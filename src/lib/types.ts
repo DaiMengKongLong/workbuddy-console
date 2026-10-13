@@ -520,10 +520,96 @@ export interface SettingsInfo {
   proxyUrl: string;
   /** 自动签到（仅国内版账号，服务端每小时巡检一次） */
   autoCheckin: boolean;
+  /** 凭据自动刷新（服务端每 6 小时巡检一次，只在临期时才刷新） */
+  autoRefreshToken: boolean;
+  /** 启动时检查新版本（唯一一处访问非官方服务的出站请求） */
+  autoCheckUpdate: boolean;
   effectiveProxy: string | null;
   detected: WorkbuddyDetection;
   cacheDir: string;
   modelsCaches: PlatformCacheInfo[];
+}
+
+/* ---------------- 版本自检 ---------------- */
+
+/** 版本自检结果；`hasUpdate` 只在远端版本**严格新于**本机时才为 true */
+export interface AppUpdateInfo {
+  ok: boolean;
+  /** 设置里关掉了自动检查（手动检查不受影响） */
+  disabled?: boolean;
+  /** 本机版本（取自 package.json） */
+  current: string;
+  latest: string | null;
+  tagName?: string | null;
+  hasUpdate: boolean;
+  releaseUrl: string | null;
+  downloadUrl: string | null;
+  assetName: string | null;
+  publishedAt: number | null;
+  notes: string;
+  checkedAt: number | null;
+  /** 结果来自磁盘缓存（未重新请求） */
+  cached: boolean;
+  /** 用了上一次的成功缓存（本次请求失败） */
+  stale?: boolean;
+  error: string | null;
+}
+
+/* ---------------- 凭据刷新 ---------------- */
+
+/** 单个账号的刷新判定 */
+export interface AccountRefreshPlan {
+  id: string;
+  uid: string;
+  name: string;
+  variant: 'cn' | 'ai';
+  /** 剩余小时数；null = 账号里没有这个有效期字段 */
+  accessHours: number | null;
+  refreshHours: number | null;
+  hasRefreshToken: boolean;
+  hasPlainAccess: boolean;
+  /** refresh_token 已过期或无机密凭据：只能重新扫码 */
+  dead: boolean;
+  due: boolean;
+  reason: 'ok' | 'access-expiring' | 'refresh-expiring' | 'dead' | 'unknown-expiry' | 'no-refresh-token' | 'manual';
+}
+
+export interface AccountRefreshRunResult {
+  ok: boolean;
+  action: 'refreshed' | 'skipped' | 'failed' | 'dead';
+  reason: string;
+  message: string;
+  accountId: string;
+  accountName: string;
+  variant: 'cn' | 'ai';
+  accessHours: number | null;
+  refreshHours: number | null;
+  before?: { accessHours: number | null; refreshHours: number | null };
+}
+
+export interface AccountRefreshResponse {
+  autoRefreshToken: boolean;
+  intervalHours: number;
+  accessMinHours: number;
+  refreshMinHours: number;
+  accounts: AccountRefreshPlan[];
+  lastRun: { at: number; refreshed: number } | null;
+  logs: {
+    ts: number;
+    accountId: string;
+    accountName: string;
+    variant: 'cn' | 'ai';
+    ok: boolean;
+    action: string;
+    reason: string;
+    message?: string;
+  }[];
+}
+
+export interface AccountRefreshRunResponse {
+  ok: boolean;
+  results: AccountRefreshRunResult[];
+  summary: { total: number; refreshed: number; skipped: number; failed: number; dead: number };
 }
 
 /* ---------------- 每日签到 ---------------- */

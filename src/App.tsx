@@ -5,6 +5,7 @@ import {
   Card,
   ConfirmProvider,
   IconChart,
+  IconDownload,
   IconGrid,
   IconRefresh,
   IconSettings,
@@ -16,7 +17,7 @@ import {
   ToastProvider,
 } from './components/ui';
 import { get } from './lib/api';
-import type { AccountsResponse, LoadedInfo } from './lib/types';
+import type { AccountsResponse, AppUpdateInfo, LoadedInfo } from './lib/types';
 import StatsPage from './pages/StatsPage';
 import SettingsPage from './pages/SettingsPage';
 import AccountsPage from './pages/AccountsPage';
@@ -50,6 +51,51 @@ function resolveHash(): { tab: TabId; platform: PlatformTab } {
 
 function currentTab(): TabId {
   return resolveHash().tab;
+}
+
+/**
+ * 左下角：版本号 + 有新版时的升级按钮。
+ *
+ * 只有远端版本**严格新于**本机时才出现按钮——本机开发版常常领先于已发布的 tag，
+ * 按"版本号不相等即有更新"判断会把用户引向一次**降级**安装。版本号本身也取自服务端
+ * （package.json），不再在前端硬编码，省掉"发版忘了改这里"的老问题。
+ */
+function VersionFooter() {
+  const [info, setInfo] = useState<AppUpdateInfo | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    get<AppUpdateInfo>('/api/app/update')
+      .then((r) => {
+        if (alive) setInfo(r);
+      })
+      .catch(() => {
+        /* 检查失败只影响按钮显示，不该在界面上报错 */
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const target = info?.downloadUrl || info?.releaseUrl || '';
+  return (
+    <div className="flex items-center justify-between border-t border-zinc-100 pt-2.5">
+      <span className="text-[10px] font-medium tracking-wide text-zinc-300">WorkBuddy Console</span>
+      <div className="flex items-center gap-1.5">
+        {info?.hasUpdate && target && (
+          <button
+            onClick={() => window.open(target, '_blank', 'noopener')}
+            title={`发现新版本 v${info.latest}${info.assetName ? `（${info.assetName}）` : ''}，点击前往下载`}
+            className="flex h-5 items-center gap-1 rounded-full bg-indigo-600 pl-1.5 pr-2 text-[10px] font-medium text-white transition-colors hover:bg-indigo-500"
+          >
+            <IconDownload className="h-3 w-3" />
+            升级 v{info.latest}
+          </button>
+        )}
+        <span className="text-[10px] tabular-nums text-zinc-300">{info ? `v${info.current}` : ''}</span>
+      </div>
+    </div>
+  );
 }
 
 /** 顶栏：当前登录的 WorkBuddy 账号（60s 轮询），点击进账号管理 */
@@ -272,10 +318,7 @@ export default function App() {
                 <span className="font-mono">~/.wb-switch</span>，模型写入{' '}
                 <span className="font-mono">~/.workbuddy/models.json</span>
               </div>
-              <div className="flex items-center justify-between border-t border-zinc-100 pt-2.5">
-                <span className="text-[10px] font-medium tracking-wide text-zinc-300">WorkBuddy Console</span>
-                <span className="text-[10px] tabular-nums text-zinc-300">v0.2.0</span>
-              </div>
+              <VersionFooter />
             </div>
           </aside>
 

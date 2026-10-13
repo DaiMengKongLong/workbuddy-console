@@ -38,6 +38,15 @@ import {
 import { getCreditStatistics, getOfflineCreditProjection, getAccountBalances } from './workbuddy/credits.mjs';
 import { VARIANT_LIST, authFilePath, dataRoot } from './workbuddy/variant.mjs';
 import { checkinAll, checkinAccount, fetchCheckinStatus, loadCheckinLogs, allCheckedInToday } from './workbuddy/checkin.mjs';
+import {
+  refreshAccounts,
+  refreshPlan,
+  loadRefreshLogs,
+  lastRefreshRun,
+  ACCESS_MIN_HOURS,
+  REFRESH_MIN_HOURS,
+} from './workbuddy/tokenRefresh.mjs';
+import { checkForUpdate, LOCAL_VERSION } from './update.mjs';
 import { checkPermissions } from './workbuddy/diagnostics.mjs';
 import { listBackups, restoreBackup, deleteBackup, cleanBackups, backupVariants } from './workbuddy/backups.mjs';
 import { registerProxyRoutes, refreshModelsCache } from './proxy/index.mjs';
@@ -90,6 +99,8 @@ app.get('/api/health', (req, res) => {
     pid: process.pid,
     uptime: Math.round(process.uptime()),
     now: Date.now(),
+    // 本机版本号：界面不再硬编码，统一从这里取
+    version: LOCAL_VERSION,
     // 运行在 Electron 桌面壳里时为 true：前端据此调整「服务断开」的恢复指引
     desktop: process.env.WB_DESKTOP === '1',
   });
@@ -772,6 +783,8 @@ app.get(
       workbuddyDir: cfg.settings.workbuddyDir || '',
       proxyUrl: cfg.settings.proxyUrl || '',
       autoCheckin: !!cfg.settings.autoCheckin,
+      autoRefreshToken: !!cfg.settings.autoRefreshToken,
+      autoCheckUpdate: !!cfg.settings.autoCheckUpdate,
       effectiveProxy: await getProxyUrl(),
       detected: detectWorkbuddyDir(),
       cacheDir: cachePath(''),
@@ -793,12 +806,20 @@ app.put(
     if (typeof req.body?.autoCheckin === 'boolean') {
       cfg.settings.autoCheckin = req.body.autoCheckin;
     }
+    if (typeof req.body?.autoRefreshToken === 'boolean') {
+      cfg.settings.autoRefreshToken = req.body.autoRefreshToken;
+    }
+    if (typeof req.body?.autoCheckUpdate === 'boolean') {
+      cfg.settings.autoCheckUpdate = req.body.autoCheckUpdate;
+    }
     saveConfig(cfg);
     res.json({
       ok: true,
       workbuddyDir: cfg.settings.workbuddyDir,
       proxyUrl: cfg.settings.proxyUrl,
       autoCheckin: !!cfg.settings.autoCheckin,
+      autoRefreshToken: !!cfg.settings.autoRefreshToken,
+      autoCheckUpdate: !!cfg.settings.autoCheckUpdate,
       effectiveProxy: await getProxyUrl(),
       detected: detectWorkbuddyDir(),
     });
@@ -825,6 +846,113 @@ app.post('/api/cache/clear', (req, res) => {
   clearModelsCache(String(req.body?.platform || '')); // 空字符串 = 清全部平台
   res.json({ ok: true });
 });
+
+/* ---------------- 版本自检 ---------------- */
+
+app.get(
+  '/api/app/update',
+  wrap(async (req, res) => {
+    const cfg = loadConfig();
+    // 关掉自动检查时不发起任何出站请求，前端据此只显示版本号、不显示升级按钮
+    if (!cfg.settings.autoCheckUpdate) {
+      res.json({
+        ok: true,
+        disabled: true,
+        current: LOCAL_VERSION,
+        latest: null,
+        hasUpdate: false,
+        releaseUrl: null,
+        downloadUrl: null,
+        assetName: null,
+        publishedAt: null,
+        notes: '',
+        checkedAt: null,
+        cached: false,
+        error: null,
+      });
+      return;
+    }
+    res.json(await checkForUpdate({ force: false }));
+  })
+);
+
+// 手动「检查更新」是一次明确的授权动作，即使关掉了自动检查也照做
+app.post(
+  '/api/app/update/check',
+  wrap(async (req, res) => {
+    res.json(await checkForUpdate({ force: true }));
+  })
+);
+
+/* ---------------- 凭据自动刷新（巡检 + 接口） ---------------- */
+
+/** 巡检间隔：6 小时。判据本身是"临期才动手"，这里只负责定期来看一眼 */
+const TOKEN_REFRESH_PATROL_MS = 6 * 60 * 60 * 1000;
+let tokenRefreshBusy = false;
+let tokenRefreshTimer = null;
+
+app.get(
+  '/api/accounts/refresh',
+  wrap(async (req, res) => {
+    const cfg = loadConfig();
+    res.json({
+      autoRefreshToken: !!cfg.settings.autoRefreshToken,
+      intervalHours: TOKEN_REFRESH_PATROL_MS / 3_600_000,
+      accessMinHours: ACCESS_MIN_HOURS,
+      refreshMinHours: REFRESH_MIN_HOURS,
+      accounts: refreshPlan(),
+      lastRun: lastRefreshRun(),
+      logs: loadRefreshLogs().slice(0, 30),
+    });
+  })
+);
+
+// 手动刷新：不传 accountId 就处理全部账号；force 跳过临期判定（用户明确要求刷）
+app.post(
+  '/api/accounts/refresh',
+  wrap(async (req, res) => {
+    const accountId = req.body?.accountId ? String(req.body.accountId) : '';
+    const force = req.body?.force === true || req.body?.force === '1';
+    const { results, summary } = await refreshAccounts({
+      accountIds: accountId ? [accountId] : null,
+      force,
+    });
+    res.json({ ok: true, results, summary });
+  })
+);
+
+async function runTokenRefreshPatrol({ silent = false } = {}) {
+  if (tokenRefreshBusy) return null;
+  if (!loadConfig().settings.autoRefreshToken) return null;
+  tokenRefreshBusy = true;
+  try {
+    const { results, summary } = await refreshAccounts();
+    // 平时（没有临期账号）完全静默：这类巡检不该在日志里刷存在感
+    if (summary.refreshed || summary.failed || (!silent && summary.dead)) {
+      console.log(
+        `[refresh] 凭据巡检：刷新 ${summary.refreshed}、跳过 ${summary.skipped}、失败 ${summary.failed}、需重新登录 ${summary.dead}`
+      );
+      for (const r of results.filter((x) => x.action === 'failed')) {
+        console.error(`[refresh] 「${r.accountName}」刷新失败：${r.message}`);
+      }
+    }
+    return summary;
+  } catch (e) {
+    console.error('[refresh] 凭据巡检出错:', e?.message || e);
+    return null;
+  } finally {
+    tokenRefreshBusy = false;
+  }
+}
+
+/** 启动巡检：先延迟 60 秒（不与启动时的其它初始化抢网络），之后每 6 小时一次 */
+function startTokenRefreshPatrol() {
+  if (tokenRefreshTimer) clearInterval(tokenRefreshTimer);
+  setTimeout(() => runTokenRefreshPatrol({ silent: true }), 60_000);
+  tokenRefreshTimer = setInterval(runTokenRefreshPatrol, TOKEN_REFRESH_PATROL_MS);
+}
+
+startTokenRefreshPatrol();
 
 /* ---------------- 自动签到巡检 ---------------- */
 

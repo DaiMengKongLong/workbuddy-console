@@ -14,6 +14,11 @@ const DEFAULT_SETTINGS = {
   workbuddyDir: '', // 覆盖默认 ~/.workbuddy
   proxyUrl: '', // 出站代理（如 http://127.0.0.1:7890）；留空自动探测环境变量 / Windows 系统代理
   autoCheckin: true, // 自动签到（仅国内版账号，服务端每小时巡检一次）；默认开启，可在设置里关闭
+  // 凭据自动刷新（服务端每 6 小时巡检一次，只在 access/refresh 临期时才动手）；默认开启。
+  // 关掉后：既没被切换、也没走过反向代理的账号会一直静默过期，直到需要重新扫码。
+  autoRefreshToken: true,
+  // 启动时检查有没有新版本（只读 GitHub Release 元数据，是唯一一处访问非官方服务的出站请求）
+  autoCheckUpdate: true,
 };
 
 /**

@@ -22,6 +22,7 @@
     "test:proxy-pool": "node scripts/test-proxy-pool.mjs",
     "test:sessions": "node scripts/test-session-copy.mjs",
     "test:stop": "node scripts/test-stop-process.mjs",
+    "test:refresh": "node scripts/test-token-refresh.mjs",
     "app": "electron .",
     "app:dir": "npm run build && electron-builder --dir --publish never",
     "app:win": "npm run build && electron-builder --win --publish never",

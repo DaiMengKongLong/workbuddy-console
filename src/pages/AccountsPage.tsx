@@ -37,6 +37,7 @@ import { fmtDateTime } from '../lib/format';
 import type {
   AccountBalancesResponse,
   AccountInfo,
+  AccountRefreshRunResponse,
   AccountsResponse,
   AppStopResult,
   CreditBalance,
@@ -164,6 +165,7 @@ function AccountCard({
   balanceLoading,
   onSwitch,
   onSyncSessions,
+  onRefreshToken,
   onRename,
   onDelete,
   onShowPackages,
@@ -175,6 +177,7 @@ function AccountCard({
   balanceLoading: boolean;
   onSwitch: () => void;
   onSyncSessions: () => void;
+  onRefreshToken: () => void;
   onRename: () => void;
   onDelete: () => void;
   onShowPackages: () => void;
@@ -301,10 +304,10 @@ function AccountCard({
           className="h-7 rounded-full px-2.5 pr-3.5 text-xs"
           disabled={isCurrent || busy || !account.hasPlainToken}
           onClick={onSwitch}
-          title={account.hasPlainToken ? '设为 WorkBuddy 当前登录账号' : '该账号没有可用的明文凭据，无法切换'}
+          title={account.hasPlainToken ? '把 WorkBuddy 的登录态切换到这个账号' : '该账号没有可用的明文凭据，无法切换'}
         >
           {isCurrent ? <IconCheck className="w-3.5 h-3.5" /> : <IconSwitch className="w-3.5 h-3.5" />}
-          {isCurrent ? '使用中' : '设为当前'}
+          {isCurrent ? '使用中' : '切换账号'}
         </Button>
         <Button size="sm" className="h-7 rounded-full px-2.5 pr-3.5 text-xs" onClick={onRename}>
           <IconEdit className="w-3.5 h-3.5" />
@@ -323,6 +326,20 @@ function AccountCard({
         >
           <IconCopy className="w-3.5 h-3.5" />
           同步会话
+        </Button>
+        <Button
+          size="sm"
+          className="h-7 rounded-full px-2.5 pr-3.5 text-xs"
+          disabled={busy || !account.hasPlainToken}
+          onClick={onRefreshToken}
+          title={
+            account.hasPlainToken
+              ? '用 refresh_token 换一份新的 access_token，有效期顺延（账号长期不用时可防止静默失效）'
+              : '该账号没有可用的凭据，需重新扫码登录'
+          }
+        >
+          <IconRefresh className="w-3.5 h-3.5" />
+          刷新凭据
         </Button>
         <Button
           size="sm"
@@ -1438,6 +1455,35 @@ export default function AccountsPage() {
     await switchNow(account, [], stopAppRef.current);
   };
 
+  /**
+   * 手动刷新单个账号的凭据。
+   *
+   * 走 `force=1`：用户是**明确点在这个账号上**的，不必再拿"临期"替他判断。
+   * 这与设置页那个批量「检查并刷新」刻意不同——批量动作要保持保守，避免无谓的凭据轮换。
+   */
+  const doRefreshToken = async (account: AccountInfo) => {
+    setBusyId(account.id);
+    try {
+      const r = await post<AccountRefreshRunResponse>('/api/accounts/refresh', {
+        accountId: account.id,
+        force: true,
+      });
+      const row = r.results[0];
+      if (row?.ok && row.action === 'refreshed') {
+        toast('ok', `「${account.name}」凭据已刷新，有效期已顺延`);
+      } else if (row?.ok) {
+        toast('info', `「${account.name}」未做刷新（${row.reason}）`);
+      } else {
+        toast('err', row?.message || '刷新失败');
+      }
+      await load();
+    } catch (e: any) {
+      toast('err', e?.message || '刷新失败');
+    } finally {
+      setBusyId(null);
+    }
+  };
+
 /** 一键结束后台全部 WorkBuddy 进程（与切换/复制里的自动退出同一条服务端逻辑） */
   const stopNow = async () => {
     const ok = await confirm({
@@ -1734,6 +1780,7 @@ export default function AccountsPage() {
                   setSessionTarget(a);
                 }}
                 onRename={() => setEditing(a)}
+                onRefreshToken={() => doRefreshToken(a)}
                 onDelete={() => doDelete(a)}
                 onShowPackages={() => setPkgTarget(a)}
               />

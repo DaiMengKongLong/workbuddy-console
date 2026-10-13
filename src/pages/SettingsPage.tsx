@@ -7,6 +7,7 @@ import {
   IconClock,
   IconCopy,
   IconDatabase,
+  IconDownload,
   IconPower,
   IconRefresh,
   IconShield,
@@ -20,6 +21,9 @@ import {
 } from '../components/ui';
 import { del, get, post, put } from '../lib/api';
 import type {
+  AccountRefreshResponse,
+  AccountRefreshRunResponse,
+  AppUpdateInfo,
   BackupEntry,
   BackupsResponse,
   CheckinAllResult,
@@ -72,6 +76,25 @@ function fmtSize(bytes: number) {
   return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
 }
 
+/** 剩余小时数 → 人话；null（账号里没有该有效期字段）与"已过期"必须区分 */
+function fmtHours(h: number | null | undefined): string {
+  if (h == null || !Number.isFinite(h)) return '未知';
+  if (h <= 0) return '已过期';
+  if (h < 48) return `${h.toFixed(1)} 小时`;
+  return `${(h / 24).toFixed(1)} 天`;
+}
+
+/** 凭据刷新的判定原因 → 中文（与服务端 tokenRefresh.mjs 的 reason 一一对应） */
+const REFRESH_REASON_TEXT: Record<string, string> = {
+  ok: '有效期充足',
+  'access-expiring': 'access 即将过期',
+  'refresh-expiring': 'refresh 即将过期',
+  dead: 'refresh 已过期，需重新登录',
+  'unknown-expiry': '未记录有效期，暂不处理',
+  'no-refresh-token': '无 refresh_token，需重新扫码',
+  manual: '手动刷新',
+};
+
 export default function SettingsPage() {
   const toast = useToast();
   const confirm = useConfirm();
@@ -93,6 +116,14 @@ export default function SettingsPage() {
   const [checkin, setCheckin] = useState<CheckinStatusResponse | null>(null);
   const [checkinLoading, setCheckinLoading] = useState(false);
   const [checkingIn, setCheckingIn] = useState(false);
+
+  /* ---------------- 凭据自动刷新 ---------------- */
+  const [refreshInfo, setRefreshInfo] = useState<AccountRefreshResponse | null>(null);
+  const [refreshingTokens, setRefreshingTokens] = useState(false);
+
+  /* ---------------- 版本自检 ---------------- */
+  const [updateInfo, setUpdateInfo] = useState<AppUpdateInfo | null>(null);
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
 
   /* ---------------- 权限自检 ---------------- */
   const [perm, setPerm] = useState<PermissionResponse | null>(null);
@@ -136,6 +167,59 @@ export default function SettingsPage() {
     [toast]
   );
 
+  const loadRefreshInfo = useCallback(async () => {
+    try {
+      setRefreshInfo(await get<AccountRefreshResponse>('/api/accounts/refresh'));
+    } catch {
+      /* 凭据状态查询失败不打扰用户，列表留空即可 */
+    }
+  }, []);
+
+  const loadUpdateInfo = useCallback(
+    async (force = false) => {
+      setCheckingUpdate(true);
+      try {
+        setUpdateInfo(
+          force ? await post<AppUpdateInfo>('/api/app/update/check') : await get<AppUpdateInfo>('/api/app/update')
+        );
+      } catch (e: any) {
+        if (force) toast('err', e?.message || '检查更新失败');
+      } finally {
+        setCheckingUpdate(false);
+      }
+    },
+    [toast]
+  );
+
+  /**
+   * 手动「检查并刷新」：不带 force —— 只刷新已经临期的账号。
+   * 不做「点一下全部重刷」，是因为刷新可能轮换 refresh_token，无谓的刷新反而会与
+   * WorkBuddy 自己持有的那一份互相踩到（详见 server/workbuddy/tokenRefresh.mjs 的说明）。
+   */
+  const runTokenRefresh = async () => {
+    setRefreshingTokens(true);
+    try {
+      const r = await post<AccountRefreshRunResponse>('/api/accounts/refresh', {});
+      const { summary } = r;
+      const failed = r.results.find((x) => x.action === 'failed');
+      const dead = r.results.filter((x) => x.action === 'dead');
+      if (summary.refreshed) {
+        toast('ok', `已刷新 ${summary.refreshed} 个临期账号${summary.failed ? `，${summary.failed} 个失败` : ''}`);
+      } else if (summary.failed) {
+        toast('err', `刷新失败：${failed?.message || '未知原因'}`);
+      } else if (dead.length) {
+        toast('info', `${dead.length} 个账号需重新登录：${dead.map((d) => d.accountName).join('、')}`);
+      } else {
+        toast('ok', '所有账号的有效期都还很充足，未做任何刷新');
+      }
+      await loadRefreshInfo();
+    } catch (e: any) {
+      toast('err', e?.message || '刷新失败');
+    } finally {
+      setRefreshingTokens(false);
+    }
+  };
+
   const loadPerm = useCallback(
     async (silent = false) => {
       if (!silent) setPermLoading(true);
@@ -170,7 +254,9 @@ export default function SettingsPage() {
     loadLocalLogs();
     void loadPerm(true);
     void loadCheckin(true);
-  }, [loadSettings, loadStatus, loadBackups, loadLocalLogs, loadPerm, loadCheckin]);
+    void loadRefreshInfo();
+    void loadUpdateInfo(false);
+  }, [loadSettings, loadStatus, loadBackups, loadLocalLogs, loadPerm, loadCheckin, loadRefreshInfo, loadUpdateInfo]);
 
   /** 重新检测数据目录与运行状态 */
   const redetect = useCallback(
@@ -237,6 +323,25 @@ export default function SettingsPage() {
       toast('ok', r.autoCheckin ? '已开启自动签到：服务端每小时巡检一次，发现未签到会自动补签' : '已关闭自动签到');
     } catch (e: any) {
       setSettings((p) => (p ? { ...p, autoCheckin: prev } : p));
+      toast('err', e?.message || '保存失败');
+    }
+  };
+
+  /** 其余布尔设置项的统一开关：与自动签到同一套「乐观更新 + 失败回滚」交互 */
+  const toggleBoolSetting = async (
+    key: 'autoRefreshToken' | 'autoCheckUpdate',
+    next: boolean,
+    hint: { on: string; off: string }
+  ) => {
+    if (!settings) return;
+    const prev = !!settings[key];
+    setSettings((p) => (p ? { ...p, [key]: next } : p));
+    try {
+      const r = await put<Partial<SettingsInfo>>('/api/settings', { [key]: next });
+      setSettings((p) => (p ? { ...p, [key]: !!r[key] } : p));
+      toast('ok', next ? hint.on : hint.off);
+    } catch (e: any) {
+      setSettings((p) => (p ? { ...p, [key]: prev } : p));
       toast('err', e?.message || '保存失败');
     }
   };
@@ -540,6 +645,84 @@ export default function SettingsPage() {
                   </div>
                 ))}
               </div>
+            </div>
+          )}
+        </Card>
+      </PageSection>
+
+      {/* 账号凭据维护 */}
+      <PageSection
+        icon={<IconRefresh />}
+        title="账号凭据维护"
+        desc="凭据不会自己续命：既没被切换过、也没走过反向代理的账号，会一路静默失效，直到只能重新扫码"
+      >
+        <Card className="p-5">
+          <div className="divide-y divide-zinc-100 -mx-4 mb-3">
+            <Row
+              label={
+                <span className="flex flex-wrap items-center gap-2">
+                  凭据自动刷新
+                  <Badge color={settings?.autoRefreshToken ? 'green' : 'gray'}>
+                    {settings?.autoRefreshToken ? '已开启（默认）' : '已关闭'}
+                  </Badge>
+                </span>
+              }
+              desc={
+                <>
+                  服务端每 {refreshInfo?.intervalHours ?? 6} 小时看一次，
+                  <b className="text-zinc-600">只在临期时才动手</b>：access_token 剩余不足{' '}
+                  {refreshInfo?.accessMinHours ?? 24} 小时，或 refresh_token 剩余不足{' '}
+                  {refreshInfo?.refreshMinHours ?? 72} 小时。关掉后，长期不切换、也不走反向代理的账号会一直静默过期。
+                </>
+              }
+            >
+              <label className="flex items-center gap-2 text-sm text-zinc-600 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={!!settings?.autoRefreshToken}
+                  onChange={(e) =>
+                    toggleBoolSetting('autoRefreshToken', e.target.checked, {
+                      on: '已开启凭据自动刷新：只在临期时才刷新，不会频繁打扰官方接口',
+                      off: '已关闭凭据自动刷新：长期不用的账号可能失效',
+                    })
+                  }
+                  className="accent-indigo-600 rounded"
+                />
+                {settings?.autoRefreshToken ? '已开启' : '已关闭'}
+              </label>
+            </Row>
+
+            <Row label="立即检查" desc="只刷新已经临期的账号；有效期充足的保持不动，避免无谓的凭据轮换">
+              <Button size="sm" onClick={runTokenRefresh} loading={refreshingTokens}>
+                {!refreshingTokens && <IconRefresh className="w-3.5 h-3.5" />}
+                检查并刷新
+              </Button>
+            </Row>
+          </div>
+
+          {!refreshInfo ? (
+            <div className="py-3 text-sm text-zinc-400">正在读取账号凭据状态…</div>
+          ) : !refreshInfo.accounts.length ? (
+            <div className="py-3 text-sm text-zinc-400">账号库为空。先在「账号管理」里导入账号。</div>
+          ) : (
+            <ul className="-mx-4 divide-y divide-zinc-100">
+              {refreshInfo.accounts.map((a) => (
+                <li key={a.id} className="flex flex-wrap items-center gap-x-3 gap-y-1 px-4 py-2.5 text-xs">
+                  <span className="font-medium text-zinc-700">{a.name}</span>
+                  <Badge color={a.dead ? 'red' : a.due ? 'amber' : 'gray'}>
+                    {REFRESH_REASON_TEXT[a.reason] || a.reason}
+                  </Badge>
+                  <span className="ml-auto tabular-nums text-zinc-400">
+                    access {fmtHours(a.accessHours)} · refresh {fmtHours(a.refreshHours)}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+
+          {refreshInfo?.lastRun && (
+            <div className="mt-3 text-[11px] text-zinc-400">
+              最近一次自动巡检：{fmtDateTime(refreshInfo.lastRun.at)}，刷新 {refreshInfo.lastRun.refreshed} 个账号。
             </div>
           )}
         </Card>
@@ -867,8 +1050,54 @@ export default function SettingsPage() {
         <Card className="p-5 text-xs text-zinc-400 leading-relaxed space-y-1.5">
           <div className="flex items-center gap-2">
             <div className="font-medium text-zinc-600 text-sm">WorkBuddy 一体化管理工具</div>
-            <Badge color="gray">v0.2.0</Badge>
+            {/* 版本号取自服务端 package.json，前端不再硬编码（发版忘了改这里就再也对不上了） */}
+            <Badge color="gray">{updateInfo ? `v${updateInfo.current}` : '版本读取中'}</Badge>
           </div>
+
+          <div className="flex flex-wrap items-center gap-2 border-t border-zinc-100 pt-2.5">
+            {updateInfo?.hasUpdate ? (
+              <>
+                <Badge color="green">发现新版本 v{updateInfo.latest}</Badge>
+                <a
+                  href={updateInfo.downloadUrl || updateInfo.releaseUrl || '#'}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex h-7 items-center gap-1 rounded-xl border border-indigo-300 px-2.5 text-[11px] font-medium text-indigo-600 transition-colors hover:bg-indigo-50"
+                >
+                  <IconDownload className="w-3.5 h-3.5" />
+                  下载安装包
+                </a>
+              </>
+            ) : (
+              <Badge color="gray">{updateInfo?.error ? '版本状态未知' : '已是最新版本'}</Badge>
+            )}
+            <Button size="sm" onClick={() => loadUpdateInfo(true)} loading={checkingUpdate}>
+              {!checkingUpdate && <IconRefresh className="w-3.5 h-3.5" />}
+              检查更新
+            </Button>
+            <label className="flex items-center gap-1.5 text-[11px] text-zinc-400 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={!!settings?.autoCheckUpdate}
+                onChange={(e) =>
+                  toggleBoolSetting('autoCheckUpdate', e.target.checked, {
+                    on: '已开启自动检查更新',
+                    off: '已关闭自动检查更新（仍可手动点「检查更新」）',
+                  })
+                }
+                className="accent-indigo-600 rounded"
+              />
+              启动时自动检查
+            </label>
+          </div>
+
+          {updateInfo?.error && <div className="text-amber-600">{updateInfo.error}</div>}
+          {!!updateInfo?.checkedAt && !updateInfo.error && (
+            <div className="text-zinc-300">
+              上次检查：{fmtDateTime(updateInfo.checkedAt)}
+              {updateInfo.cached ? '（本地缓存，6 小时内不重复请求）' : ''}
+            </div>
+          )}
           <div>
             主要能力：账号管理（扫码登录 / 切换 / 备份恢复）· Token 统计 · 积分统计 ·
             免费模型广场（免费模型 / 平台额度 / API Keys）·

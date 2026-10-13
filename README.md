@@ -30,12 +30,12 @@ npm run app          # 以桌面窗口运行（Electron）
 
 | 页面 | 说明 |
 | --- | --- |
-| **账号管理** | 扫码添加（OAuth 设备码，二维码本地渲染、服务端常驻采集）、导入本机登录态、一键切换（**自动结束 WorkBuddy 后台进程** → 备份 + 原子写入 + 失败回滚 → **自动重新打开**）、**会话复制**（把当前账号的对话按新会话 id 复制给目标账号，切换时可勾选一并执行）、备注、删除；顶部标明当前登录态与 WorkBuddy 运行状态 |
+| **账号管理** | 扫码添加（OAuth 设备码，二维码本地渲染、服务端常驻采集）、导入本机登录态、**切换账号**（**自动结束 WorkBuddy 后台进程** → 备份 + 原子写入 + 失败回滚 → **自动重新打开**）、**刷新凭据**（用 refresh_token 换新的 access_token）、**会话复制**（把当前账号的对话按新会话 id 复制给目标账号，切换时可勾选一并执行）、备注、删除；顶部标明当前登录态与 WorkBuddy 运行状态 |
 | **免费模型广场** | 三个子页签合并在一个入口：**免费模型**（只看各平台免费模型，搜索 + 排序，一键写入 `models.json` 或导出给其他 agent）、**平台额度**（各平台 Key 的免费额度与余额）、**API Keys**（多 Key 轮换、测试、设为活跃）+ 模型列表缓存管理 |
 | **反向代理** | 把 WorkBuddy 的官方对话能力**按四种主流协议**暴露给本机 agent：OpenAI Chat Completions（`/v1/chat/completions`）、Anthropic Messages（`/v1/messages`）、OpenAI Responses（`/v1/responses`）、Google Gemini 原生（`/v1beta/models/{model}:generateContent`）；账号池轮询、401 自动刷新 token 并换号、流式/非流式都支持（上游只收流式，非流式由代理聚合）；按协议族分组的接入示例（Claude Code / Codex CLI / Gemini CLI / Cherry Studio / Cline / Cursor / TRAE / 小米 MiMo / 豆包 等）、请求日志与连通性自检；默认关闭，需在页面显式开启 |
 | **Token 统计** | 扫描本机会话日志（JSONL），统计请求数、输入/输出/缓存读写/思考 Token、缓存命中率、模型与项目排行、会话明细；**按档位（国内版 / 国际版）分别归档**，可选「全部档位」合并查看 |
 | **积分统计** | 调用官方用量接口：可用剩余积分、按账号与档位汇总、逐请求明细（分页）、趋势与模型分布；接口不可达时回退本地离线预估 |
-| **设置** | WorkBuddy 运行状态与重启、**每日签到**（自动巡检默认开启，可关闭；也可随时手动一键签到）、数据目录检测、**登录态与目录权限自检**、**登录态备份与恢复**、网络代理、通知历史、界面错误日志 |
+| **设置** | WorkBuddy 运行状态与重启、**每日签到**（自动巡检默认开启，可关闭；也可随时手动一键签到）、**账号凭据维护**（凭据自动刷新默认开启，可关闭；附各账号剩余有效期与「检查并刷新」）、数据目录检测、**登录态与目录权限自检**、**登录态备份与恢复**、网络代理、通知历史、界面错误日志；左下角显示版本号，**有新版本时出现升级按钮**（「关于」里可手动检查、关掉自动检查） |
 
 ## Token 统计口径
 
@@ -73,9 +73,38 @@ WorkBuddy 的对话记录**按账号隔离**：`workbuddy.db` 的 `sessions` 表
 ```bash
 node scripts/test-session-copy.mjs   # 会话复制 / 门禁 / 回滚 / 账本（91 项断言）
 node scripts/test-stop-process.mjs   # 自动退出 WorkBuddy 的进程链路（23 项断言，仅 Windows）
+node scripts/test-token-refresh.mjs  # 凭据刷新判据与版本自检（46 项断言，官方接口用桩替换）
 ```
 
 `test-stop-process.mjs` 会把 `node.exe` 复制成同名替身 `WorkBuddyFake.exe` 后台拉起，再走完整的「枚举 → 优雅退出 → 强杀 → 确认消失」流程，并断言**真实 WorkBuddy 的进程一个都没被误杀**。它还守着一条容易写反的判据：进程确实不存在时探测结果必须"干净地"报没有（`error` 为空），否则在 PowerShell 被安全策略禁掉的机器上，切换账号会在最后一道门把自己拦住。
+
+## 账号不会"放着放着就失效"（凭据自动刷新）
+
+账号库里的 `access_token` / `refresh_token` 都有有效期。原先**唯一**会刷新它们的地方是反向代理处理请求时，而且只在"到期前 60 秒"那个极窄窗口触发——于是**既没被切换过、也没走过反向代理**的账号会一路静默过期，等到想用时只能重新扫码。
+
+服务端因此加了一条巡检（默认开启，可在「设置 → 账号凭据维护」关闭或手动触发）：
+
+| 情况 | 动作 |
+| --- | --- |
+| `access_token` 剩余 < **24 小时** | 刷 |
+| `refresh_token` 剩余 < **72 小时** | 刷（兜底：refresh 一过期就再也救不回来） |
+| 两个有效期字段都缺失 | **不动**（判断不了就别猜） |
+| `refresh_token` 已过期 / 账号根本没有 refresh_token 且 access 已临期 | 不刷，界面标红提示**需重新扫码登录** |
+
+- **巡检间隔 6 小时**，但**只在临期时才动手**。为什么不每次巡检都刷：刷新有可能轮换 `refresh_token`，而 WorkBuddy 自己的登录态文件里还存着它那一份；频次越高，两方互相踩到的概率越大。临期才刷，等于只在"反正也要死了"的时刻出手。
+- **两个入口，粒度不同**：设置页的「检查并刷新」是批量动作，**不带 force**，只动临期账号；账号卡片上的「刷新凭据」是用户明确点在某个账号上，**带 force**，无条件刷新。
+- **失败不静默**：接口 4xx/5xx、网络不通都逐账号记录原因；巡检平时完全静默（没有临期账号时不写日志）。
+- **只记结果不记凭据**：日志在 `~/.wb-switch/token_refresh_logs.json`（本工具私有），只有时间、账号名、动作与剩余有效期。
+
+## 版本自检（左下角的升级按钮）
+
+左下角版本号取自 `package.json`（前端不再硬编码），版本服务是 GitHub Release（本仓库 Actions 在推 tag 时构建 Windows / macOS 安装包）。
+
+- **只有远端版本严格新于本机时才出现升级按钮**。本机开发版常常领先于已发布的 tag（本地 `0.2.0`、最新 Release 还是 `0.1.2`），若按"版本号不相等即有更新"判断，按钮会把用户引向一次**降级**安装——这条已写成回归断言。
+- 点击按钮打开与当前平台/架构匹配的安装包下载地址（匹配不到就回落到 Release 页面）。产物命名随版本变过（早期 `Free-Token-0.1.2-win-x64.exe`，现在 `WorkBuddy-Console-0.2.0-win-x64.exe`），所以只按"后缀 + 架构关键词"匹配，不锚定前缀。
+- 结果缓存 6 小时（GitHub 未认证请求限每小时 60 次）；**失败不覆盖上一次的成功结果**，只在请求成功时写缓存。网络不通就"不显示按钮"，不弹报错——没有新版本来就是常态。
+- 出站走统一的 `proxyFetch`，自动遵循「设置 → 网络代理」/ 环境变量 / Windows 系统代理。
+- 这是本工具**唯一一处访问非官方服务**的出站请求（只读 Release 元数据）；「设置 → 关于」里可关掉自动检查，手动「检查更新」仍可用。
 
 ## 桌面版（Windows / macOS）
 
@@ -198,7 +227,9 @@ node scripts/test-proxy-pool.mjs        # 23 项断言：账号池准入与凭�
 | 积分快照（与 workbuddy-switch 共享，结构兼容） | `~/.wb-switch/credit_usage_snapshots.json` |
 | 积分用量缓存（本工具私有） | `~/.wb-switch/credit_stats_cache.json` |
 | 签到日志（本工具私有） | `~/.wb-switch/checkin_logs.json` |
-| 工具配置（平台 Key / 代理 / 自动签到） | `~/.free-token/config.json` |
+| 凭据刷新日志（本工具私有，不含 token） | `~/.wb-switch/token_refresh_logs.json` |
+| 工具配置（平台 Key / 代理 / 自动签到 / 凭据自动刷新） | `~/.free-token/config.json` |
+| 版本自检缓存（6 小时） | `~/.free-token/cache/update-check.json` |
 | 写入 WorkBuddy 的模型配置 | `~/.workbuddy/models.json`（国内版）/ `~/.workbuddy-ai/models.json`（国际版） |
 
 > 与 workbuddy-switch 同目录共存时，**只有账号库、备份与积分快照是刻意共用的**；
@@ -213,8 +244,9 @@ node scripts/test-proxy-pool.mjs        # 23 项断言：账号池准入与凭�
 ```
 workbuddy-free-token-manage/
 ├── server/
-│   ├── index.mjs            # Express 入口 + 路由
+│   ├── index.mjs            # Express 入口 + 路由 + 定时巡检（签到 / 凭据刷新）
 │   ├── proxy.mjs            # 出站代理（免费模型平台请求）
+│   ├── update.mjs           # 版本自检（GitHub Release + 6 小时缓存 + semver 比较）
 │   ├── proxy/               # 反向代理（多协议：OpenAI / Anthropic / Responses / Gemini）
 │   │   ├── index.mjs        # 路由 + 账号池轮询 + 鉴权 + 管理 API
 │   │   ├── wb.mjs           # WorkBuddy 官方上游客户端（风控头 / 刷新 token / SSE 聚合）
@@ -233,6 +265,7 @@ workbuddy-free-token-manage/
 │       ├── oauth.mjs        # 扫码登录（服务端常驻轮询）
 │       ├── credits.mjs      # 积分统计（官方接口 + 离线预估）
 │       ├── checkin.mjs      # 每日签到
+│       ├── tokenRefresh.mjs # 凭据自动刷新（临期判定 + 日志）
 │       ├── backups.mjs      # 登录态备份管理
 │       └── diagnostics.mjs  # 目录权限自检
 ├── src/
@@ -252,6 +285,7 @@ workbuddy-free-token-manage/
 │   ├── test-proxy-protocols.mjs # 四协议转换回归（离线）
 │   ├── test-proxy-pool.mjs      # 反向代理账号池准入回归（隔离账号库）
 │   ├── test-session-copy.mjs    # 会话复制回归（隔离临时数据根）
-│   └── test-stop-process.mjs    # 退出 WorkBuddy 的进程链路回归（同名替身进程）
+│   ├── test-stop-process.mjs    # 退出 WorkBuddy 的进程链路回归（同名替身进程）
+│   └── test-token-refresh.mjs   # 凭据刷新判据 + 版本自检回归（官方接口用桩替换）
 └── electron/main.mjs        # 桌面壳（内嵌 Express + 窗口）
 ```
