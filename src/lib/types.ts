@@ -622,7 +622,7 @@ export interface ProxyAccount {
   uid: string;
   variant: 'cn' | 'ai';
   variantLabel: string;
-  /** 是否可用于出站请求（需明文凭据且未过期） */
+  /** 是否可用于出站请求（有明文凭据，或凭 refresh_token 可自行换新） */
   usable: boolean;
   expired: boolean;
   expiresAt: number | null;

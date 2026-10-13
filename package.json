@@ -19,6 +19,7 @@
     "icons": "node scripts/make-icons.mjs",
     "test:proxy": "node scripts/test-proxy.mjs",
     "test:proxy-protocols": "node scripts/test-proxy-protocols.mjs",
+    "test:proxy-pool": "node scripts/test-proxy-pool.mjs",
     "test:sessions": "node scripts/test-session-copy.mjs",
     "test:stop": "node scripts/test-stop-process.mjs",
     "app": "electron .",

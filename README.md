@@ -107,7 +107,7 @@ npm run app:dir # 只出免安装目录（release/<平台>-unpacked），本地�
 - **协议转换**：官方上游只认 OpenAI 协议、且**只接受流式**；四种入站协议都在 `server/proxy/` 里做双向翻译，非流式请求由代理本地聚合后回填。
 - **风控净化**：上游会拦「system 文本里带别家 agent 系统提示词」的请求（`code 11128`）；代理出站前会把竞品指纹词中性化，用户消息不受影响。详见下文。
 - **鉴权**：`Authorization: Bearer <Key>`、`x-api-key: <Key>`、`x-goog-api-key: <Key>`（或 `?key=`）三种都认 —— 分别对应 OpenAI 类 / Anthropic 类 / Gemini 类客户端各自的默认行为。Key 首次开启自动生成，可随时重新生成。
-- **账号池**：默认用全部「带明文凭据」的账号按请求轮询；401/403 会先刷新 token 再换下一个账号。
+- **账号池**：默认用全部「能出站」的账号按请求轮询 —— 有明文凭据的算能出站；`access_token` 过期、甚至只存了加密信封，只要还有 `refresh_token` 也算，出站前会先换一份明文回来。401/403 会先刷新 token 再换下一个账号。
 - **档位隔离**：国内版走 `copilot.tencent.com`，国际版走 `www.workbuddy.ai`，绝不混档。
 - **安全**：只监听 `127.0.0.1`，局域网不可见；`refresh_token` 只出现在官方 refresh 端点；请求日志只存内存、不含消息正文。
 - **依赖**：代理由管理台进程提供，需保持管理台运行（桌面版关闭窗口后驻留托盘，不会中断）。
@@ -170,8 +170,14 @@ OpenAI 的 `role:"system"`、Gemini 的 `systemInstruction`），**用户消息�
 与风控净化）：
 
 ```bash
-node scripts/test-proxy-protocols.mjs
+node scripts/test-proxy-protocols.mjs   # 65 项断言
+node scripts/test-proxy-pool.mjs        # 23 项断言：账号池准入与凭据刷新判据
 ```
+
+> `test-proxy-pool.mjs` 守的是一条真实踩过的坑：账号池曾经用「明文凭据且未过期」当准入判据，
+> 于是「管理台离线几天、`access_token` 正好过期」的账号会被**静默踢出池子** ——
+> 明明 `refresh_token` 还有效、一次刷新就能救回来，界面却只回一句「没有可用账号」，
+> 把人往「重新扫码」上引。
 
 ## 隐私红线
 
@@ -244,6 +250,7 @@ workbuddy-free-token-manage/
 │       └── SettingsPage.tsx     # 设置
 ├── scripts/
 │   ├── test-proxy-protocols.mjs # 四协议转换回归（离线）
+│   ├── test-proxy-pool.mjs      # 反向代理账号池准入回归（隔离账号库）
 │   ├── test-session-copy.mjs    # 会话复制回归（隔离临时数据根）
 │   └── test-stop-process.mjs    # 退出 WorkBuddy 的进程链路回归（同名替身进程）
 └── electron/main.mjs        # 桌面壳（内嵌 Express + 窗口）

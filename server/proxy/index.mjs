@@ -15,7 +15,7 @@
 import { Readable } from 'node:stream';
 import crypto from 'node:crypto';
 import { loadConfig, saveConfig, DEFAULT_PROXY } from '../store/config.mjs';
-import { loadAccounts, accountMeta, secretValue, hasPlainToken } from '../workbuddy/accounts.mjs';
+import { loadAccounts, accountMeta, secretValue } from '../workbuddy/accounts.mjs';
 import { variantOf } from '../workbuddy/variant.mjs';
 import { chatComplete, refreshAccessToken, fetchUpstreamModels, openUpstreamStream } from './wb.mjs';
 import { anthropicToOpenAi, buildAnthropicMessage, pipeAnthropicStream } from './anthropic.mjs';
@@ -61,17 +61,40 @@ function ensureKey() {
   return key;
 }
 
-/** 参与轮换的账号：只看有明文 access_token 的（加密信封无法用于出站请求） */
-function poolAccounts() {
+/** 出站可用的明文 access_token（空值或加密信封对象都不算） */
+function plainAccessToken(account) {
+  const t = secretValue(account, 'access_token');
+  return typeof t === 'string' && t.trim() ? t : '';
+}
+
+/** 出站可用的明文 refresh_token */
+function plainRefreshToken(account) {
+  const t = secretValue(account, 'refresh_token');
+  return typeof t === 'string' && t.trim() ? t : '';
+}
+
+/**
+ * 账号能否用于出站请求：有明文 access_token，**或**有明文 refresh_token
+ * （access_token 过期、甚至只存了加密信封，都能靠 refresh_token 换一份明文的回来）。
+ *
+ * ⚠️ 别用 `hasPlainToken` 当这个判据：它顺带把"已过期"也算成不可用，于是
+ * 「管理台离线几天、access_token 正好过期」的账号会被**静默踢出账号池**——
+ * 明明 refresh_token 还有效，界面却只回一句"没有可用账号"，把人往"重新扫码"上引。
+ * 那个函数在签到 / 切换账号 / 界面徽章里仍按原语义使用（那里"过期=不可用"是对的）。
+ */
+export function canEgress(account) {
+  return !!plainAccessToken(account) || !!plainRefreshToken(account);
+}
+
+/** 参与轮换的账号：能出站的（见 canEgress），再按界面选中的子集过滤 */
+export function poolAccounts() {
   const cfg = loadConfig();
   const raw = cfg.proxy?.accountIds;
   // null / 非数组 = 未指定 → 全部可用账号；[] = 明确一个都不选 → 池为空
   const selected = Array.isArray(raw) ? raw.filter((x) => typeof x === 'string') : null;
   if (selected && selected.length === 0) return [];
   return loadAccounts().filter((a) => {
-    if (typeof secretValue(a, 'access_token') !== 'string' || !secretValue(a, 'access_token').trim()) return false;
-    if (a?.access_token && typeof a.access_token === 'object') return false;
-    if (!hasPlainToken(a)) return false;
+    if (!canEgress(a)) return false;
     return selected ? selected.includes(a.id) : true;
   });
 }
@@ -86,8 +109,15 @@ function summarizeLog() {
   state.stats.lastAt = Date.now();
 }
 
-/** 账号是否需要先刷新（到期前 60 秒就刷，避免请求打到一半过期） */
-function needsRefresh(account) {
+/**
+ * 账号是否需要先刷新：到期前 60 秒就刷（避免请求打到一半过期），
+ * 另外**当前 token 出站根本用不了**（缺失 / 加密信封 / 已过期）时也必须先换明文。
+ *
+ * 注意"已过期"这里靠 `expiresAt - now < 0` 自然成立——**前提是账号还在池子里**
+ * （见 canEgress 的注释：池子必须收下"过期但可刷新"的账号，否则这行永远轮不到它）。
+ */
+export function needsRefresh(account) {
+  if (!plainAccessToken(account)) return true;
   const exp = Number(account?.expiresAt);
   return Number.isFinite(exp) && exp > 0 && exp - Date.now() < 60_000;
 }
@@ -667,7 +697,7 @@ function publicStatus(port, { reveal = false } = {}) {
   const selected = Array.isArray(stored) ? stored : loadAccounts().map((a) => a?.id).filter(Boolean);
   const accounts = loadAccounts().map((a) => {
     const meta = accountMeta(a);
-    const usable = typeof secretValue(a, 'access_token') === 'string' && hasPlainToken(a);
+    const usable = canEgress(a);
     return {
       id: meta.id,
       name: meta.name,
