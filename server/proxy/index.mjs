@@ -14,9 +14,10 @@
  */
 import { Readable } from 'node:stream';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
 import { loadConfig, saveConfig, DEFAULT_PROXY } from '../store/config.mjs';
 import { loadAccounts, accountMeta, secretValue } from '../workbuddy/accounts.mjs';
-import { variantOf } from '../workbuddy/variant.mjs';
+import { variantOf, VARIANT_LIST, authFilePath } from '../workbuddy/variant.mjs';
 import { chatComplete, refreshAccessToken, fetchUpstreamModels, openUpstreamStream } from './wb.mjs';
 import { anthropicToOpenAi, buildAnthropicMessage, pipeAnthropicStream } from './anthropic.mjs';
 import { responsesToOpenAi, buildResponsesReply, pipeResponsesStream } from './responses.mjs';
@@ -93,10 +94,35 @@ export function poolAccounts() {
   // null / 非数组 = 未指定 → 全部可用账号；[] = 明确一个都不选 → 池为空
   const selected = Array.isArray(raw) ? raw.filter((x) => typeof x === 'string') : null;
   if (selected && selected.length === 0) return [];
+  const loginUids = currentLoginUids();
   return loadAccounts().filter((a) => {
     if (!canEgress(a)) return false;
+    // 桌面端当前登录的账号**绝不参与出站**（显式勾选了也不行，见 currentLoginUids 注释）
+    if (a?.uid && loginUids.has(String(a.uid))) return false;
     return selected ? selected.includes(a.id) : true;
   });
+}
+
+/**
+ * 桌面端当前登录的 uid 集合（两个档位的登录态文件都查，读不到的档位当未登录）。
+ *
+ * 为什么要把当前登录账号剔出账号池：上游 11128 渠道风控除了按单请求内容判，
+ * **对账号也有连坐效应** —— 实测「代理带着账号 A 跑竞品系统提示词的流量」之后，
+ * 官方客户端用同一个账号 A 发消息也开始被拦。账号池默认收全部能出站的账号，
+ * 不加隔离就等于主动把官方客户端正登录的账号往风控枪口上送。
+ * 这里从机制上把两边分开：官方客户端用 A，代理只用其余账号。
+ */
+export function currentLoginUids() {
+  const uids = new Set();
+  for (const v of VARIANT_LIST) {
+    try {
+      const uid = JSON.parse(fs.readFileSync(authFilePath(v.id), 'utf8'))?.account?.uid;
+      if (typeof uid === 'string' && uid.trim()) uids.add(uid.trim());
+    } catch {
+      /* 没有登录态文件 / 解析失败 → 该档位当未登录 */
+    }
+  }
+  return uids;
 }
 
 function log(entry) {
@@ -830,6 +856,7 @@ function publicStatus(port, { reveal = false } = {}) {
   // 界面统一按"显式列表"理解：未指定（null）时展开成全部可用账号的 id
   const stored = cfg.proxy?.accountIds;
   const selected = Array.isArray(stored) ? stored : loadAccounts().map((a) => a?.id).filter(Boolean);
+  const loginUids = currentLoginUids();
   const accounts = loadAccounts().map((a) => {
     const meta = accountMeta(a);
     const usable = canEgress(a);
@@ -843,6 +870,8 @@ function publicStatus(port, { reveal = false } = {}) {
       expired: meta.expired,
       expiresAt: meta.expiresAt,
       selected: selected.length ? selected.includes(meta.id) : true,
+      // 桌面端当前登录的账号：即使勾选了也不在池里（poolAccounts 强制排除），界面据此禁勾并打标
+      isCurrentLogin: !!(meta.uid && loginUids.has(String(meta.uid))),
     };
   });
   return {

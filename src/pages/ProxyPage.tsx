@@ -408,6 +408,11 @@ export default function ProxyPage() {
   };
 
   const usableCount = useMemo(() => (data?.accounts || []).filter((a) => a.usable).length, [data]);
+  // 可参与出站的账号 = 可用 且 不是桌面端当前登录账号（后者被服务端强制排除）
+  const eligibleCount = useMemo(
+    () => (data?.accounts || []).filter((a) => a.usable && !a.isCurrentLogin).length,
+    [data]
+  );
   // base 结尾带 /v1；root 去掉 /v1（Gemini CLI 等只填域名根）；model 取实拉到的第一个模型
   const rootUrl = (data?.baseUrl || '').replace(/\/v1$/, '');
   const modelHint = data?.models.ids[0] || '<模型 ID>';
@@ -446,7 +451,8 @@ export default function ProxyPage() {
             <p className="mt-1.5 text-xs leading-5 text-zinc-500">
               开启后，本机其他 agent（Claude Code、Codex CLI、Gemini CLI、Cherry Studio、Cline、TRAE、小米 MiMo、豆包等）
               把地址指向下面的 Base URL，就能用 WorkBuddy 账号的积分与模型额度发请求。请求按账号池轮询，
-              401 时自动刷新 token 并换号重试。
+              401 时自动刷新 token 并换号重试。桌面端当前登录的账号会自动排除在池外，
+              避免同一账号被上游风控连坐（11128）导致官方客户端不可用。
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
@@ -525,9 +531,11 @@ export default function ProxyPage() {
         {data.enabled && data.poolCount === 0 && (
           <div className="mt-3">
             <Note tone="amber" title="当前账号池是空的">
-              {usableCount > 0
+              {eligibleCount > 0
                 ? '请在下方「参与轮换的账号」里至少勾选一个账号。'
-                : '账号库里没有可用于出站请求的账号（需要扫码登录导入的明文凭据），请先到「账号管理」添加。'}
+                : usableCount > 0
+                  ? '可用的账号只有桌面端当前登录的那个——该账号不参与代理出站（避免同一账号被上游风控连坐官方客户端）。请先切换客户端登录账号，或再导入一个账号。'
+                  : '账号库里没有可用于出站请求的账号（需要扫码登录导入的明文凭据），请先到「账号管理」添加。'}
             </Note>
           </div>
         )}
@@ -552,7 +560,7 @@ export default function ProxyPage() {
         icon={<IconKey />}
         title="参与轮换的账号"
         count={`${data.poolCount}/${usableCount}`}
-        desc="只有扫码登录导入的账号（含明文凭据）能用于出站请求"
+        desc="只有扫码登录导入的账号（含明文凭据）能用于出站请求；桌面端当前登录的账号会被自动排除，避免同一账号被上游风控连坐"
         actions={
           <Button size="sm" variant="subtle" onClick={() => void load()}>
             <IconRefresh className="w-3.5 h-3.5" />
@@ -567,17 +575,22 @@ export default function ProxyPage() {
             {data.accounts.map((a) => (
               <label
                 key={a.id}
-                className={`flex flex-wrap items-center gap-3 px-4 py-3 ${a.usable ? 'cursor-pointer' : 'opacity-60'}`}
+                className={`flex flex-wrap items-center gap-3 px-4 py-3 ${a.usable && !a.isCurrentLogin ? 'cursor-pointer' : 'opacity-60'}`}
               >
                 <input
                   type="checkbox"
-                  checked={a.selected && a.usable}
-                  disabled={!a.usable}
+                  checked={a.selected && a.usable && !a.isCurrentLogin}
+                  disabled={!a.usable || a.isCurrentLogin}
                   onChange={(e) => void toggleAccount(a.id, e.target.checked)}
                   className="accent-indigo-600 rounded"
                 />
                 <span className="min-w-0 flex-1 truncate text-sm text-zinc-800">{a.name}</span>
                 <Badge color="gray">{a.variantLabel}</Badge>
+                {a.isCurrentLogin && (
+                  <Badge color="blue" dot>
+                    桌面端登录中 · 不参与出站
+                  </Badge>
+                )}
                 {a.usable ? (
                   <Badge color={a.expired ? 'amber' : 'green'} dot>
                     {a.expired ? '凭据已过期（将自动刷新）' : '可用'}

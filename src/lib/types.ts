@@ -733,6 +733,8 @@ export interface ProxyAccount {
   expired: boolean;
   expiresAt: number | null;
   selected: boolean;
+  /** 是否为桌面端当前登录账号（该账号不参与代理出站，避免上游风控连坐官方客户端） */
+  isCurrentLogin: boolean;
 }
 
 export interface ProxyLog {
