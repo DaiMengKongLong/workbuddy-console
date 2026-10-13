@@ -1,0 +1,57 @@
+appId: com.workbuddy.console
+# productName 参与 exe / 安装目录命名，保持 ASCII 更稳；中文名放在快捷方式（用户可见处）
+productName: WorkBuddy Console
+directories:
+  buildResources: build
+  output: release
+files:
+  - dist/**
+  - electron/**
+  - server/**
+  - build/** # 运行时托盘图标也在 build/ 下，必须随包
+  - package.json
+# 统一产物命名（避免 productName 中的空格影响 Release 附件上传）
+artifactName: WorkBuddy-Console-${version}-${os}-${arch}.${ext}
+asar: true
+compression: normal
+
+win:
+  target:
+    - target: nsis
+      arch: [x64]
+  icon: build/icon.ico
+
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  shortcutName: WorkBuddy 管理台
+  # 安装完成后不立即启动：管理台会驻留后台，交给用户自己挑时机打开
+  runAfterFinish: true
+  installerIcon: build/icon.ico
+  uninstallerIcon: build/icon.ico
+
+mac:
+  target:
+    - target: dmg
+      arch: [arm64, x64]
+    # zip 便于不走 App Store 的直接分发，也是日后自动更新的载体
+    - target: zip
+      arch: [arm64, x64]
+  icon: build/icon.icns
+  category: public.app-category.developer-tools
+  darkModeSupport: true
+  # 未购买 Apple 开发者证书：identity null 走 ad-hoc 签名，
+  # 用户首次打开需「右键 → 打开」或在系统设置里放行（README 有说明）
+  identity: null
+  hardenedRuntime: false
+  gatekeeperAssess: false
+  notarize: false
+
+dmg:
+  # 安装界面：左边应用、右边 Applications 快捷方式
+  contents:
+    - { x: 130, y: 220 }
+    - { x: 410, y: 220, type: link, path: /Applications }
+
+npmRebuild: false

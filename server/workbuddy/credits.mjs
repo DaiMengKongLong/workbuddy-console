@@ -1,0 +1,876 @@
+/**
+ * 积分（资源余额）统计。
+ *
+ * 复刻 workbuddy-switch 的 credit_usage.rs + official_usage.rs 的核心逻辑，
+ * 但做了一处关键简化与一处关键增强：
+ *
+ * 简化：不再自己实现"快照推导消耗"作为唯一数据源。官方
+ * `get-user-request-usage` 接口直接给出**逐请求**的 credit 明细，
+ * 按日/按模型/按账号聚合后就是精确消耗，比本地快照差值法更准。
+ * 本地快照降级为**离线兜底**——接口不可用时仍能展示历史趋势。
+ *
+ * 增强：快照在每次成功查询后自动落盘（供离线兜底与"余额曲线"使用）。
+ */
+import { proxyFetch } from '../proxy.mjs';
+import { variantOf, getVariant } from './variant.mjs';
+import {
+  loadAccounts,
+  accountDisplayName,
+  secretValue,
+  CREDIT_SNAPSHOTS_FILE,
+  OFFICIAL_USAGE_CACHE_FILE,
+  readJsonFile,
+} from './accounts.mjs';
+import { atomicWriteJson } from '../store/config.mjs';
+
+/** 单次查询最多返回条数；超过时靠推进起点反复扫描 */
+const PAGE_SIZE = 3000;
+/** 每个账号落进 requests 明细的条数上限（前端分页展示，防止缓存文件膨胀） */
+const DETAIL_LIMIT = 1000;
+/** 连续扫描轮数上限，兜住"服务端异常回同一页"的死循环 */
+const MAX_ROUNDS = 100;
+/** 快照保留天数 */
+const SNAPSHOT_RETENTION_DAYS = 90;
+const SNAPSHOT_MAX_RECORDS = 5000;
+
+/** 缓存有效期：官方接口较慢，短时间内重复打开统计页直接用缓存 */
+const CACHE_TTL_MS = 5 * 60 * 1000;
+
+/** 请求头：与官方前端 Axios 拦截器保持一致，避免网关把请求判为未知客户端 */
+export function authHeaders(account, url) {
+  const variant = variantOf(account);
+  const origin = url.startsWith(variant.apiEndpoint) ? variant.apiEndpoint : getVariant(variant).apiEndpoint;
+  const headers = {
+    Authorization: `Bearer ${typeof secretValue(account, 'access_token') === 'string' ? secretValue(account, 'access_token') : ''}`,
+    Accept: 'application/json',
+    'Content-Type': 'application/json',
+    'X-Client-Platform': 'web',
+    Origin: origin,
+    Referer: `${origin}/profile/plans-usage`,
+  };
+  if (account?.uid) headers['X-User-Id'] = String(account.uid);
+  const eid = account?.enterpriseId || account?.enterprise_id;
+  if (eid) {
+    headers['X-Enterprise-Id'] = String(eid);
+    headers['X-Tenant-Id'] = String(eid);
+  }
+  if (account?.domain) headers['X-Domain'] = String(account.domain);
+  return headers;
+}
+
+/** 带账号凭据的 POST；网络失败原样抛出，由上层归类为"该账号查询失败" */
+async function authenticatedPost(account, url, body) {
+  const res = await proxyFetch(url, {
+    method: 'POST',
+    headers: authHeaders(account, url),
+    body: JSON.stringify(body),
+  });
+  const text = await res.text();
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    throw new Error(`接口返回非 JSON（HTTP ${res.status}）`);
+  }
+  return json;
+}
+
+/** 官方统一响应包：{ code, data, msg }。code 非 0 视为业务失败 */
+function unwrap(json) {
+  if (!json || typeof json !== 'object') throw new Error('接口返回为空');
+  const code = json.code ?? json.Code ?? 0;
+  if (code !== 0) {
+    const msg = json.msg || json.message || json.Message || `错误码 ${code}`;
+    // 401/未授权要能识别，以便提示"token 已失效，请重新登录"
+    const err = new Error(msg);
+    err.unauthorized = /401|unauthorized|未授权|登录|token/i.test(String(msg)) || code === 401;
+    throw err;
+  }
+  return json.data ?? json.Data ?? json;
+}
+
+/** 时间戳 → 本地日期字符串 YYYY-MM-DD */
+export function localDate(ts) {
+  const d = new Date(ts);
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${d.getFullYear()}-${m}-${day}`;
+}
+
+function dateStr(d) {
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${d.getFullYear()}-${m}-${day}`;
+}
+
+function dateTimeStr(d) {
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mm = String(d.getMinutes()).padStart(2, '0');
+  const ss = String(d.getSeconds()).padStart(2, '0');
+  return `${dateStr(d)} ${hh}:${mm}:${ss}`;
+}
+
+/**
+ * 解析一条请求明细的时间。官方返回 `requestTime` 为 "YYYY-MM-DD HH:mm:ss"
+ * 本地时间字符串；也兼容时间戳与 RFC3339。
+ */
+function parseRequestTime(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    // 秒级时间戳（10 位）转毫秒
+    const ms = value < 1e11 ? value * 1000 : value;
+    const d = new Date(ms);
+    return { ts: d.getTime(), date: dateStr(d), time: dateTimeStr(d) };
+  }
+  const text = String(value || '').trim();
+  if (!text) return null;
+  // "2026-10-12 11:37:00" 按本地时间解析（不用 new Date(text)，Safari/Node 对该格式不一致）
+  const m = text.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/);
+  if (m) {
+    const ts = new Date(
+      Number(m[1]), Number(m[2]) - 1, Number(m[3]),
+      Number(m[4]), Number(m[5]), Number(m[6])
+    ).getTime();
+    return { ts, date: m[1] + '-' + m[2] + '-' + m[3], time: text };
+  }
+  const parsed = Date.parse(text);
+  if (Number.isFinite(parsed)) {
+    const d = new Date(parsed);
+    return { ts: parsed, date: dateStr(d), time: dateTimeStr(d) };
+  }
+  return null;
+}
+
+function num(v) {
+  const n = typeof v === 'number' ? v : Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+
+/**
+ * 从单页响应里取出请求明细数组。
+ *
+ * 实测官方返回 `data.data`，另有 list / requests / records 等历史变体，一并兼容。
+ * 注意：明细里带 `input`（用户提问原文）与 `inputTrunc`，属于隐私内容，
+ * 这里只定位数组位置，字段级白名单在下方 rows.push 处执行——绝不整条透传。
+ */
+function extractRows(data) {
+  if (Array.isArray(data)) return data;
+  if (!data || typeof data !== 'object') return [];
+  const candidates = [data.data, data.list, data.requests, data.records, data.items, data.requestList];
+  for (const c of candidates) {
+    if (Array.isArray(c)) return c;
+  }
+  return [];
+}
+
+/**
+ * 扫描单个账号最近 N 天的官方请求用量。
+ *
+ * 服务端单次最多返回 PAGE_SIZE 条，且超限时**保留最早的一批**，
+ * 因此不能靠 total 判断是否取完，而是"取满就把起点推进到本轮最新一条"反复扫，
+ * 直到某一轮取不满为止。
+ */
+async function fetchAccountUsage(account, days) {
+  const variant = variantOf(account);
+  const url = variant.usageUrl;
+  const end = new Date();
+  const start = new Date();
+  start.setDate(start.getDate() - (days - 1));
+
+  const endTime = `${dateStr(end)} 23:59:59`;
+  let startTime = `${dateTimeStr(start)}`;
+  const rows = [];
+  const seen = new Set();
+  let rounds = 0;
+
+  while (rounds < MAX_ROUNDS) {
+    const json = await authenticatedPost(account, url, {
+      startTime,
+      endTime,
+      pageNum: 1,
+      pageSize: PAGE_SIZE,
+    });
+    const data = unwrap(json);
+    const page = extractRows(data);
+    if (!page.length) break;
+
+    let newestTs = 0;
+    page.forEach((raw, idx) => {
+      const time = parseRequestTime(raw?.requestTime ?? raw?.createTime ?? raw?.time);
+      if (!time) return;
+      if (time.ts > newestTs) newestTs = time.ts;
+      // requestId 缺失时用「时间+模型+序号」构造去重键，保证多轮扫描不重复计入
+      const id = String(raw?.requestId ?? raw?.id ?? `${time.ts}|${raw?.model ?? ''}|${idx}`);
+      if (seen.has(id)) return;
+      seen.add(id);
+      rows.push({
+        requestId: id,
+        ts: time.ts,
+        date: time.date,
+        time: time.time,
+        model: String(raw?.model || 'unknown'),
+        client: String(raw?.client || ''),
+        credit: num(raw?.credit ?? raw?.credits),
+      });
+    });
+
+    // 未取满 = 区间内数据已扫完
+    if (page.length < PAGE_SIZE) break;
+    if (!newestTs) break;
+    // 起点无法推进（服务端返回的时间没有前进）= 停滞，保留已有数据退出
+    const next = new Date(newestTs + 1000);
+    const nextStart = `${dateTimeStr(next)}`;
+    if (nextStart <= startTime) break;
+    startTime = nextStart;
+    rounds++;
+  }
+
+  return rows;
+}
+
+/* ---------------- 本地快照（离线兜底 + 余额曲线） ---------------- */
+
+export function loadSnapshots() {
+  const raw = readJsonFile(CREDIT_SNAPSHOTS_FILE, []);
+  return Array.isArray(raw) ? raw : [];
+}
+
+/** 记录一次余额观察；5 分钟内的重复快照不重复落盘（去重窗口） */
+export function recordSnapshot(account, total, remaining) {
+  const snapshots = loadSnapshots();
+  const now = Date.now();
+  const last = snapshots
+    .filter((s) => s?.accountId === account.id)
+    .sort((a, b) => b.ts - a.ts)[0];
+  if (last && Math.abs(num(last.total) - total) < 0.01 && Math.abs(num(last.remaining) - remaining) < 0.01) {
+    return; // 余额没变，不写
+  }
+  snapshots.push({
+    ts: now,
+    accountId: account.id,
+    accountName: accountDisplayName(account),
+    variant: variantOf(account).id,
+    total: Math.max(0, total),
+    remaining: Math.max(0, remaining),
+  });
+  // 保留期裁剪
+  const cutoff = now - SNAPSHOT_RETENTION_DAYS * 24 * 3600 * 1000;
+  const kept = snapshots
+    .filter((s) => num(s?.ts) >= cutoff)
+    .sort((a, b) => a.ts - b.ts)
+    .slice(-SNAPSHOT_MAX_RECORDS);
+  atomicWriteJson(CREDIT_SNAPSHOTS_FILE, kept);
+}
+
+/**
+ * 商品码 → 官方中文名。
+ *
+ * 来源与 workbuddy-switch 一致（官方客户端 asar 内的 package-name-resolver.ts）：
+ * 国内版不直接用后端下发的 PackageName（那是运营原文），统一按商品码映射成前端文案，
+ * 国际版才用 PackageName。未登记的商品码保持回落链，不会漏展示。
+ * 官方新增商品码时需手工同步。
+ */
+const CREDIT_PACKAGE_NAMES = {
+  TCACA_code_001_PqouKr6QWV: 'CodeBuddy 个人体验版',
+  TCACA_code_002_AkiJS3ZHF5: '版本基础用量',
+  TCACA_code_003_FAnt7lcmRT: 'CodeBuddy 个人标准版',
+  TCACA_code_005_maRGyrHhw1: '版本基础用量',
+  TCACA_code_006_DbXS0lrypC: 'CodeBuddy 个人体验版',
+  TCACA_code_007_nzdH5h4Nl0: '平台奖励积分',
+  TCACA_code_008_cfWoLwvjU4: '版本基础用量',
+  TCACA_code_009_0XmEQc2xOf: '购买积分',
+  TCACA_code_023_4xbGhMrE6q: '版本基础用量',
+  TCACA_code_026_BaESVICNoi: '版本基础用量',
+  TCACA_code_027_0FCGVA6vSa: '版本基础用量',
+  TCACA_code_028_NtpWi0jzXs: '版本赠送用量',
+  TCACA_code_029_6wCGEWquYy: '平台奖励积分',
+  TCACA_code_030_BjSt89qTvr: '平台奖励积分',
+  TCACA_code_035_ArVxJcGDsm: '版本基础用量',
+  TCACA_code_036_lupO5WgNdG: '版本赠送用量',
+  TCACA_code_037_WxOD3MpI2o: '版本赠送用量',
+  TCACA_code_038_OhvqZtiPKr: '购买积分',
+  TCACA_code_039_KRcQj7wUat: '版本基础用量',
+  TCACA_code_040_mi9rCYg46x: '版本基础用量',
+};
+
+/** 到期时间早于「扣除结束时间 + 该天数」时改用周期结束时间（视前者为长期占位） */
+const EXPIRY_CYCLE_OVERRIDE_DAYS = 30;
+/** 距现在超过该天数视为长期有效（官方占位值） */
+const FAR_FUTURE_EXPIRY_DAYS = 365;
+/** 临近到期窗口 */
+const EXPIRING_SOON_DAYS = 7;
+
+/**
+ * 付费 / 免费积分包的**明细**接口（与汇总接口分开）。
+ *
+ * 汇总接口只给当前周期的总额与剩余，**不含任何到期字段**；到期时间只在明细
+ * 接口的记录里（`DeductionEndTime` / `CycleEndTime` / `ExpiredTime`）。
+ * 两者按 PackageCode 关联：汇总决定权威数额，明细只负责补到期时间。
+ * 商品码清单与 workbuddy-switch 一致（∪ 官方客户端 PAID/FREE_PACKAGE_CODES），
+ * 请求体多带码对不存在的包无副作用。
+ */
+const RESOURCE_PAID_PACKAGES_PATH = '/billing/meter/get-user-resource-paid-packages';
+const RESOURCE_FREE_PACKAGES_PATH = '/billing/meter/get-user-resource-free-packages';
+const PAID_PACKAGE_CODES = [
+  'TCACA_code_002_AkiJS3ZHF5',
+  'TCACA_code_023_4xbGhMrE6q',
+  'TCACA_code_026_BaESVICNoi',
+  'TCACA_code_027_0FCGVA6vSa',
+  'TCACA_code_009_0XmEQc2xOf',
+  'TCACA_code_038_OhvqZtiPKr',
+  'TCACA_code_003_FAnt7lcmRT',
+  'TCACA_code_036_lupO5WgNdG',
+];
+const FREE_PACKAGE_CODES = [
+  'TCACA_code_008_cfWoLwvjU4',
+  'TCACA_code_007_nzdH5h4Nl0',
+  'TCACA_code_028_NtpWi0jzXs',
+  'TCACA_code_029_6wCGEWquYy',
+  'TCACA_code_030_BjSt89qTvr',
+  'TCACA_code_001_PqouKr6QWV',
+  'TCACA_code_006_DbXS0lrypC',
+  'TCACA_code_035_ArVxJcGDsm',
+  'TCACA_code_037_WxOD3MpI2o',
+  'TCACA_code_039_KRcQj7wUat',
+  'TCACA_code_040_mi9rCYg46x',
+];
+
+/** 取第一个有值的字段（官方大小写变体都要兼容） */
+function firstValue(raw, keys) {
+  for (const k of keys) {
+    const v = raw?.[k];
+    if (v !== undefined && v !== null && v !== '') return v;
+  }
+  return undefined;
+}
+
+/**
+ * 时间字段 → 毫秒时间戳。
+ * 兼容三种形态：毫秒/秒级数字、"YYYY-MM-DD HH:mm:ss" 本地时间字符串、可被
+ * Date.parse 解析的其他字符串。无法解析返回 null。
+ */
+function parseTimestampMs(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value < 1e11 ? value * 1000 : value;
+  }
+  if (typeof value === 'string' && value.trim()) {
+    const n = Number(value);
+    if (Number.isFinite(n)) return n < 1e11 ? n * 1000 : n;
+    // 明细接口的到期字段是这个格式，且必须是本地时间（不能丢给 Date.parse 赌实现）
+    const m = value.trim().match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/);
+    if (m) {
+      return new Date(
+        Number(m[1]), Number(m[2]) - 1, Number(m[3]),
+        Number(m[4]), Number(m[5]), Number(m[6])
+      ).getTime();
+    }
+    const parsed = Date.parse(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return null;
+}
+
+/**
+ * 解析单个资源包的到期时刻。
+ *
+ * 优先 DeductionEndTime / ExpiredTime；仅当 CycleEndTime 比其早超过 30 天时
+ * 改用周期结束时间（前者是长期占位）。最终值距现在超过 365 天视为长期有效。
+ */
+function resolveExpireAt(raw, now) {
+  const deductionEnd = parseTimestampMs(
+    firstValue(raw, ['DeductionEndTime', 'deductionEndTime', 'ExpiredTime', 'expiredTime']),
+  );
+  const cycleEnd = parseTimestampMs(firstValue(raw, ['CycleEndTime', 'cycleEndTime']));
+  const overrideMs = EXPIRY_CYCLE_OVERRIDE_DAYS * 24 * 3600 * 1000;
+  let expireAt = null;
+  if (deductionEnd != null && cycleEnd != null && deductionEnd - cycleEnd > overrideMs) {
+    expireAt = cycleEnd;
+  } else if (deductionEnd != null) {
+    expireAt = deductionEnd;
+  } else {
+    expireAt = cycleEnd;
+  }
+  if (expireAt == null) return null;
+  return expireAt - now <= FAR_FUTURE_EXPIRY_DAYS * 24 * 3600 * 1000 ? expireAt : null;
+}
+
+/** 官方资源包名：商品码命中映射用映射名，否则回落 PackageName → packageCode */
+function creditPackageName(raw) {
+  const code = firstValue(raw, ['PackageCode', 'packageCode']);
+  const name = firstValue(raw, ['PackageName', 'packageName']);
+  if (code && CREDIT_PACKAGE_NAMES[code]) return CREDIT_PACKAGE_NAMES[code];
+  return name || code || '积分包';
+}
+
+/**
+ * 拉取付费 / 免费两类积分包明细，返回「商品码 → 该码下最早的未过期到期时刻」。
+ *
+ * 明细接口一次返回全部历史成交记录（含已用完、已到期的），同一 PackageCode 会有
+ * 很多条；对汇总里的一个包来说，真正该提醒的是**最早那个还没过的到期日**。
+ * 明细查询失败不影响汇总结果——只是各包到期时间显示为「长期有效」。
+ */
+async function fetchPackageExpiryMap(account, origin) {
+  const paidBody = {
+    PageNumber: 1,
+    PageSize: 200,
+    Status: [0, 3],
+    PackageCodes: PAID_PACKAGE_CODES,
+    NeedRenewInfo: true,
+  };
+  const today = dateStr(new Date());
+  const freeBody = {
+    PageNumber: 1,
+    PageSize: 200,
+    Status: [0, 3],
+    PackageCodes: FREE_PACKAGE_CODES,
+    SlicePeriodStartTime: `${today} 00:00:00`,
+    SlicePeriodEndTime: `${today} 23:59:59`,
+  };
+
+  const [paidRes, freeRes] = await Promise.allSettled([
+    authenticatedPost(account, origin + RESOURCE_PAID_PACKAGES_PATH, paidBody),
+    authenticatedPost(account, origin + RESOURCE_FREE_PACKAGES_PATH, freeBody),
+  ]);
+
+  const now = Date.now();
+  /** 商品码 → 最早的未过期到期时刻（毫秒） */
+  const map = new Map();
+  const consider = (raw) => {
+    const code = firstValue(raw, ['PackageCode', 'packageCode']);
+    if (!code) return;
+    const expireAt = resolveExpireAt(raw, now);
+    if (expireAt == null || expireAt <= now) return; // 已过期/长期有效不参与
+    const prev = map.get(code);
+    if (prev == null || expireAt < prev) map.set(code, expireAt);
+  };
+
+  for (const settled of [paidRes, freeRes]) {
+    if (settled.status !== 'fulfilled') continue;
+    let data;
+    try {
+      data = unwrap(settled.value);
+    } catch {
+      continue; // 单侧失败不影响另一侧
+    }
+    const list = data?.Accounts ?? data?.accounts ?? (Array.isArray(data) ? data : []);
+    if (Array.isArray(list)) list.forEach(consider);
+  }
+  return map;
+}
+
+/**
+ * 查询单个账号的资源余额（积分，单位 credits）。
+ *
+ * 三个接口合并，各自职责分明：
+ *
+ * 1. `get-user-resource-summary`（汇总）——**权威数额**。返回 `data.Packages[]`，
+ *    每包给出周期总额/剩余/已用，但不含任何到期字段；
+ * 2. `get-user-resource-paid-packages` / `-free-packages`（明细）——只用来补
+ *    **到期时间**，按 PackageCode 关联到汇总的包上。
+ *
+ * 之所以不让明细参与求和：明细是逐笔成交记录，同一商品码会有很多条历史，
+ * 直接相加会和汇总的周期口径重复计算。汇总的 remaining 才是当前真实余额。
+ *
+ * 同时保留旧版标量形状（remaining/total）作为兼容兜底。
+ */
+async function fetchBalance(account) {
+  const variant = variantOf(account);
+  const json = await authenticatedPost(account, variant.resourceUrl, {});
+  const data = unwrap(json);
+
+  const packages = Array.isArray(data?.Packages)
+    ? data.Packages
+    : Array.isArray(data?.packages)
+      ? data.packages
+      : null;
+
+  if (packages?.length) {
+    const now = Date.now();
+    let total = 0;
+    let remaining = 0;
+    let used = 0;
+    const details = [];
+    for (const p of packages) {
+      const t = num(p?.CycleTotalCapacity ?? p?.totalCapacity);
+      const r = num(p?.CycleRemainCapacity ?? p?.remainCapacity);
+      const u = num(p?.CycleUsedCapacity ?? p?.usedCapacity);
+      total += t;
+      remaining += r;
+      used += u;
+      const code = firstValue(p, ['PackageCode', 'packageCode']) ?? null;
+      details.push({
+        packageCode: code,
+        name: creditPackageName(p),
+        total: round2(t),
+        remaining: round2(r),
+        used: round2(u),
+        expireAt: null, // 下面用明细接口补
+        expired: false,
+        expiringSoon: false,
+      });
+    }
+    // 剩余 + 已用 与总额对不上时（部分包无 used 字段），以总额减剩余兜底
+    if (used <= 0 && total > remaining) used = total - remaining;
+
+    // 明细接口补到期时间；失败则所有包保持"长期有效"，不影响余额展示
+    try {
+      const expiryMap = await fetchPackageExpiryMap(account, variant.apiEndpoint);
+      for (const d of details) {
+        const expireAt = (d.packageCode && expiryMap.get(d.packageCode)) ?? null;
+        d.expireAt = expireAt;
+        d.expired = expireAt != null && expireAt <= now;
+        d.expiringSoon = expireAt != null && expireAt > now && expireAt - now <= EXPIRING_SOON_DAYS * 24 * 3600 * 1000;
+      }
+    } catch {
+      /* 明细查询失败：到期时间留空 */
+    }
+
+    // 有剩余且未到期的排前面，同序按到期时间升序
+    details.sort((a, b) => {
+      const ra = a.remaining > 0 && !a.expired ? 0 : 1;
+      const rb = b.remaining > 0 && !b.expired ? 0 : 1;
+      if (ra !== rb) return ra - rb;
+      const ea = a.expireAt ?? Number.POSITIVE_INFINITY;
+      const eb = b.expireAt ?? Number.POSITIVE_INFINITY;
+      return ea === eb ? 0 : ea < eb ? -1 : 1;
+    });
+    return {
+      total: round2(total),
+      remaining: round2(remaining),
+      used: round2(used),
+      packageCount: packages.length,
+      unit: packages[0]?.CapacityUnit || 'credits',
+      packages: details,
+    };
+  }
+
+  // 标量形状兜底
+  const pick = (...keys) => {
+    for (const k of keys) {
+      if (data?.[k] !== undefined && data?.[k] !== null && data[k] !== '') {
+        const n = num(data[k]);
+        if (Number.isFinite(n)) return n;
+      }
+    }
+    return null;
+  };
+  const remaining = pick('remaining', 'remain', 'remainCredit', 'available', 'availableCredit');
+  const total = pick('total', 'totalCredit', 'quota');
+  if (remaining == null && total == null) {
+    throw new Error('接口返回中没有可识别的余额字段');
+  }
+  const rem = remaining ?? 0;
+  const tot = total ?? 0;
+  return {
+    total: round2(tot),
+    remaining: round2(rem),
+    used: round2(tot > 0 ? Math.max(0, tot - rem) : 0),
+    packageCount: 0,
+    unit: 'credits',
+    packages: [],
+  };
+}
+
+function round2(n) {
+  return Math.round(num(n) * 100) / 100;
+}
+
+/**
+ * 只查各账号的积分余额（含积分包明细），不走用量明细扫描。
+ *
+ * 账号页卡片要用「余额 + 近期到期」，那只需要一次资源接口；`getCreditStatistics`
+ * 还要额外扫 30 天逐请求用量（上千条），放在账号页会把首屏拖慢。两者缓存策略
+ * 相互独立：这里的结果只在进程内保留 BALANCE_CACHE_TTL_MS，落盘仍由
+ * `recordSnapshot` 负责（给离线兜底用）。
+ */
+const BALANCE_CACHE_TTL_MS = 2 * 60 * 1000;
+let balanceCache = { at: 0, payload: null };
+
+export async function getAccountBalances({ refresh = false } = {}) {
+  const now = Date.now();
+  if (!refresh && balanceCache.payload && now - balanceCache.at < BALANCE_CACHE_TTL_MS) {
+    return { ...balanceCache.payload, cached: true };
+  }
+
+  const accounts = loadAccounts().filter((a) => a?.uid);
+  const rows = [];
+  const errors = [];
+
+  for (const account of accounts) {
+    const variant = variantOf(account);
+    const base = {
+      accountId: account.id,
+      accountName: accountDisplayName(account),
+      variant: variant.id,
+      variantLabel: variant.label,
+    };
+    try {
+      const b = await fetchBalance(account);
+      recordSnapshot(account, b.total, b.remaining);
+      rows.push({ ...base, balance: { ...b, updatedAt: now }, balanceError: null, error: null });
+    } catch (err) {
+      rows.push({ ...base, balance: null, balanceError: err?.message || '余额查询失败', error: err?.message || '查询失败' });
+      errors.push({ ...base, error: err?.message || '查询失败' });
+    }
+  }
+
+  const payload = {
+    collectedAt: now,
+    accounts: rows,
+    errors,
+  };
+  balanceCache = { at: now, payload };
+  return { ...payload, cached: false };
+}
+
+/* ---------------- 主入口 ---------------- */
+
+/** 本工具缓存 payload 的结构标识；读到别的结构一律当缓存不存在 */
+const CACHE_SCHEMA = 'wb-console-credit-v1';
+
+function readCache() {
+  const raw = readJsonFile(OFFICIAL_USAGE_CACHE_FILE, null);
+  const payload = raw?.payload;
+  if (!payload || typeof payload !== 'object') return null;
+  // 结构校验：必须是本工具写的（对方程序/旧版本的 payload 字段完全不同）
+  if (payload.schema !== CACHE_SCHEMA) return null;
+  if (!Array.isArray(payload.requests) || !Array.isArray(payload.accounts)) return null;
+  // 账号行必须带 variant：没有就说明是外来结构，直接丢弃而不是拿残缺数据渲染
+  if (payload.accounts.length && !('variant' in payload.accounts[0])) return null;
+  return payload;
+}
+
+/**
+ * 积分统计。
+ *
+ * @param {object} opts
+ * @param {number} opts.days 统计窗口天数（默认 30）
+ * @param {boolean} opts.refresh true 时绕过缓存重新打官方接口
+ * @param {'all'|'cn'|'ai'} opts.variant 档位筛选：只统计该档位的账号（默认 all）
+ */
+export async function getCreditStatistics({ days = 30, refresh = false, variant = 'all' } = {}) {
+  const variantFilter = variant === 'cn' || variant === 'ai' ? variant : 'all';
+  const accounts = loadAccounts()
+    .filter((a) => a?.uid)
+    .filter((a) => variantFilter === 'all' || variantOf(a).id === variantFilter);
+  const now = Date.now();
+
+  // 缓存命中则直接返回，避免每次打开统计页都打官方接口
+  if (!refresh) {
+    const cached = readCache();
+    // 档位筛选结果不能跨档位复用：缓存里的筛选口径必须一致
+    if (cached && (cached.variantFilter || 'all') === variantFilter && now - num(cached.collectedAt) < CACHE_TTL_MS) {
+      return { ...cached, cached: true };
+    }
+  }
+
+  const start = new Date();
+  start.setDate(start.getDate() - (days - 1));
+  const rangeStart = dateStr(start);
+  const rangeEnd = dateStr(new Date(now));
+
+  const allRows = [];
+  const accountsResult = [];
+  const errors = [];
+  let collectedAt = 0;
+
+  for (const account of accounts) {
+    const variant = variantOf(account);
+    const base = {
+      accountId: account.id,
+      accountName: accountDisplayName(account),
+      variant: variant.id,
+      variantLabel: variant.label,
+    };
+    try {
+      const rows = await fetchAccountUsage(account, days);
+      collectedAt = now;
+      allRows.push(...rows.map((r) => ({ ...r, ...base })));
+
+      // 余额单独查：失败不影响用量统计（降级为余额未知）
+      let balance = null;
+      let balanceError = null;
+      try {
+        const b = await fetchBalance(account);
+        balance = { ...b, updatedAt: now };
+        recordSnapshot(account, b.total, b.remaining);
+      } catch (err) {
+        balanceError = err?.message || '余额查询失败';
+      }
+
+      const credit = rows.reduce((s, r) => s + r.credit, 0);
+      accountsResult.push({
+        ...base,
+        requests: rows.length,
+        credit,
+        balance,
+        balanceError,
+        error: null,
+      });
+    } catch (err) {
+      accountsResult.push({
+        ...base,
+        requests: 0,
+        credit: 0,
+        balance: null,
+        balanceError: null,
+        error: err?.message || '查询失败',
+        unauthorized: !!err?.unauthorized,
+      });
+      errors.push({ ...base, error: err?.message || '查询失败' });
+    }
+  }
+
+  const payload = buildProjection({
+    allRows,
+    accountsResult,
+    errors,
+    rangeStart,
+    rangeEnd,
+    collectedAt: now,
+    days,
+    variantFilter,
+  });
+
+  // 只有真的取到数据才覆盖缓存，避免一次网络抖动把好缓存冲掉
+  if (collectedAt) {
+    try {
+      atomicWriteJson(OFFICIAL_USAGE_CACHE_FILE, { payload });
+    } catch {
+      /* 缓存写失败不影响本次返回 */
+    }
+  }
+  return { ...payload, cached: false };
+}
+
+/** 把逐请求明细投影成界面需要的聚合结构（离线缓存与在线结果共用这一份口径） */
+function buildProjection({ allRows, accountsResult, errors, rangeStart, rangeEnd, collectedAt, days, variantFilter = 'all' }) {
+  const dailyMap = new Map();
+  const modelMap = new Map();
+  const accountMap = new Map();
+
+  for (const r of allRows) {
+    // daily
+    let d = dailyMap.get(r.date);
+    if (!d) d = { date: r.date, credit: 0, requests: 0, models: new Map() };
+    d.credit += r.credit;
+    d.requests += 1;
+    d.models.set(r.model, (d.models.get(r.model) || 0) + r.credit);
+    dailyMap.set(r.date, d);
+
+    // byModel
+    let m = modelMap.get(r.model);
+    if (!m) m = { model: r.model, credit: 0, requests: 0 };
+    m.credit += r.credit;
+    m.requests += 1;
+    modelMap.set(r.model, m);
+
+    // byAccount
+    let a = accountMap.get(r.accountId);
+    if (!a) a = { accountId: r.accountId, accountName: r.accountName, credit: 0, requests: 0 };
+    a.credit += r.credit;
+    a.requests += 1;
+    accountMap.set(r.accountId, a);
+  }
+
+  const today = dateStr(new Date());
+  const totalCredit = allRows.reduce((s, r) => s + r.credit, 0);
+
+  const daily = [...dailyMap.values()]
+    .sort((a, b) => (a.date < b.date ? -1 : 1))
+    .map((d) => ({
+      date: d.date,
+      credit: d.credit,
+      requests: d.requests,
+      byModel: Object.fromEntries([...d.models.entries()].sort((x, y) => y[1] - x[1])),
+    }));
+
+  const models = [...modelMap.values()].sort((a, b) => b.credit - a.credit);
+
+  // 按档位分流：全部视图下给出国内版/国际版各自的消耗，方便"归类看"
+  const variantMap = new Map();
+  for (const r of allRows) {
+    const v = r.variant || 'cn';
+    let x = variantMap.get(v);
+    if (!x) x = { variant: v, credit: 0, requests: 0 };
+    x.credit += r.credit;
+    x.requests += 1;
+    variantMap.set(v, x);
+  }
+  const variantTotals = [...variantMap.values()].sort((a, b) => b.credit - a.credit);
+
+  // 明细按消耗降序截断，控制缓存体积与前端渲染压力
+  const requests = [...allRows].sort((a, b) => b.credit - a.credit).slice(0, DETAIL_LIMIT);
+
+  return {
+    schema: CACHE_SCHEMA,
+    variantFilter,
+    status: errors.length && !allRows.length ? 'error' : errors.length ? 'partial' : 'complete',
+    collectedAt,
+    rangeStart,
+    rangeEnd,
+    days,
+    detailLimitPerAccount: DETAIL_LIMIT,
+    summary: {
+      usageToday: daily.find((d) => d.date === today)?.credit ?? 0,
+      usage7Days: daily.slice(-7).reduce((s, d) => s + d.credit, 0),
+      usageThisMonth: totalCredit,
+      totalRequests: allRows.length,
+    },
+    accounts: accountsResult,
+    daily,
+    models,
+    variantTotals,
+    requests,
+    errors,
+  };
+}
+
+/**
+ * 离线兜底：官方接口不可用时，用本地快照推导"观察到的消耗"。
+ *
+ * WorkBuddy 只返回当前余额，没有历史账单，因此这里用**相邻快照的正向下降量**
+ * 推导消耗；首次快照和余额上升只建立基线，不产生负数消耗。
+ */
+export function getOfflineCreditProjection({ days = 30 } = {}) {
+  const now = Date.now();
+  const cutoff = now - days * 24 * 3600 * 1000;
+  const snapshots = loadSnapshots()
+    .filter((s) => num(s?.ts) >= cutoff && s?.accountId)
+    .sort((a, b) => a.ts - b.ts);
+
+  const perAccount = new Map();
+  for (let i = 1; i < snapshots.length; i++) {
+    const prev = snapshots[i - 1];
+    const cur = snapshots[i];
+    if (prev.accountId !== cur.accountId) continue;
+    const delta = num(prev.remaining) - num(cur.remaining);
+    if (delta <= 0) continue; // 余额没降或上升（充值/赠送）→ 不算消耗
+    let acc = perAccount.get(cur.accountId);
+    if (!acc) {
+      acc = {
+        accountId: cur.accountId,
+        accountName: cur.accountName,
+        variant: cur.variant || 'cn',
+        consumed: 0,
+        events: 0,
+        lastRemaining: num(cur.remaining),
+        total: num(cur.total),
+      };
+      perAccount.set(cur.accountId, acc);
+    }
+    acc.consumed += delta;
+    acc.events += 1;
+    acc.lastRemaining = num(cur.remaining);
+    acc.total = num(cur.total);
+  }
+
+  const accounts = [...perAccount.values()];
+  return {
+    offline: true,
+    generatedAt: now,
+    days,
+    accounts,
+    totalConsumed: accounts.reduce((s, a) => s + a.consumed, 0),
+    snapshotCount: snapshots.length,
+  };
+}

@@ -1,0 +1,22 @@
+node_modules/
+dist/
+release/
+release-*/
+out/
+out-*/
+.screenshots/
+# 本地开发脚手架 / UI 走查截图等临时产物，不进版本库
+/_dev/
+*.log
+.DS_Store
+/.zcode
+/.workbuddy/memory
+/.workbuddy
+
+# 环境变量与凭据文件：本项目不需要（API Key 存 ~/.free-token/config.json），
+# 此处列出仅为防止日后误提交
+.env
+.env.*
+*.pem
+*.key
+*.p12

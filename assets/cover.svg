@@ -1,0 +1,143 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#211d52"/>
+      <stop offset="1" stop-color="#0a0918"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#6366f1" stop-opacity="0.55"/>
+      <stop offset="0.55" stop-color="#6366f1" stop-opacity="0.16"/>
+      <stop offset="1" stop-color="#6366f1" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glowR" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#8b5cf6" stop-opacity="0.32"/>
+      <stop offset="1" stop-color="#8b5cf6" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="title" x1="0" y1="0" x2="1" y2="0.4">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="0.62" stop-color="#e9e6ff"/>
+      <stop offset="1" stop-color="#a5b4fc"/>
+    </linearGradient>
+    <linearGradient id="rule" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.22"/>
+      <stop offset="0.55" stop-color="#ffffff" stop-opacity="0.08"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <pattern id="dots" width="34" height="34" patternUnits="userSpaceOnUse">
+      <circle cx="2" cy="2" r="1.4" fill="#ffffff"/>
+    </pattern>
+  </defs>
+
+  <!-- 背景 -->
+  <rect width="1280" height="640" fill="url(#bg)"/>
+  <rect width="1280" height="640" fill="url(#dots)" opacity="0.055"/>
+  <circle cx="300" cy="300" r="460" fill="url(#glow)"/>
+  <circle cx="1130" cy="70" r="330" fill="url(#glowR)"/>
+
+  <!-- 吉祥物周围的同心圆环 -->
+  <circle cx="300" cy="300" r="252" fill="none" stroke="#6366f1" stroke-opacity="0.20" stroke-width="1.5"/>
+  <circle cx="300" cy="300" r="308" fill="none" stroke="#6366f1" stroke-opacity="0.10" stroke-width="1.5"/>
+
+  <!-- 背景星光 -->
+  <path d="M0 -16 C2 -6 6 -2 16 0 C6 2 2 6 0 16 C-2 6 -6 2 -16 0 C-6 -2 -2 -6 0 -16 Z"
+    transform="translate(96 92) scale(1.15)" fill="#fbbf24" opacity="0.9"/>
+  <path d="M0 -16 C2 -6 6 -2 16 0 C6 2 2 6 0 16 C-2 6 -6 2 -16 0 C-6 -2 -2 -6 0 -16 Z"
+    transform="translate(608 592) scale(0.55)" fill="#a5b4fc" opacity="0.45"/>
+  <path d="M0 -16 C2 -6 6 -2 16 0 C6 2 2 6 0 16 C-2 6 -6 2 -16 0 C-6 -2 -2 -6 0 -16 Z"
+    transform="translate(520 104) scale(0.7)" fill="#6ee7b7" opacity="0.55"/>
+  <path d="M0 -16 C2 -6 6 -2 16 0 C6 2 2 6 0 16 C-2 6 -6 2 -16 0 C-6 -2 -2 -6 0 -16 Z"
+    transform="translate(560 560) scale(0.85)" fill="#fbbf24" opacity="0.5"/>
+  <path d="M0 -16 C2 -6 6 -2 16 0 C6 2 2 6 0 16 C-2 6 -6 2 -16 0 C-6 -2 -2 -6 0 -16 Z"
+    transform="translate(1232 300) scale(0.9)" fill="#a5b4fc" opacity="0.45"/>
+  <path d="M0 -16 C2 -6 6 -2 16 0 C6 2 2 6 0 16 C-2 6 -6 2 -16 0 C-6 -2 -2 -6 0 -16 Z"
+    transform="translate(660 46) scale(0.5)" fill="#a5b4fc" opacity="0.4"/>
+  <path d="M0 -16 C2 -6 6 -2 16 0 C6 2 2 6 0 16 C-2 6 -6 2 -16 0 C-6 -2 -2 -6 0 -16 Z"
+    transform="translate(1050 486) scale(0.55)" fill="#6ee7b7" opacity="0.35"/>
+
+  <!-- 吉祥物（内联自 logo.svg） -->
+  <g transform="translate(89.76 74.85) scale(0.79)">
+    
+  <defs>
+    <linearGradient id="ft-body" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#818cf8"/>
+      <stop offset="1" stop-color="#6d28d9"/>
+    </linearGradient>
+    <linearGradient id="ft-ear" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#6366f1"/>
+      <stop offset="1" stop-color="#5b21b6"/>
+    </linearGradient>
+  </defs>
+
+  <!-- 地面投影 -->
+  <ellipse cx="256" cy="482" rx="118" ry="16" fill="#312e81" opacity="0.18"/>
+
+  <!-- 左耳 -->
+  <path d="M118 208 L146 72 L268 138 Z" fill="url(#ft-ear)" stroke="url(#ft-ear)" stroke-width="28" stroke-linejoin="round"/>
+  <path d="M162 178 L164 112 L228 148 Z" fill="#c7d2fe" stroke="#c7d2fe" stroke-width="14" stroke-linejoin="round"/>
+  <!-- 右耳 -->
+  <path d="M394 208 L366 72 L244 138 Z" fill="url(#ft-ear)" stroke="url(#ft-ear)" stroke-width="28" stroke-linejoin="round"/>
+  <path d="M350 178 L348 112 L284 148 Z" fill="#c7d2fe" stroke="#c7d2fe" stroke-width="14" stroke-linejoin="round"/>
+
+  <!-- 代币本体 -->
+  <circle cx="256" cy="296" r="166" fill="url(#ft-body)"/>
+  <circle cx="256" cy="296" r="132" fill="none" stroke="#ffffff" stroke-opacity="0.28" stroke-width="9"/>
+
+  <!-- 闪电徽记 -->
+  <path d="M272 172 L204 280 L248 280 L238 348 L308 246 L260 246 Z"
+        fill="#fde047" stroke="#fde047" stroke-width="10" stroke-linejoin="round"/>
+
+  <!-- 表情 -->
+  <circle cx="198" cy="342" r="11" fill="#1e1b4b"/>
+  <circle cx="314" cy="342" r="11" fill="#1e1b4b"/>
+  <circle cx="202" cy="338" r="4" fill="#ffffff" opacity="0.9"/>
+  <circle cx="318" cy="338" r="4" fill="#ffffff" opacity="0.9"/>
+  <path d="M232 368 Q256 386 280 368" fill="none" stroke="#1e1b4b" stroke-width="7" stroke-linecap="round"/>
+  <ellipse cx="162" cy="360" rx="17" ry="10" fill="#f9a8d4" opacity="0.75"/>
+  <ellipse cx="350" cy="360" rx="17" ry="10" fill="#f9a8d4" opacity="0.75"/>
+
+  <!-- 星光 -->
+  <path d="M0 -16 C2 -6 6 -2 16 0 C6 2 2 6 0 16 C-2 6 -6 2 -16 0 C-6 -2 -2 -6 0 -16 Z" transform="translate(78 120) scale(1.1)" fill="#fbbf24"/>
+  <path d="M0 -16 C2 -6 6 -2 16 0 C6 2 2 6 0 16 C-2 6 -6 2 -16 0 C-6 -2 -2 -6 0 -16 Z" transform="translate(446 92) scale(0.9)" fill="#6ee7b7"/>
+  <path d="M0 -16 C2 -6 6 -2 16 0 C6 2 2 6 0 16 C-2 6 -6 2 -16 0 C-6 -2 -2 -6 0 -16 Z" transform="translate(452 214) scale(0.65)" fill="#fbbf24"/>
+  <path d="M0 -16 C2 -6 6 -2 16 0 C6 2 2 6 0 16 C-2 6 -6 2 -16 0 C-6 -2 -2 -6 0 -16 Z" transform="translate(60 262) scale(0.55)" fill="#c7d2fe"/>
+
+  </g>
+
+  <!-- 文案区 -->
+  <text x="562" y="188" font-family="'Microsoft YaHei UI','Microsoft YaHei','PingFang SC','Hiragino Sans GB','Noto Sans CJK SC',sans-serif" font-size="19" font-weight="600"
+        letter-spacing="4.5" fill="#a5b4fc">账号 · 模型 · 用量</text>
+
+  <text x="560" y="288" font-family="'Segoe UI','Helvetica Neue',Helvetica,Arial,sans-serif,'Microsoft YaHei UI','Microsoft YaHei','PingFang SC','Hiragino Sans GB','Noto Sans CJK SC',sans-serif" font-size="72" font-weight="700"
+        letter-spacing="-1" fill="url(#title)">WorkBuddy 管理台</text>
+
+  <text x="562" y="338" font-family="'Microsoft YaHei UI','Microsoft YaHei','PingFang SC','Hiragino Sans GB','Noto Sans CJK SC',sans-serif" font-size="25" font-weight="400"
+        fill="#c7d2fe">把账号、模型、用量收进同一个本地工具</text>
+
+  <!-- 三步流程 -->
+  <rect x="560" y="384" width="176" height="50" rx="25" fill="rgba(255,255,255,0.07)" stroke="rgba(165,180,252,0.28)" stroke-width="1.5"/><circle cx="586" cy="409" r="12" fill="#6366f1"/><text x="586" y="415" font-family="'Segoe UI','Helvetica Neue',Helvetica,Arial,sans-serif" font-size="16" font-weight="700"
+       fill="#ffffff" text-anchor="middle">1</text>
+  <text x="608" y="415" font-family="'Microsoft YaHei UI','Microsoft YaHei','PingFang SC','Hiragino Sans GB','Noto Sans CJK SC',sans-serif" font-size="18" font-weight="500" fill="#e2e8ff">扫码加账号</text>
+  <rect x="752" y="384" width="176" height="50" rx="25" fill="rgba(255,255,255,0.07)" stroke="rgba(165,180,252,0.28)" stroke-width="1.5"/><circle cx="778" cy="409" r="12" fill="#6366f1"/><text x="778" y="415" font-family="'Segoe UI','Helvetica Neue',Helvetica,Arial,sans-serif" font-size="16" font-weight="700"
+       fill="#ffffff" text-anchor="middle">2</text>
+  <text x="800" y="415" font-family="'Microsoft YaHei UI','Microsoft YaHei','PingFang SC','Hiragino Sans GB','Noto Sans CJK SC',sans-serif" font-size="18" font-weight="500" fill="#e2e8ff">载入模型</text>
+  <rect x="944" y="384" width="176" height="50" rx="25" fill="rgba(255,255,255,0.07)" stroke="rgba(165,180,252,0.28)" stroke-width="1.5"/><circle cx="970" cy="409" r="12" fill="#6366f1"/><text x="970" y="415" font-family="'Segoe UI','Helvetica Neue',Helvetica,Arial,sans-serif" font-size="16" font-weight="700"
+       fill="#ffffff" text-anchor="middle">3</text>
+  <text x="992" y="415" font-family="'Microsoft YaHei UI','Microsoft YaHei','PingFang SC','Hiragino Sans GB','Noto Sans CJK SC',sans-serif" font-size="18" font-weight="500" fill="#e2e8ff">统计用量</text>
+
+  <!-- 分隔线 -->
+  <rect x="80" y="512" width="1120" height="1.5" fill="url(#rule)"/>
+
+  <!-- 底栏左：许可与隐私 -->
+  <text x="80" y="562" font-family="'Microsoft YaHei UI','Microsoft YaHei','PingFang SC','Hiragino Sans GB','Noto Sans CJK SC',sans-serif" font-size="17" font-weight="400"
+        fill="#94a3b8">MIT 开源 · 完全免费 · 数据只存本机</text>
+
+  <!-- 底栏右：可用平台 -->
+  <rect x="740" y="536" width="128" height="38" rx="19" fill="rgba(255,255,255,0.05)" stroke="rgba(165,180,252,0.22)" stroke-width="1"/><text x="804" y="561" font-family="'Microsoft YaHei UI','Microsoft YaHei','PingFang SC','Hiragino Sans GB','Noto Sans CJK SC',sans-serif" font-size="16" font-weight="500"
+       fill="#c7d2fe" text-anchor="middle">OpenRouter</text>
+  <rect x="880" y="536" width="112" height="38" rx="19" fill="rgba(255,255,255,0.05)" stroke="rgba(165,180,252,0.22)" stroke-width="1"/><text x="936" y="561" font-family="'Microsoft YaHei UI','Microsoft YaHei','PingFang SC','Hiragino Sans GB','Noto Sans CJK SC',sans-serif" font-size="16" font-weight="500"
+       fill="#c7d2fe" text-anchor="middle">硅基流动</text>
+  <rect x="1004" y="536" width="88" height="38" rx="19" fill="rgba(255,255,255,0.05)" stroke="rgba(165,180,252,0.22)" stroke-width="1"/><text x="1048" y="561" font-family="'Microsoft YaHei UI','Microsoft YaHei','PingFang SC','Hiragino Sans GB','Noto Sans CJK SC',sans-serif" font-size="16" font-weight="500"
+       fill="#c7d2fe" text-anchor="middle">魔搭</text>
+  <rect x="1104" y="536" width="96" height="38" rx="19" fill="rgba(255,255,255,0.05)" stroke="rgba(165,180,252,0.22)" stroke-width="1"/><text x="1152" y="561" font-family="'Microsoft YaHei UI','Microsoft YaHei','PingFang SC','Hiragino Sans GB','Noto Sans CJK SC',sans-serif" font-size="16" font-weight="500"
+       fill="#c7d2fe" text-anchor="middle">Agnes AI</text>
+</svg>
