@@ -303,6 +303,31 @@ const parseSse = (text) =>
   ok(devMsgs[0].content === 'see the vendor docs', '净化：developer 条目同样处理');
 }
 
+/* ---------------- A7. 上游风控净化：模板句指纹（ZCode / Claude Code 的 git 状态标签） ---------------- */
+{
+  const { sanitizeSystemText, neutralizeInjectedTemplates, sanitizeMessages } = await import(
+    '../server/proxy/sanitize.mjs'
+  );
+
+  // 实证（2026-10-13，回放 ZCode 真实请求体）：system 第 3 段里**没有任何品牌词**，
+  // 却稳定被 code 11128 拦截；最小触发片段就是下面这 47 字，单独发也能复现。
+  const GIT_STATUS_LABEL = 'Main branch (you will usually use this for PRs)';
+  const TMPL_TRIGGER = `gitStatus: This is the git status at the start of the conversation.\n\nCurrent branch: main\n\n${GIT_STATUS_LABEL}: main\n\nGit user: walter`;
+
+  const out = neutralizeInjectedTemplates(TMPL_TRIGGER);
+  ok(!out.includes(GIT_STATUS_LABEL), '净化：git 状态模板标签（逐字指纹）被抹掉');
+  ok(out.includes('Main branch: main'), '净化：还原成普通写法，分支信息不丢');
+  ok(out.includes('Current branch: main') && out.includes('Git user: walter'), '净化：模板句之外的 git 信息原样保留');
+
+  ok(sanitizeSystemText(GIT_STATUS_LABEL) === 'Main branch', '净化：单独该片段也处理（它就是最小触发片段）');
+  ok(neutralizeInjectedTemplates('普通文本 (you will usually)') === '普通文本 (you will usually)', '净化：不误伤相似但不等价的文本');
+
+  const msgs = [{ role: 'system', content: TMPL_TRIGGER }, { role: 'user', content: `${GIT_STATUS_LABEL}: main` }];
+  sanitizeMessages(msgs);
+  ok(!msgs[0].content.includes(GIT_STATUS_LABEL), '净化：system 条目里的模板句被处理');
+  ok(msgs[1].content.includes(GIT_STATUS_LABEL), '净化：用户消息里的同样文本不动（不是系统提示词）');
+}
+
 /* ---------------- B0. 上游错误简报（把一坨 JSON 压成一行人话） ---------------- */
 {
   const { briefUpstream, briefErrors } = await import('../server/proxy/index.mjs');

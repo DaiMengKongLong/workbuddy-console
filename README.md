@@ -214,18 +214,35 @@ export GEMINI_MODEL=<模型 ID>
 
 ⇒ 判据是**一段连续逐字文本**命中已知竞品系统提示词，不是关键词表、也不是长度门。
 
-因此 `server/proxy/sanitize.mjs` 在出站前只做两件事：
+且指纹库里**不只有品牌词，还有竞品系统提示词里的固定模板句**。
+回放 ZCode 的真实请求体（system 共 3 段）实测：
+
+| 实验 | 结果 |
+| --- | --- |
+| 只留第 1 / 第 2 段 | 通过 |
+| 只留第 3 段（5,735 字，**全文没有任何品牌词**） | **被拦** |
+| 第 3 段里删掉 ` (you will usually use this for PRs)` | 通过（整段 5,735 字） |
+| 单独把 `Main branch (you will usually use this for PRs)`（47 字）当 system 发 | **被拦**（连测 3 次一致） |
+
+⇒ 最小触发片段是 Claude Code 注入 git 状态时写的**分支标签**
+（`Main branch (you will usually use this for PRs): <分支>`，当前分支是主干时才出现）。
+
+因此 `server/proxy/sanitize.mjs` 在出站前做三件事：
 
 1. 剔除客户端注入的内部元数据行（Claude Code 的 `x-anthropic-billing-header:` 等）；
-2. 把竞品指纹词换成中性词（`Codex CLI` → `assistant CLI`、`OpenAI` → `the vendor`），
-   按句首补大写，语义不变。
+2. 把竞品指纹**词**换成中性词（`Codex CLI` → `assistant CLI`、`OpenAI` → `the vendor`），
+   按句首补大写，语义不变；
+3. 把竞品系统提示词里的**固定模板句**还原成普通写法
+   （`Main branch (you will usually use this for PRs)` → `Main branch`，分支信息不丢）。
 
 **只动 system 级文本**（Responses 的 `instructions`、Anthropic 的 `system`、
 OpenAI 的 `role:"system"`、Gemini 的 `systemInstruction`），**用户消息一律原样透传** ——
 用户正常问一句「OpenAI 是什么」不该被改写。
 
-> 只有 `Codex` / `OpenAI` / `ChatGPT` 家族在词表里，因为只有它被实证触发；Claude Code、
-> Gemini CLI 的系统提示词不会被改写。新增规则前请先二分验证，别凭猜加词。
+> 规则分两张表、都只收**已实证触发**的项：品牌词只有 `Codex` / `OpenAI` / `ChatGPT` 家族，
+> 模板句只有上面那条 git 状态标签。新增规则前请先做「移除该片段 → 上游是否放行」的二分验证，
+> 别凭猜加词——改写 system 文本本身有语义代价。用户反馈仍然 11128 时，请把该客户端的
+> 系统提示词特征一并带来。
 
 ### 客户端连不上 / 报错时怎么查
 
@@ -247,7 +264,7 @@ OpenAI 的 `role:"system"`、Gemini 的 `systemInstruction`），**用户消息�
 与风控净化）：
 
 ```bash
-node scripts/test-proxy-protocols.mjs   # 77 项断言
+node scripts/test-proxy-protocols.mjs   # 84 项断言
 node scripts/test-proxy-pool.mjs        # 23 项断言：账号池准入与凭据刷新判据
 ```
 

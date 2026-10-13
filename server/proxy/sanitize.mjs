@@ -23,7 +23,9 @@
  * 用户正常问一句 "OpenAI 是什么" 不该被改写。
  *
  * ⚠️ 加规则前必须先二分验证。改写 system 文本本身有语义代价（Claude Code 这类提示词
- * 依赖自我认知），没有实测证据不要凭猜加词。当前词表仅覆盖已实证的 Codex / OpenAI 家族。
+ * 依赖自我认知），没有实测证据不要凭猜加词。当前规则分两张表，都只收**已实证触发**的项：
+ *   - `BRAND_RULES`    —— 品牌词（Codex / OpenAI 家族）
+ *   - `TEMPLATE_RULES` —— 竞品系统提示词里的固定模板句（Claude Code 的 git 状态分支标签）
  */
 
 /**
@@ -60,6 +62,35 @@ const BRAND_RULES = [
   [/\bChatGPT\b/gi, 'the chat assistant'],
 ];
 
+/**
+ * 上游指纹库里不止有**品牌词**，还有竞品系统提示词里的**固定模板句**。
+ *
+ * 实证（2026-10-13，回放 ZCode 的真实请求体 `_dev/zcode-body.json`，本地代理 57901）：
+ *   - ZCode 的 system 是 3 段；逐段测下来只有第 3 段（5,735 字的「沟通 / 环境」提示）被拦，
+ *     第 1、2 段单独送都能过 ⇒ 触发点在第 3 段。
+ *   - 第 3 段里**没有任何品牌词**（ZCode/Claude/Anthropic/OpenAI/Codex 计数全为 0），
+ *     却稳定触发 ⇒ 判据是模板句而不是品牌名。
+ *   - 该段里删掉 ` (you will usually use this for PRs)` 这 36 个字，**整段 5,735 字立刻通过**；
+ *     把这 47 字的 `Main branch (you will usually use this for PRs)` 单独当 system 发，
+ *     仍然稳定 11128（连测 3 次一致）⇒ 最小触发片段就是它，且该段内不存在第二个触发点。
+ *
+ * 这串是 **Claude Code 往 system 注入 git 状态时写的分支标签**
+ * （`Main branch (you will usually use this for PRs): <分支>`，当前分支是主干时才会出现）。
+ * 处理方式与品牌词一致：还原成普通写法，语义不变、也不再逐字命中指纹库。
+ *
+ * ⚠️ 同 `BRAND_RULES`：加规则前必须先用「移除该片段 → 上游是否放行」实证。
+ */
+const TEMPLATE_RULES = [
+  [/Main branch \(you will usually use this for PRs\)/g, 'Main branch'],
+];
+
+/** 抹掉竞品系统提示词的固定模板句（只做已验证的逐字替换） */
+export function neutralizeInjectedTemplates(text) {
+  let out = String(text);
+  for (const [re, to] of TEMPLATE_RULES) out = out.replace(re, to);
+  return out;
+}
+
 /** 位于句首（串首 / 句末标点后 / 换行后）才补大写，句中的 "by OpenAI" 不能变成 "by The vendor" */
 const atSentenceStart = (before) => /(^|[.!?]|\n)\s*$/.test(before);
 
@@ -74,10 +105,10 @@ export function neutralizeAgentFingerprint(text) {
   return out;
 }
 
-/** system 级文本的完整净化：先去内部元数据行，再抹竞品指纹 */
+/** system 级文本的完整净化：先去内部元数据行，再抹竞品指纹（品牌词 + 模板句） */
 export function sanitizeSystemText(text) {
   if (typeof text !== 'string' || !text) return text;
-  return neutralizeAgentFingerprint(stripInternalHeaders(text));
+  return neutralizeInjectedTemplates(neutralizeAgentFingerprint(stripInternalHeaders(text)));
 }
 
 /**
