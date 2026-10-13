@@ -25,8 +25,8 @@ nsis:
   oneClick: false
   allowToChangeInstallationDirectory: true
   createDesktopShortcut: true
-  shortcutName: WorkBuddy 管理台
-  # 安装完成后不立即启动：管理台会驻留后台，交给用户自己挑时机打开
+  shortcutName: workbuddy控制台
+  # 安装完成后不立即启动：控制台会驻留后台，交给用户自己挑时机打开
   runAfterFinish: true
   installerIcon: build/icon.ico
   uninstallerIcon: build/icon.ico

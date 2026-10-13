@@ -44,7 +44,7 @@ export async function api<T = unknown>(path: string, init?: RequestInit & { time
     if (e?.name === 'AbortError') {
       throw fail(`本地服务响应超时（${Math.round(timeoutMs / 1000)} 秒未返回），已中断请求`, true);
     }
-    throw fail('无法连接本地服务，请确认 WorkBuddy 管理台的服务正在运行', true);
+    throw fail('无法连接本地服务，请确认 workbuddy控制台的服务正在运行', true);
   } finally {
     clearTimeout(timer);
   }

@@ -17,7 +17,7 @@
  *
  * 客户端接入（官方 Gemini CLI，实测文档口径）：
  *   GOOGLE_GEMINI_BASE_URL = http://127.0.0.1:<port>   # 只填域名，不要带 /v1beta
- *   GEMINI_API_KEY         = <管理台生成的 Key>
+ *   GEMINI_API_KEY         = <控制台生成的 Key>
  *   鉴权头默认走 x-goog-api-key；CLI 会自动拼 /v1beta/models/{model}:...
  *   注：CLI 要求 HTTPS，但 localhost / 127.0.0.1 例外，因此本机回环可直接用 http。
  */

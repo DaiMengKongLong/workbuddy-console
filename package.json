@@ -2,7 +2,7 @@
   "name": "workbuddy-console",
   "private": true,
   "version": "0.2.0",
-  "description": "WorkBuddy 管理台：账号切换、多平台免费模型广场、Token 与积分用量统计",
+  "description": "workbuddy控制台：账号切换、多平台免费模型广场、Token 与积分用量统计",
   "author": "walter-io",
   "license": "MIT",
   "repository": {
@@ -23,6 +23,7 @@
     "test:sessions": "node scripts/test-session-copy.mjs",
     "test:stop": "node scripts/test-stop-process.mjs",
     "test:refresh": "node scripts/test-token-refresh.mjs",
+    "test:growth": "node scripts/test-growth.mjs",
     "app": "electron .",
     "app:dir": "npm run build && electron-builder --dir --publish never",
     "app:win": "npm run build && electron-builder --win --publish never",

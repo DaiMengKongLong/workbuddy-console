@@ -19,7 +19,7 @@ if (!app.requestSingleInstanceLock()) {
   app.quit();
 }
 
-// 管理台是纯 UI + 本地服务，不需要 GPU：远程桌面 / 虚拟机里 GPU 进程可能不可用，
+// 控制台是纯 UI + 本地服务，不需要 GPU：远程桌面 / 虚拟机里 GPU 进程可能不可用，
 // 禁用硬件加速避免窗口渲染崩溃（软件渲染对这种界面毫无压力）
 app.disableHardwareAcceleration();
 
@@ -81,10 +81,10 @@ function createTray() {
   if (process.platform === 'darwin') icon.setTemplateImage(true);
 
   tray = new Tray(icon);
-  tray.setToolTip('WorkBuddy 管理台');
+  tray.setToolTip('workbuddy控制台');
   tray.setContextMenu(
     Menu.buildFromTemplate([
-      { label: '打开 WorkBuddy 管理台', click: showWindow },
+      { label: '打开 workbuddy控制台', click: showWindow },
       { type: 'separator' },
       {
         label: '开机自动启动',
@@ -118,7 +118,7 @@ async function createWindow() {
     height: 900,
     minWidth: 960,
     minHeight: 600,
-    title: 'WorkBuddy 管理台',
+    title: 'workbuddy控制台',
     icon: buildRes('icon.png'),
     autoHideMenuBar: true,
     backgroundColor: '#f4f4f5',
@@ -150,7 +150,7 @@ async function createWindow() {
     // Windows 用户习惯「点 X 就是关」，首次隐藏时用气泡提示一次
     if (process.platform === 'win32' && tray) {
       tray.displayBalloon({
-        title: 'WorkBuddy 管理台仍在后台运行',
+        title: 'workbuddy控制台仍在后台运行',
         content: '每日签到自动巡检继续工作中。右键托盘图标可打开窗口或退出。',
         iconType: 'info',
       });
@@ -172,7 +172,7 @@ app.whenReady()
   })
   .catch((err) => {
     // 服务启动失败时弹出系统对话框而不是白屏
-    dialog.showErrorBox('WorkBuddy 管理台启动失败', String(err?.message || err));
+    dialog.showErrorBox('workbuddy控制台启动失败', String(err?.message || err));
     app.quit();
   });
 

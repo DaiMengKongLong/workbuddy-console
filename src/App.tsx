@@ -80,7 +80,7 @@ function VersionFooter() {
   const target = info?.downloadUrl || info?.releaseUrl || '';
   return (
     <div className="flex items-center justify-between border-t border-zinc-100 pt-2.5">
-      <span className="text-[10px] font-medium tracking-wide text-zinc-300">WorkBuddy Console</span>
+      <span className="text-[10px] font-medium tracking-wide text-zinc-300">workbuddy控制台</span>
       <div className="flex items-center gap-1.5">
         {info?.hasUpdate && target && (
           <button
@@ -174,7 +174,7 @@ function ServiceBanner() {
           {' '}
           —— 界面数据无法刷新。{' '}
           {isDesktop ? (
-            <>请从系统托盘图标右键「退出」后重新打开 WorkBuddy 管理台；若仍无法恢复，请重启应用。</>
+            <>请从系统托盘图标右键「退出」后重新打开 workbuddy控制台；若仍无法恢复，请重启应用。</>
           ) : (
             <>
               请在项目目录执行 <span className="font-mono text-xs bg-white/70 rounded px-1 py-0.5">npm start</span> 启动服务，或直接运行{' '}
@@ -286,7 +286,7 @@ export default function App() {
                 <IconShield className="w-4.5 h-4.5" />
               </div>
               <div className="min-w-0">
-                <div className="font-semibold text-zinc-900 leading-tight">WorkBuddy 管理台</div>
+                <div className="font-semibold text-zinc-900 leading-tight">workbuddy控制台</div>
                 <div className="text-[11px] text-zinc-400 leading-tight">账号 · 模型 · 用量</div>
               </div>
             </div>

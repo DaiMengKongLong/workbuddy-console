@@ -13,6 +13,7 @@
 import { proxyFetch } from '../proxy.mjs';
 import { variantOf } from './variant.mjs';
 import { authHeaders } from './credits.mjs';
+import { runGrowthForAccount } from './growth.mjs';
 import {
   loadAccounts,
   accountDisplayName,
@@ -184,8 +185,8 @@ function appendCheckinLogs(entries) {
   }
 }
 
-/** 一条签到记录（只存结果，不存任何 token） */
-function logEntry(account, result) {
+/** 一条签到记录（只存结果，不存任何 token）；growth 存在时附上成长中心报告 */
+function logEntry(account, result, growth = null) {
   return {
     ts: Date.now(),
     accountId: account.id,
@@ -194,14 +195,37 @@ function logEntry(account, result) {
     ok: Boolean(result.ok),
     alreadyCheckedIn: Boolean(result.alreadyCheckedIn),
     message: result.message || result.error || '',
+    ...(growth
+      ? {
+          growth: {
+            ok: Boolean(growth.ok),
+            report: growth.report || '',
+            creditsGained: growth.creditsGained || 0,
+            hardFailures: growth.hardFailures || 0,
+          },
+        }
+      : {}),
   };
 }
 
 /**
- * 对单个账号签到：先查状态，未签到才提交，避免无谓的写请求。
- * 返回 { ok, action: 'checked'|'already'|'skipped'|'failed', message, account }
+ * 签到成功后顺带跑成长中心（旅行/任务/补登/兑换/盲盒/Buddy）。
+ * 失败绝不抛出让签到结果被污染——成长中心是附加收益，签到才是主流程。
  */
-export async function checkinAccount(accountId) {
+async function growthSafe(account) {
+  try {
+    return await runGrowthForAccount(account);
+  } catch (e) {
+    return { ok: false, report: `成长中心异常（${e?.message || e}）`, creditsGained: 0, hardFailures: 1 };
+  }
+}
+
+/**
+ * 对单个账号签到 + 成长中心：先查状态，未签到才提交，避免无谓的写请求。
+ * 签到成功（含今日已签）后顺带跑成长中心六个模块。
+ * 返回 { ok, action: 'checked'|'already'|'skipped'|'failed', message, account, growth? }
+ */
+export async function checkinAccount(accountId, { withGrowth = true } = {}) {
   const accounts = loadAccounts();
   const account = accounts.find((a) => a.id === accountId);
   if (!account) throw new Error('账号不存在');
@@ -209,8 +233,10 @@ export async function checkinAccount(accountId) {
   const state = await fetchCheckinStatus(account);
   // 状态接口不可用（部分账号无权限/接口变动）时，仍然直接提交一次——接口幂等
   if (state.ok && state.todayCheckedIn) {
+    const growth = withGrowth ? await growthSafe(account) : null;
     const result = { ok: true, action: 'already', message: '今日已签到', account: accountMeta(account) };
-    appendCheckinLogs([logEntry(account, { ok: true, alreadyCheckedIn: true, message: result.message })]);
+    if (growth) result.growth = growth;
+    appendCheckinLogs([logEntry(account, { ok: true, alreadyCheckedIn: true, message: result.message }, growth)]);
     return result;
   }
   if (!state.ok && state.unsupported) {
@@ -219,13 +245,15 @@ export async function checkinAccount(accountId) {
 
   const done = await performCheckin(account);
   if (done.ok) {
+    const growth = withGrowth ? await growthSafe(account) : null;
     const result = {
       ok: true,
       action: 'checked',
       message: done.alreadyCheckedIn ? '今日已签到' : done.message || '签到成功',
       account: accountMeta(account),
     };
-    appendCheckinLogs([logEntry(account, done)]);
+    if (growth) result.growth = growth;
+    appendCheckinLogs([logEntry(account, done, growth)]);
     return result;
   }
   const reason = done.message || state.error || '签到失败';
@@ -234,10 +262,12 @@ export async function checkinAccount(accountId) {
 }
 
 /**
- * 全部账号签到（并发受限，避免同一时刻打爆网关）。
+ * 全部账号签到 + 成长中心（并发受限，避免同一时刻打爆网关）。
+ * - onlyPending：已签到的账号不重复提交签到（成长中心仍照常领取）；
+ * - skipGrowthIfDoneToday：今天已跑过成长中心的账号跳过（自动巡检用，手动领取不设这道闸）。
  * 返回 { results, summary }
  */
-export async function checkinAll({ onlyPending = false } = {}) {
+export async function checkinAll({ onlyPending = false, withGrowth = true, skipGrowthIfDoneToday = false } = {}) {
   const accounts = loadAccounts().filter((a) => variantOf(a).id === 'cn');
   const results = [];
   const CONCURRENCY = 3;
@@ -250,7 +280,11 @@ export async function checkinAll({ onlyPending = false } = {}) {
         if (onlyPending) {
           const state = await fetchCheckinStatus(account);
           if (state.ok && state.todayCheckedIn) {
-            results.push({ ok: true, action: 'already', message: '今日已签到', account: accountMeta(account) });
+            if (withGrowth && !(skipGrowthIfDoneToday && growthDoneToday(account.id))) {
+              results.push(await checkinAccount(account.id, { withGrowth: true }));
+            } else {
+              results.push({ ok: true, action: 'already', message: '今日已签到', account: accountMeta(account) });
+            }
             continue;
           }
           if (state.unsupported) {
@@ -258,7 +292,7 @@ export async function checkinAll({ onlyPending = false } = {}) {
             continue;
           }
         }
-        results.push(await checkinAccount(account.id));
+        results.push(await checkinAccount(account.id, { withGrowth }));
       } catch (e) {
         results.push({ ok: false, action: 'failed', message: e?.message || '签到失败', account: accountMeta(account) });
       }
@@ -272,6 +306,8 @@ export async function checkinAll({ onlyPending = false } = {}) {
     already: results.filter((r) => r.action === 'already').length,
     failed: results.filter((r) => r.action === 'failed').length,
     skipped: results.filter((r) => r.action === 'skipped').length,
+    growthCredits: results.reduce((sum, r) => sum + (r.growth?.creditsGained || 0), 0),
+    growthHardFailures: results.reduce((sum, r) => sum + (r.growth?.hardFailures || 0), 0),
   };
   return { results, summary };
 }
@@ -290,4 +326,21 @@ export async function allCheckedInToday() {
     }
   }
   return true;
+}
+
+/** 今天（本地时区）该账号是否已有成长中心记录 */
+export function growthDoneToday(accountId) {
+  const dayStart = new Date();
+  dayStart.setHours(0, 0, 0, 0);
+  return loadCheckinLogs().some((e) => e.accountId === accountId && e.growth && e.ts >= dayStart.getTime());
+}
+
+/**
+ * 今天是否所有国内版可签到账号都已跑过成长中心（自动巡检的第二道门禁）。
+ * 日志被裁剪会忘掉记录 → 最坏情况是当天多跑一轮，而成长中心各接口全部幂等/服务端兜底，无害。
+ */
+export function allGrowthDoneToday() {
+  const accounts = loadAccounts().filter((a) => variantOf(a).id === 'cn' && hasPlainToken(a));
+  if (accounts.length === 0) return true;
+  return accounts.every((a) => growthDoneToday(a.id));
 }

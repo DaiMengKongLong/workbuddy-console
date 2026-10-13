@@ -37,7 +37,7 @@ import {
 } from './workbuddy/auth.mjs';
 import { getCreditStatistics, getOfflineCreditProjection, getAccountBalances } from './workbuddy/credits.mjs';
 import { VARIANT_LIST, authFilePath, dataRoot } from './workbuddy/variant.mjs';
-import { checkinAll, checkinAccount, fetchCheckinStatus, loadCheckinLogs, allCheckedInToday } from './workbuddy/checkin.mjs';
+import { checkinAll, checkinAccount, fetchCheckinStatus, loadCheckinLogs, allCheckedInToday, allGrowthDoneToday } from './workbuddy/checkin.mjs';
 import {
   refreshAccounts,
   refreshPlan,
@@ -970,11 +970,13 @@ async function runCheckinPatrol() {
   if (hour < 6 || hour >= 23) return;
   checkinPatrolBusy = true;
   try {
-    if (await allCheckedInToday()) return;
-    const { summary, results } = await checkinAll({ onlyPending: true });
+    // 两道门禁：签到 + 成长中心（签到早满了也不影响成长中心的旅行/任务/补登/兑换/盲盒）
+    if ((await allCheckedInToday()) && allGrowthDoneToday()) return;
+    const { summary, results } = await checkinAll({ onlyPending: true, skipGrowthIfDoneToday: true });
     const failed = results.filter((r) => r.action === 'failed');
     console.log(
       `[checkin] 自动巡检完成：签到 ${summary.checked}、已签到 ${summary.already}、失败 ${summary.failed}` +
+        (summary.growthCredits ? `、成长中心 +${summary.growthCredits} 积分` : '') +
         (failed.length ? `（${failed.map((f) => f.account?.name || f.account?.uid).join(', ')}）` : '')
     );
   } catch (e) {
@@ -1010,7 +1012,7 @@ app.get(/^\/(?!api\/).*/, (req, res) => {
 
 app.listen(PORT, '127.0.0.1', () => {
   const url = `http://127.0.0.1:${PORT}`;
-  console.log(`WorkBuddy 管理台已启动: ${url}`);
+  console.log(`workbuddy控制台已启动: ${url}`);
   if (process.env.NO_OPEN !== '1') {
     const cmd =
       process.platform === 'win32'

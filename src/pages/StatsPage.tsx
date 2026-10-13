@@ -277,7 +277,7 @@ export default function StatsPage() {
     const rangeLabel = RANGE_OPTS.find((r) => r.value === range)?.label || range;
     const modelLabel = model || '全部模型';
 
-    row(['WorkBuddy 管理台 Token 用量统计']);
+    row(['workbuddy控制台 Token 用量统计']);
     row(['生成时间', new Date(data.generatedAt).toLocaleString('zh-CN')]);
     row(['统计区间', rangeLabel]);
     row(['模型筛选', modelLabel]);

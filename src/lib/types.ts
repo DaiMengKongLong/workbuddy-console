@@ -612,7 +612,7 @@ export interface AccountRefreshRunResponse {
   summary: { total: number; refreshed: number; skipped: number; failed: number; dead: number };
 }
 
-/* ---------------- 每日签到 ---------------- */
+/* ---------------- 每日签到与成长中心 ---------------- */
 
 export interface CheckinState {
   account: AccountInfo;
@@ -625,6 +625,15 @@ export interface CheckinState {
   unauthorized?: boolean;
 }
 
+/** 成长中心一轮领取的摘要（旅行/任务/补登/兑换/盲盒/Buddy） */
+export interface GrowthRunInfo {
+  ok: boolean;
+  /** 一行式汇报，如「领旅行礼物 +50 积分；开盲盒获得：冰箱贴（能量 12，连签 7 天）」 */
+  report: string;
+  creditsGained: number;
+  hardFailures: number;
+}
+
 export interface CheckinLogEntry {
   ts: number;
   accountId: string;
@@ -633,6 +642,7 @@ export interface CheckinLogEntry {
   ok: boolean;
   alreadyCheckedIn: boolean;
   message: string;
+  growth?: GrowthRunInfo;
 }
 
 export interface CheckinStatusResponse {
@@ -645,11 +655,21 @@ export interface CheckinRunResult {
   action: 'checked' | 'already' | 'skipped' | 'failed';
   message: string;
   account: AccountInfo;
+  growth?: GrowthRunInfo;
 }
 
 export interface CheckinAllResult {
   results: CheckinRunResult[];
-  summary: { total: number; checked: number; already: number; failed: number; skipped: number };
+  summary: {
+    total: number;
+    checked: number;
+    already: number;
+    failed: number;
+    skipped: number;
+    /** 本轮成长中心合计进账积分 */
+    growthCredits: number;
+    growthHardFailures: number;
+  };
 }
 
 /* ---------------- 权限自检 ---------------- */

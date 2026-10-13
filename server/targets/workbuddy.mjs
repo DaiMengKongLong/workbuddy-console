@@ -237,9 +237,9 @@ function shortExecError(err) {
  * 测试机上真实 WorkBuddy 多半正在运行，用同名替身进程才能真实验证
  * 「优雅退出 → 强杀 → 确认消失」这条升级逻辑，而不必关掉真的客户端。
  *
- * ⚠️ 千万别改成通配符（`WorkBuddy*`）：两者的匹配都是**按映像名精确**的，而管理台自己打包后的
+ * ⚠️ 千万别改成通配符（`WorkBuddy*`）：两者的匹配都是**按映像名精确**的，而控制台自己打包后的
  * 进程叫 `WorkBuddy Console`（electron-builder 的 productName）。一旦放宽成前缀匹配，
- * 切号时就会**把管理台自己杀掉**，切换动作当场中断。
+ * 切号时就会**把控制台自己杀掉**，切换动作当场中断。
  */
 export const WORKBUDDY_PROCESS_NAMES = ['WorkBuddy', 'CodeBuddy'];
 

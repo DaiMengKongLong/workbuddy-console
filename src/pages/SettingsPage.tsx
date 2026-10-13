@@ -320,7 +320,7 @@ export default function SettingsPage() {
     try {
       const r = await put<{ autoCheckin: boolean }>('/api/settings', { autoCheckin: next });
       setSettings((p) => (p ? { ...p, autoCheckin: r.autoCheckin } : p));
-      toast('ok', r.autoCheckin ? '已开启自动签到：服务端每小时巡检一次，发现未签到会自动补签' : '已关闭自动签到');
+      toast('ok', r.autoCheckin ? '已开启自动领取：服务端每小时巡检一次，自动补签并领取成长中心奖励' : '已关闭自动领取');
     } catch (e: any) {
       setSettings((p) => (p ? { ...p, autoCheckin: prev } : p));
       toast('err', e?.message || '保存失败');
@@ -350,8 +350,11 @@ export default function SettingsPage() {
     setCheckingIn(true);
     try {
       if (accountId) {
-        const r = await post<{ ok: boolean; action: string; message: string }>('/api/workbuddy/checkin', { accountId });
-        toast(r.ok ? 'ok' : 'err', r.message);
+        const r = await post<{ ok: boolean; action: string; message: string; growth?: { report: string } }>(
+          '/api/workbuddy/checkin',
+          { accountId }
+        );
+        toast(r.ok ? 'ok' : 'err', r.growth?.report ? `${r.message}；${r.growth.report}` : r.message);
       } else {
         const r = await post<CheckinAllResult>('/api/workbuddy/checkin', { onlyPending: true });
         const { summary } = r;
@@ -359,11 +362,12 @@ export default function SettingsPage() {
         if (summary.already) parts.push(`已签到 ${summary.already} 个`);
         if (summary.skipped) parts.push(`跳过 ${summary.skipped} 个`);
         if (summary.failed) parts.push(`失败 ${summary.failed} 个`);
-        toast(summary.failed ? 'err' : 'ok', `签到完成：${parts.join('，')}`);
+        if (summary.growthCredits) parts.push(`成长中心 +${summary.growthCredits} 积分`);
+        toast(summary.failed || summary.growthHardFailures ? 'err' : 'ok', `领取完成：${parts.join('，')}`);
       }
       await loadCheckin(true);
     } catch (e: any) {
-      toast('err', e?.message || '签到失败');
+      toast('err', e?.message || '领取失败');
     } finally {
       setCheckingIn(false);
     }
@@ -550,20 +554,27 @@ export default function SettingsPage() {
         </Card>
       </PageSection>
 
-      {/* 每日签到 */}
+      {/* 每日签到与成长中心 */}
       <PageSection
         icon={<IconClock />}
-        title="每日签到"
+        title="每日签到与成长中心"
         count={cnStates.length ? `${cnStates.filter((s) => s.todayCheckedIn).length}/${cnStates.length} 今日已签` : undefined}
-        desc="国内版账号每日可领积分；自动巡检默认开启，可在下方关闭"
+        desc="签到积分之外，成长中心的旅行礼物、任务、补登、连登兑换、盲盒、Buddy 也一并代领；自动巡检默认开启"
         actions={
           <>
             <Button size="sm" variant="subtle" loading={checkinLoading} onClick={() => loadCheckin(false)}>
               <IconRefresh className="w-3.5 h-3.5" />
               刷新状态
             </Button>
-            <Button size="sm" variant="primary" loading={checkingIn} disabled={!cnStates.length} onClick={() => runCheckin()}>
-              一键签到
+            <Button
+              size="sm"
+              variant="primary"
+              loading={checkingIn}
+              disabled={!cnStates.length}
+              onClick={() => runCheckin()}
+              title="签到 + 领取成长中心全部可领奖励（旅行礼物/派 Buddy/任务/断登补签/连登兑换/开盲盒/Buddy 盲盒）"
+            >
+              一键领取
             </Button>
           </>
         }
@@ -573,7 +584,7 @@ export default function SettingsPage() {
             <Row
               label={
                 <span className="flex flex-wrap items-center gap-2">
-                  自动签到
+                  自动领取（签到 + 成长中心）
                   <Badge color={settings?.autoCheckin ? 'green' : 'gray'}>
                     {settings?.autoCheckin ? '已开启（默认）' : '已关闭'}
                   </Badge>
@@ -582,11 +593,12 @@ export default function SettingsPage() {
               desc={
                 <>
                   <b className="text-zinc-600">默认为开启</b>
-                  ，服务端每小时巡检一次（06:00–23:00），发现当日未签到会自动补签
-                  （只对国内版账号生效；签到接口幂等，重复提交无副作用）。
-                  巡检依赖管理台处于运行状态：桌面版关闭窗口后会驻留系统托盘，签到不会中断。
+                  ，服务端每小时巡检一次（06:00–23:00），发现当日未签到会自动补签，并顺带领取成长中心的
+                  <b className="text-zinc-600">旅行礼物、派 Buddy、任务奖励、断登补签（消耗补登卡）、连登兑换、开盲盒、Buddy 盲盒</b>
+                  （只对国内版账号生效；各接口幂等或由服务端兜底，重复执行无副作用；补登卡每轮最多用 1 张、盲盒每轮最多开 1 次）。
+                  巡检依赖控制台处于运行状态：桌面版关闭窗口后会驻留系统托盘，领取不会中断。
                   <br />
-                  不需要自动签到可在此关闭；关闭后仍可随时点右上角「一键签到」或单账号「签到」手动领取。
+                  不需要自动领取可在此关闭；关闭后仍可随时点右上角「一键领取」或单账号「领取」手动执行。
                 </>
               }
             >
@@ -624,8 +636,15 @@ export default function SettingsPage() {
                     ) : (
                       <Badge color="gray">{s.unsupported ? '不支持' : '查询失败'}</Badge>
                     )}
-                    <Button size="sm" variant="subtle" loading={checkingIn} disabled={!s.ok || s.todayCheckedIn} onClick={() => runCheckin(s.account.id)}>
-                      签到
+                    <Button
+                      size="sm"
+                      variant="subtle"
+                      loading={checkingIn}
+                      disabled={!s.ok}
+                      onClick={() => runCheckin(s.account.id)}
+                      title="签到（未签时）+ 领取成长中心全部可领奖励"
+                    >
+                      领取
                     </Button>
                   </div>
                 </div>
@@ -635,13 +654,23 @@ export default function SettingsPage() {
 
           {!!checkin?.logs?.length && (
             <div className="mt-4">
-              <div className="text-xs text-zinc-400 mb-1.5">最近签到记录</div>
-              <div className="max-h-40 overflow-y-auto rounded-xl border border-zinc-100 divide-y divide-zinc-50">
+              <div className="text-xs text-zinc-400 mb-1.5">最近领取记录（含成长中心）</div>
+              <div className="max-h-48 overflow-y-auto rounded-xl border border-zinc-100 divide-y divide-zinc-50">
                 {checkin.logs.map((l, i) => (
-                  <div key={`${l.ts}-${i}`} className="flex flex-wrap items-center gap-2 px-3 py-1.5 text-xs">
-                    <span className="text-zinc-400 tabular-nums">{fmtDateTime(l.ts)}</span>
-                    <span className="text-zinc-600 truncate max-w-40">{l.accountName}</span>
-                    <span className={l.ok ? 'text-emerald-600' : 'text-red-500'}>{l.message}</span>
+                  <div key={`${l.ts}-${i}`} className="px-3 py-1.5 text-xs">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-zinc-400 tabular-nums">{fmtDateTime(l.ts)}</span>
+                      <span className="text-zinc-600 truncate max-w-40">{l.accountName}</span>
+                      <span className={l.ok ? 'text-emerald-600' : 'text-red-500'}>{l.message}</span>
+                      {l.growth && l.growth.creditsGained > 0 && (
+                        <Badge color="green">成长中心 +{l.growth.creditsGained}</Badge>
+                      )}
+                    </div>
+                    {l.growth?.report && (
+                      <div className={`mt-0.5 pl-0.5 leading-relaxed ${l.growth.ok ? 'text-zinc-500' : 'text-amber-600'}`}>
+                        {l.growth.report}
+                      </div>
+                    )}
                   </div>
                 ))}
               </div>
@@ -1046,7 +1075,7 @@ export default function SettingsPage() {
       </PageSection>
 
       {/* 关于 */}
-      <PageSection icon={<IconShield />} title="关于 WorkBuddy 管理台">
+      <PageSection icon={<IconShield />} title="关于 workbuddy控制台">
         <Card className="p-5 text-xs text-zinc-400 leading-relaxed space-y-1.5">
           <div className="flex items-center gap-2">
             <div className="font-medium text-zinc-600 text-sm">WorkBuddy 一体化管理工具</div>

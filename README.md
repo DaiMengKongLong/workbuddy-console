@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="assets/cover.png" alt="WorkBuddy 管理台 — 账号 · 模型 · 用量" width="100%" />
+  <img src="assets/cover.png" alt="workbuddy控制台 — 账号 · 模型 · 用量" width="100%" />
 </p>
 
-# WorkBuddy 管理台
+# workbuddy控制台
 
 > 把 **WorkBuddy 账号管理**、**多平台免费模型**、**Token 用量统计**、**积分统计** 收进同一个本地工具。
 
@@ -35,7 +35,7 @@ npm run app          # 以桌面窗口运行（Electron）
 | **反向代理** | 把 WorkBuddy 的官方对话能力**按四种主流协议**暴露给本机 agent：OpenAI Chat Completions（`/v1/chat/completions`）、Anthropic Messages（`/v1/messages`）、OpenAI Responses（`/v1/responses`）、Google Gemini 原生（`/v1beta/models/{model}:generateContent`）；账号池轮询、401 自动刷新 token 并换号、流式/非流式都支持（上游只收流式，非流式由代理聚合）；按协议族分组的接入示例（Claude Code / Codex CLI / Gemini CLI / Cherry Studio / Cline / Cursor / TRAE / 小米 MiMo / 豆包 等）、请求日志与连通性自检；默认关闭，需在页面显式开启 |
 | **Token 统计** | 扫描本机会话日志（JSONL），统计请求数、输入/输出/缓存读写/思考 Token、缓存命中率、模型与项目排行、会话明细；**按档位（国内版 / 国际版）分别归档**，可选「全部档位」合并查看 |
 | **积分统计** | 调用官方用量接口：可用剩余积分、按账号与档位汇总、逐请求明细（分页）、趋势与模型分布；接口不可达时回退本地离线预估 |
-| **设置** | WorkBuddy 运行状态与重启、**每日签到**（自动巡检默认开启，可关闭；也可随时手动一键签到）、**账号凭据维护**（凭据自动刷新默认开启，可关闭；附各账号剩余有效期与「检查并刷新」）、数据目录检测、**登录态与目录权限自检**、**登录态备份与恢复**、网络代理、通知历史、界面错误日志；左下角显示版本号，**有新版本时出现升级按钮**（「关于」里可手动检查、关掉自动检查） |
+| **设置** | WorkBuddy 运行状态与重启、**每日签到与成长中心**（旅行礼物 / 派 Buddy / 任务 / 断登补签 / 连登兑换 / 开盲盒 / Buddy 盲盒；自动巡检默认开启，可关闭；也可随时手动「一键领取」）、**账号凭据维护**（凭据自动刷新默认开启，可关闭；附各账号剩余有效期与「检查并刷新」）、数据目录检测、**登录态与目录权限自检**、**登录态备份与恢复**、网络代理、通知历史、界面错误日志；左下角显示版本号，**有新版本时出现升级按钮**（「关于」里可手动检查、关掉自动检查） |
 
 ## Token 统计口径
 
@@ -74,9 +74,41 @@ WorkBuddy 的对话记录**按账号隔离**：`workbuddy.db` 的 `sessions` 表
 node scripts/test-session-copy.mjs   # 会话复制 / 门禁 / 回滚 / 账本（91 项断言）
 node scripts/test-stop-process.mjs   # 自动退出 WorkBuddy 的进程链路（23 项断言，仅 Windows）
 node scripts/test-token-refresh.mjs  # 凭据刷新判据与版本自检（46 项断言，官方接口用桩替换）
+node scripts/test-growth.mjs         # 成长中心六模块与补登候选（49 项断言，官方接口用桩替换）
 ```
 
 `test-stop-process.mjs` 会把 `node.exe` 复制成同名替身 `WorkBuddyFake.exe` 后台拉起，再走完整的「枚举 → 优雅退出 → 强杀 → 确认消失」流程，并断言**真实 WorkBuddy 的进程一个都没被误杀**。它还守着一条容易写反的判据：进程确实不存在时探测结果必须"干净地"报没有（`error` 为空），否则在 PowerShell 被安全策略禁掉的机器上，切换账号会在最后一道门把自己拦住。
+
+## 每日签到与成长中心（国内版）
+
+签到只给一部分积分；**成长中心**里还有六个每天刷新的奖励入口，工具会一并代领（`server/workbuddy/growth.mjs`）：
+
+| # | 模块 | 接口 | 备注 |
+| --- | --- | --- | --- |
+| 1 | **Buddy 旅行** | `buddy/travel/status` → `claim` → `config` → `depart` | 到站先领礼物再派出；服务端已说"今日名额用完"就不再派出，省掉两个必然失败的请求 |
+| 2 | **任务** | `tasks` → `tasks/accept` → `tasks/{code}/claim` | 接单 body 是**复数** `task_codes` 数组（单数 `task_code` 官方一律 400）；只有 `completed` 才发奖 |
+| 3 | **断登补签** | `streak` + `heatmap` → `makeup-cards/use` | 只补**当月、今天之前、`score==0`、未补登过**的日期；**每轮最多用 1 张卡** |
+| 4 | **连登兑换** | `redeem/summary` → `redeem` | 入门 7 天 / 进阶 14 天 / 巅峰 28 天；`tier` 只认档位标识 `7d`/`14d`/`28d` |
+| 5 | **开盲盒** | `lottery/chances` → `lottery/draw` | 写路径不可逆，**每轮只开一次**；中实物奖会提醒去填收件信息 |
+| 6 | **Buddy 盲盒** | `buddy/quota` → `buddy/open` | 能量攒够 `cost_per_open` 才开，数量取 `min(affordable, max_open_count)` |
+
+几个刻意的设计：
+
+- **模块顺序有讲究**：「任务/兑换」排在「开盲盒」之前——兑换和任务送的抽奖机会/能量，**同一轮就能用上**（实测：连登兑换「入门」给的 1 次抽奖机会，在同一轮里被盲盒用掉，开出 10 积分）。
+- **补登先于兑换**：补登会改变连登天数，先补再兑才能拿到最新解锁状态。
+- **每轮限量**：补登卡 1 张、盲盒 1 次。写操作**一律不重试**（服务端处理完成后才超时时，重试会重复提交）。
+- **常态不算失败**：旅行名额用完、"没有抽奖机会"（`400 insufficient lottery chance balance`）、连登兑换 `403 天数不足`、日期已无需补登，都是每天的正常状态，只进报告、不计失败，也不会让整轮中止。
+- **一处中止**：`401/403`（非上述业务常态）判定为登录态被拒，中止本轮并提示刷新凭据或重新扫码；第一个请求就网络不可达时立刻收手，不把后面六个接口全撞一遍。
+- **两道巡检门禁**：签到 + 成长中心**各自**判定"今天做完没有"。签到早满了不影响成长中心的旅行/任务/补登/兑换/盲盒——两者是独立的每日额度。
+- **补登必须"有据可依"**：补登候选完全来自服务端活跃日历，结构异常（缺服务端日期、分数非法、格式不对）直接抛错跳过，**绝不靠猜测消耗补登卡**。
+- **汇报优先用服务端实发值**：任务列表里的 `reward_credit` 只是活动配置；兑换实发字段带 `_granted` 后缀（`credit_granted` / `energy_granted` / `cards_granted` / `chances_granted`），直接读 `credit` 恒为空、会把兑换所得漏计。
+
+手动入口在「设置 → 每日签到与成长中心」：**一键领取**（签到 + 成长中心全部可领）和单账号「领取」。最近记录里每条都带成长中心的一行式汇报（含进账积分），例如：
+
+```
+[16:12:08] 时光悠悠 今日已签到              成长中心 +0
+  今日旅行名额已用完；领取任务「关注官方公众号」（进度开始计）；连登兑换「入门」（+2 能量 +1 次抽奖）；开盲盒获得：10 积分（能量 4，连签 13 天）
+```
 
 ## 账号不会"放着放着就失效"（凭据自动刷新）
 
@@ -108,7 +140,7 @@ node scripts/test-token-refresh.mjs  # 凭据刷新判据与版本自检（46 �
 
 ## 桌面版（Windows / macOS）
 
-管理台可以打包成免装 Node 的桌面应用：Electron 主进程里直接跑 Express 服务，窗口加载本地回环地址；**关闭窗口只是缩到系统托盘**，每日签到的自动巡检继续在后台运行，右键托盘图标可恢复窗口或真正退出。
+控制台可以打包成免装 Node 的桌面应用：Electron 主进程里直接跑 Express 服务，窗口加载本地回环地址；**关闭窗口只是缩到系统托盘**，每日签到的自动巡检继续在后台运行，右键托盘图标可恢复窗口或真正退出。
 
 ```bash
 npm run icons   # 生成 build/ 下的多平台图标（png / ico / icns / 托盘图）
@@ -123,7 +155,7 @@ npm run app:dir # 只出免安装目录（release/<平台>-unpacked），本地�
 
 ## 反向代理（给市面上的主流 agent 用 WorkBuddy 的额度）
 
-开启后，管理台会在**自身端口**上提供四种主流协议的接口（不额外开端口）：
+开启后，控制台会在**自身端口**上提供四种主流协议的接口（不额外开端口）：
 
 | 端点 | 协议 | 典型客户端 |
 | --- | --- | --- |
@@ -139,9 +171,9 @@ npm run app:dir # 只出免安装目录（release/<平台>-unpacked），本地�
 - **账号池**：默认用全部「能出站」的账号按请求轮询 —— 有明文凭据的算能出站；`access_token` 过期、甚至只存了加密信封，只要还有 `refresh_token` 也算，出站前会先换一份明文回来。401/403 会先刷新 token 再换下一个账号。
 - **档位隔离**：国内版走 `copilot.tencent.com`，国际版走 `www.workbuddy.ai`，绝不混档。
 - **安全**：只监听 `127.0.0.1`，局域网不可见；`refresh_token` 只出现在官方 refresh 端点；请求日志只存内存、不含消息正文。
-- **依赖**：代理由管理台进程提供，需保持管理台运行（桌面版关闭窗口后驻留托盘，不会中断）。
+- **依赖**：代理由控制台进程提供，需保持控制台运行（桌面版关闭窗口后驻留托盘，不会中断）。
 
-各客户端的配置片段在管理台「反向代理 → 接入示例」里**按协议族分组**列出、可直接复制。几个关键点：
+各客户端的配置片段在控制台「反向代理 → 接入示例」里**按协议族分组**列出、可直接复制。几个关键点：
 
 ```bash
 # Claude Code（Anthropic 协议）
@@ -204,7 +236,7 @@ node scripts/test-proxy-pool.mjs        # 23 项断言：账号池准入与凭�
 ```
 
 > `test-proxy-pool.mjs` 守的是一条真实踩过的坑：账号池曾经用「明文凭据且未过期」当准入判据，
-> 于是「管理台离线几天、`access_token` 正好过期」的账号会被**静默踢出池子** ——
+> 于是「控制台离线几天、`access_token` 正好过期」的账号会被**静默踢出池子** ——
 > 明明 `refresh_token` 还有效、一次刷新就能救回来，界面却只回一句「没有可用账号」，
 > 把人往「重新扫码」上引。
 
@@ -226,7 +258,7 @@ node scripts/test-proxy-pool.mjs        # 23 项断言：账号池准入与凭�
 | WorkBuddy 登录态（国内版 / 国际版） | `%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info` / `workbuddy-desktop-ai.info` |
 | 积分快照（与 workbuddy-switch 共享，结构兼容） | `~/.wb-switch/credit_usage_snapshots.json` |
 | 积分用量缓存（本工具私有） | `~/.wb-switch/credit_stats_cache.json` |
-| 签到日志（本工具私有） | `~/.wb-switch/checkin_logs.json` |
+| 签到与成长中心日志（本工具私有） | `~/.wb-switch/checkin_logs.json` |
 | 凭据刷新日志（本工具私有，不含 token） | `~/.wb-switch/token_refresh_logs.json` |
 | 工具配置（平台 Key / 代理 / 自动签到 / 凭据自动刷新） | `~/.free-token/config.json` |
 | 版本自检缓存（6 小时） | `~/.free-token/cache/update-check.json` |
@@ -264,7 +296,8 @@ workbuddy-free-token-manage/
 │       ├── sessions.mjs     # 会话读取与复制（workbuddy.db + projects/ 正文 + 复制账本）
 │       ├── oauth.mjs        # 扫码登录（服务端常驻轮询）
 │       ├── credits.mjs      # 积分统计（官方接口 + 离线预估）
-│       ├── checkin.mjs      # 每日签到
+│       ├── checkin.mjs      # 每日签到（顺带领取成长中心）
+│       ├── growth.mjs       # 成长中心：旅行 / 任务 / 补登 / 兑换 / 盲盒 / Buddy
 │       ├── tokenRefresh.mjs # 凭据自动刷新（临期判定 + 日志）
 │       ├── backups.mjs      # 登录态备份管理
 │       └── diagnostics.mjs  # 目录权限自检
@@ -286,6 +319,7 @@ workbuddy-free-token-manage/
 │   ├── test-proxy-pool.mjs      # 反向代理账号池准入回归（隔离账号库）
 │   ├── test-session-copy.mjs    # 会话复制回归（隔离临时数据根）
 │   ├── test-stop-process.mjs    # 退出 WorkBuddy 的进程链路回归（同名替身进程）
-│   └── test-token-refresh.mjs   # 凭据刷新判据 + 版本自检回归（官方接口用桩替换）
+│   ├── test-token-refresh.mjs   # 凭据刷新判据 + 版本自检回归（官方接口用桩替换）
+│   └── test-growth.mjs          # 成长中心六模块 + 补登候选回归（官方接口用桩替换）
 └── electron/main.mjs        # 桌面壳（内嵌 Express + 窗口）
 ```

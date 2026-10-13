@@ -141,7 +141,7 @@ const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" 
         letter-spacing="4.5" fill="${C.indigoLight}">账号 · 模型 · 用量</text>
 
   <text x="560" y="288" font-family="${LATIN},${SANS}" font-size="72" font-weight="700"
-        letter-spacing="-1" fill="url(#title)">WorkBuddy 管理台</text>
+        letter-spacing="-1" fill="url(#title)">workbuddy控制台</text>
 
   <text x="562" y="338" font-family="${SANS}" font-size="25" font-weight="400"
         fill="${C.indigoFaint}">把账号、模型、用量收进同一个本地工具</text>

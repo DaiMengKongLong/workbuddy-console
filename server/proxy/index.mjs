@@ -6,7 +6,7 @@
  * 就能直接消耗 WorkBuddy 账号的积分与模型额度。
  *
  * 设计取舍：
- * - **不另起端口**：复用管理台自身的 Express（默认 57891 / 桌面版动态端口），
+ * - **不另起端口**：复用控制台自身的 Express（默认 57891 / 桌面版动态端口），
  *   少一个监听端口、少一处防火墙与"端口被占"的故障面。
  * - **默认关闭**：会对外暴露一个本地 HTTP 接口，必须用户显式开启。
  * - **账号轮换**：按请求轮询账号池；401/403 先刷新 token 重试，仍失败再换下一个账号。
@@ -78,7 +78,7 @@ function plainRefreshToken(account) {
  * （access_token 过期、甚至只存了加密信封，都能靠 refresh_token 换一份明文的回来）。
  *
  * ⚠️ 别用 `hasPlainToken` 当这个判据：它顺带把"已过期"也算成不可用，于是
- * 「管理台离线几天、access_token 正好过期」的账号会被**静默踢出账号池**——
+ * 「控制台离线几天、access_token 正好过期」的账号会被**静默踢出账号池**——
  * 明明 refresh_token 还有效，界面却只回一句"没有可用账号"，把人往"重新扫码"上引。
  * 那个函数在签到 / 切换账号 / 界面徽章里仍按原语义使用（那里"过期=不可用"是对的）。
  */
@@ -397,8 +397,8 @@ async function runAcrossPool(pool, task) {
 async function handleMessages(req, res) {
   const started = Date.now();
   const cfg = loadConfig();
-  if (!cfg.proxy?.enabled) return anthropicError(res, 403, '反向代理未开启，请在管理台「反向代理」页面开启');
-  if (!authorized(req)) return anthropicError(res, 401, 'API Key 无效，请在管理台「反向代理」页面查看或重新生成');
+  if (!cfg.proxy?.enabled) return anthropicError(res, 403, '反向代理未开启，请在控制台「反向代理」页面开启');
+  if (!authorized(req)) return anthropicError(res, 401, 'API Key 无效，请在控制台「反向代理」页面查看或重新生成');
   const pool = poolAccounts();
   if (!pool.length) {
     return anthropicError(res, 503, '没有可用账号：反向代理需要至少 1 个带明文凭据的 WorkBuddy 账号（扫码登录导入的账号才有）');
@@ -471,8 +471,8 @@ const responsesError = (res, status, message) =>
 async function handleResponses(req, res) {
   const started = Date.now();
   const cfg = loadConfig();
-  if (!cfg.proxy?.enabled) return responsesError(res, 403, '反向代理未开启，请在管理台「反向代理」页面开启');
-  if (!authorized(req)) return responsesError(res, 401, 'API Key 无效，请在管理台「反向代理」页面查看或重新生成');
+  if (!cfg.proxy?.enabled) return responsesError(res, 403, '反向代理未开启，请在控制台「反向代理」页面开启');
+  if (!authorized(req)) return responsesError(res, 401, 'API Key 无效，请在控制台「反向代理」页面查看或重新生成');
   const pool = poolAccounts();
   if (!pool.length) {
     return responsesError(res, 503, '没有可用账号：反向代理需要至少 1 个带明文凭据的 WorkBuddy 账号（扫码登录导入的账号才有）');
@@ -560,8 +560,8 @@ async function handleGemini(req, res) {
   const model = rawModel.replace(/^models\//, '');
 
   const cfg = loadConfig();
-  if (!cfg.proxy?.enabled) return geminiError(res, 403, '反向代理未开启，请在管理台「反向代理」页面开启');
-  if (!authorized(req)) return geminiError(res, 401, 'API Key 无效，请在管理台「反向代理」页面查看或重新生成');
+  if (!cfg.proxy?.enabled) return geminiError(res, 403, '反向代理未开启，请在控制台「反向代理」页面开启');
+  if (!authorized(req)) return geminiError(res, 401, 'API Key 无效，请在控制台「反向代理」页面查看或重新生成');
   const pool = poolAccounts();
   if (!pool.length) {
     return geminiError(res, 503, '没有可用账号：反向代理需要至少 1 个带明文凭据的 WorkBuddy 账号（扫码登录导入的账号才有）');

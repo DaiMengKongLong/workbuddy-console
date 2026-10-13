@@ -157,7 +157,7 @@ interface ClientSample {
 
 /**
  * 接入示例：覆盖市面上的主流 agent，按协议族分组。
- * 每个片段的 Base URL / Key / 模型 ID 都会按当前管理台实际值渲染，可直接复制。
+ * 每个片段的 Base URL / Key / 模型 ID 都会按当前控制台实际值渲染，可直接复制。
  */
 const CLIENT_SAMPLES: ClientSample[] = [
   /* ---- OpenAI 兼容（复用 /v1/chat/completions，覆盖面最广） ---- */
@@ -484,7 +484,7 @@ export default function ProxyPage() {
         <div className="mt-3 flex flex-wrap items-center gap-2">
           <Hint className="flex-1">
             代理只监听 <span className="font-mono">127.0.0.1</span>，局域网内其他机器访问不到；重新生成 Key 后，已配置过的 agent 需要同步更新。
-            代理由管理台进程提供，需保持管理台运行（桌面版关闭窗口后会驻留系统托盘，不会中断）。
+            代理由控制台进程提供，需保持控制台运行（桌面版关闭窗口后会驻留系统托盘，不会中断）。
           </Hint>
           <Button size="sm" variant="subtle" loading={busy} onClick={() => void rotateKey()} disabled={!data.hasKey}>
             <IconRefresh className="w-3.5 h-3.5" />
