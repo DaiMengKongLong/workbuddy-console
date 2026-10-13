@@ -306,6 +306,84 @@ export interface AccountsResponse {
   variants: VariantInfo[];
 }
 
+/* ---------------- 会话（对话记录）复制 ---------------- */
+
+/** 会话列表里的一条：源是当前登录账号，目标是选中的账号 */
+export interface SessionRow {
+  id: string;
+  /** 展示名：优先用户改名（custom_title），否则自动标题 */
+  title: string;
+  cwd: string;
+  /** 工作区名（cwd 末段），用于分组与搜索 */
+  workspace: string;
+  status: string;
+  updatedAt: number;
+  isPlayground: boolean;
+  /** 有无正文文件；没有正文的会话不能复制 */
+  hasBody: boolean;
+  bytes: number;
+  /** 是否已经复制给目标账号（本工具账本记录） */
+  copied: boolean;
+  copiedTo: string | null;
+}
+
+export interface SessionListResponse {
+  variant: string;
+  sourceUid: string;
+  targetUid: string;
+  supported: boolean;
+  sessions: SessionRow[];
+  stats: { total: number; withBody: number; bytes: number };
+}
+
+export interface SessionCopyItem {
+  id: string;
+  newId: string;
+  title: string;
+  workspace: string;
+  bytes: number;
+}
+
+/** 退出 WorkBuddy 的结果（`wasRunning=false` 表示本来就没开） */
+export interface AppStopResult {
+  stopped: boolean;
+  wasRunning: boolean;
+  killed: number[];
+  /** 是否需要强杀（WorkBuddy 关窗会缩到托盘，优雅退出经常不够） */
+  forced: boolean;
+  exePath: string | null;
+}
+
+/** 复制报告：copied 成功 / skipped 账本命中 / errors 逐条原因 */
+export interface SessionCopyReport {
+  ok: boolean;
+  variant: string;
+  sourceUid: string;
+  targetUid: string;
+  copied: SessionCopyItem[];
+  skipped: { id: string; reason: string; newId?: string }[];
+  errors: { id: string; error: string }[];
+  totalBytes: number;
+  backupPath: string;
+  appStop: AppStopResult | null;
+  /** 由路由层补上：本次是否重新打开了被关掉的 WorkBuddy */
+  relaunch?: { launched: boolean; exePath?: string; error?: string } | null;
+  elapsedMs: number;
+}
+
+/** 切换账号的返回：登录态切换结果 + 可选的会话复制报告与进程退出/重开结果 */
+export interface SwitchAccountResult {
+  ok: boolean;
+  backupPath: string | null;
+  authFilePath: string;
+  variant: string;
+  account: AccountInfo;
+  needRestart: boolean;
+  sessionCopy: SessionCopyReport | null;
+  appStop: AppStopResult | null;
+  relaunch: { launched: boolean; exePath?: string; error?: string } | null;
+}
+
 /* ---------------- 积分统计 ---------------- */
 
 /** 单个积分资源包（官方 get-user-resource-summary 的 Packages 项） */

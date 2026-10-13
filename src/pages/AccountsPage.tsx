@@ -15,6 +15,7 @@ import {
   IconPower,
   IconQrCode,
   IconRefresh,
+  IconSearch,
   IconSparkles,
   IconSwitch,
   IconTrash,
@@ -27,6 +28,7 @@ import {
   Segmented,
   Skeleton,
   Spinner,
+  Toolbar,
   useConfirm,
   useToast,
 } from '../components/ui';
@@ -36,11 +38,15 @@ import type {
   AccountBalancesResponse,
   AccountInfo,
   AccountsResponse,
+  AppStopResult,
   CreditBalance,
   CreditPackage,
   LoadedInfo,
   OAuthPollResult,
   OAuthStartResult,
+  SessionCopyReport,
+  SessionListResponse,
+  SwitchAccountResult,
   VariantInfo,
 } from '../lib/types';
 
@@ -157,6 +163,7 @@ function AccountCard({
   balance,
   balanceLoading,
   onSwitch,
+  onSyncSessions,
   onRename,
   onDelete,
   onShowPackages,
@@ -167,6 +174,7 @@ function AccountCard({
   balance: CreditBalance | null;
   balanceLoading: boolean;
   onSwitch: () => void;
+  onSyncSessions: () => void;
   onRename: () => void;
   onDelete: () => void;
   onShowPackages: () => void;
@@ -301,6 +309,20 @@ function AccountCard({
         <Button size="sm" className="h-7 rounded-full px-2.5 pr-3.5 text-xs" onClick={onRename}>
           <IconEdit className="w-3.5 h-3.5" />
           备注
+        </Button>
+        <Button
+          size="sm"
+          className="h-7 rounded-full px-2.5 pr-3.5 text-xs"
+          disabled={isCurrent || busy}
+          onClick={onSyncSessions}
+          title={
+            isCurrent
+              ? '这就是当前正在使用的账号，源与目标相同，无需复制会话'
+              : '把当前登录账号的会话复制给这个账号（新会话 id，源账号数据不受影响）'
+          }
+        >
+          <IconCopy className="w-3.5 h-3.5" />
+          同步会话
         </Button>
         <Button
           size="sm"
@@ -814,6 +836,448 @@ function PackagesDialog({ account, balance, onClose }: { account: AccountInfo | 
   );
 }
 
+/** 体积：B → 人类可读；复制会话的体积提示用（单会话可达几十 MB） */
+function fmtBytes(n: number): string {
+  if (!n || n < 0) return '0 B';
+  if (n < 1024) return `${n} B`;
+  if (n < 1048576) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1073741824) return `${(n / 1048576).toFixed(1)} MB`;
+  return `${(n / 1073741824).toFixed(2)} GB`;
+}
+
+/** 会话列表一次最多渲染多少行：本机有 3300+ 条，全渲染会明显卡顿，靠搜索收敛 */
+const SESSION_RENDER_LIMIT = 200;
+
+/**
+ * 「自动退出 WorkBuddy」勾选行（受控纯展示，两处复用）。
+ *
+ * 勾上后：切换/复制前由服务端结束 WorkBuddy 的全部相关进程，确认退出后才动数据；
+ * 切换完成后再把它重新打开（只重开"确实是我们关掉的"那种情况）。
+ */
+function StopAppRow({
+  checked,
+  onChange,
+  disabled,
+  children,
+}: {
+  checked: boolean;
+  onChange: (v: boolean) => void;
+  disabled?: boolean;
+  children?: React.ReactNode;
+}) {
+  return (
+    <label
+      className={`mt-3 flex items-start gap-2 rounded-xl border px-3 py-2.5 ${
+        disabled ? 'cursor-not-allowed border-zinc-200 bg-zinc-50' : 'cursor-pointer border-indigo-200 bg-indigo-50/60'
+      }`}
+    >
+      <input
+        type="checkbox"
+        className="mt-0.5 h-3.5 w-3.5 shrink-0 accent-indigo-600"
+        checked={checked}
+        disabled={disabled}
+        onChange={(e) => onChange(e.target.checked)}
+      />
+      <span className="text-xs leading-relaxed text-indigo-900">
+        <b>自动退出 WorkBuddy</b>：由本工具结束后台的全部 WorkBuddy 进程，确认退出后才执行，不再需要你手动关闭。
+        {children}
+      </span>
+    </label>
+  );
+}
+
+/**
+ * 确认弹窗里用的版本：自己持有勾选状态并把值写进外部 ref。
+ *
+ * 必须这样做：确认弹窗保存的是**调用那一刻的消息节点快照**，
+ * 由父组件受控的 checkbox 不会跟着父组件重渲染，勾了也读不到。
+ */
+function StopAppToggleRef({ flagRef }: { flagRef: { current: boolean } }) {
+  const [on, setOn] = useState(true);
+  return (
+    <StopAppRow
+      checked={on}
+      onChange={(v) => {
+        setOn(v);
+        flagRef.current = v;
+      }}
+    />
+  );
+}
+
+/**
+ * 切换确认框里的「同时复制会话」勾选（同样只能自己持有状态 + 写外部 ref，原因见上）。
+ */
+function CopyOnSwitchToggle({ flagRef }: { flagRef: { current: boolean } }) {
+  const [on, setOn] = useState(false);
+  return (
+    <label className="mt-2 flex cursor-pointer items-start gap-2 rounded-xl border border-indigo-200 bg-indigo-50/60 px-3 py-2.5">
+      <input
+        type="checkbox"
+        className="mt-0.5 h-3.5 w-3.5 shrink-0 accent-indigo-600"
+        checked={on}
+        onChange={(e) => {
+          setOn(e.target.checked);
+          flagRef.current = e.target.checked;
+        }}
+      />
+      <span className="text-xs leading-relaxed text-indigo-900">
+        <b>同时复制会话</b>：把当前账号的会话也带给这个账号。勾选后会先打开会话选择列表，
+        由你挑要复制哪些（复制用的是新会话 id，源账号的数据不受影响）。
+      </span>
+    </label>
+  );
+}
+
+/**
+ * 会话复制弹窗：列出「当前登录账号 → 目标账号」可复制的会话并执行复制。
+ *
+ * `mode='switch'` 时按钮变成「复制并切换」——先复制会话、再写登录态文件。
+ * 顺序不能反：来源账号是「当前登录账号」，登录态一旦被改写就再也读不出源账号是谁。
+ */
+function SessionCopyDialog({
+  open,
+  target,
+  mode,
+  wbRunning,
+  onClose,
+  onDone,
+}: {
+  open: boolean;
+  target: AccountInfo | null;
+  mode: 'copy' | 'switch';
+  wbRunning: boolean;
+  onClose: () => void;
+  onDone: () => void;
+}) {
+  const toast = useToast();
+  const [data, setData] = useState<SessionListResponse | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState('');
+  const [query, setQuery] = useState('');
+  const [hideCopied, setHideCopied] = useState(true);
+  /** 默认勾选：由服务端直接结束 WorkBuddy 进程，用户不必自己动手 */
+  const [stopApp, setStopApp] = useState(true);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [busy, setBusy] = useState(false);
+  const [report, setReport] = useState<SessionCopyReport | null>(null);
+
+  const targetId = target?.id || '';
+
+  /** 拉取列表；复制成功后也复用它刷新「已复制」标记 */
+  const load = useCallback(async () => {
+    if (!targetId) return;
+    setLoading(true);
+    setLoadError('');
+    try {
+      setData(await get<SessionListResponse>(`/api/sessions?accountId=${encodeURIComponent(targetId)}`, { timeoutMs: TIMEOUT.stats }));
+    } catch (e: any) {
+      setLoadError(e?.message || '读取会话列表失败');
+    } finally {
+      setLoading(false);
+    }
+  }, [targetId]);
+
+  // 每次打开（或换目标账号）重新拉取：避免看到过期的「已复制」状态
+  useEffect(() => {
+    if (!open) return;
+    setSelected(new Set());
+    setReport(null);
+    setQuery('');
+    setHideCopied(true);
+    setStopApp(true);
+    void load();
+  }, [open, targetId, load]);
+
+  const sessions = data?.sessions || [];
+  const copiedCount = useMemo(() => sessions.filter((s) => s.copied).length, [sessions]);
+
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return sessions.filter((s) => {
+      if (hideCopied && s.copied) return false;
+      if (!q) return true;
+      return (
+        s.title.toLowerCase().includes(q) ||
+        s.workspace.toLowerCase().includes(q) ||
+        s.id.toLowerCase().includes(q)
+      );
+    });
+  }, [sessions, query, hideCopied]);
+
+  const visible = filtered.slice(0, SESSION_RENDER_LIMIT);
+  const selectableIds = useMemo(() => filtered.filter((s) => s.hasBody && !s.copied).map((s) => s.id), [filtered]);
+  const selectedBytes = useMemo(
+    () => sessions.reduce((sum, s) => (selected.has(s.id) ? sum + s.bytes : sum), 0),
+    [sessions, selected]
+  );
+
+  const toggle = (id: string, on: boolean) =>
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (on) next.add(id);
+      else next.delete(id);
+      return next;
+    });
+
+  const run = async () => {
+    const ids = [...selected];
+    if (!ids.length || !target) return;
+    setBusy(true);
+    setReport(null);
+    try {
+      if (mode === 'switch') {
+        const r = await post<SwitchAccountResult>('/api/accounts/switch', {
+          id: target.id,
+          copySessionIds: ids,
+          stopApp,
+        });
+        const rep = r?.sessionCopy || null;
+        const failed = rep?.errors?.length || 0;
+        const reopenFailed = r?.relaunch ? r.relaunch.launched === false : false;
+        const tail = reopenFailed ? 'WorkBuddy 已退出但重新打开失败，请手动打开' : 'WorkBuddy 已自动重新打开';
+        toast(
+          failed || reopenFailed ? 'err' : 'ok',
+          `已复制 ${rep?.copied.length || 0} 个会话并切换到「${target.name}」` +
+            (failed ? `，其中 ${failed} 个复制失败（见下方明细）` : '') +
+            `，${tail}`
+        );
+        onDone();
+        // 失败明细留在弹窗里给用户看；全部成功就直接关掉——登录态已切换，
+        // 此时再拉会话列表会因为「源账号 = 目标账号」而报错，所以不做刷新。
+        if (failed) setReport(rep);
+        else onClose();
+        return;
+      }
+      const rep = await post<SessionCopyReport>('/api/sessions/copy', {
+        accountId: target.id,
+        ids,
+        stopApp,
+      });
+      setReport(rep);
+      const reopenFailed = rep.relaunch ? rep.relaunch.launched === false : false;
+      const procNote = rep.appStop?.wasRunning
+        ? reopenFailed
+          ? '；WorkBuddy 已退出，但重新打开失败，请手动打开'
+          : '；WorkBuddy 已自动重新打开'
+        : '';
+      if (rep.ok && !reopenFailed) toast('ok', `已复制 ${rep.copied.length} 个会话到「${target.name}」${procNote}`);
+      else
+        toast(
+          'err',
+          `复制完成：成功 ${rep.copied.length} 个，失败 ${rep.errors.length} 个（详见列表下方）${procNote}`
+        );
+      setSelected(new Set());
+      await load();
+      onDone();
+    } catch (e: any) {
+      toast('err', e?.message || '复制失败');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /** 只有在「运行中且没有授权自动退出」时才真的挡住操作 */
+  const blocked = wbRunning && !stopApp;
+
+  return (
+    <Modal
+      open={open}
+      onClose={busy ? () => {} : onClose}
+      width="max-w-3xl"
+      title={mode === 'switch' ? `复制会话并切换到「${target?.name}」` : `把会话复制给「${target?.name}」`}
+      subtitle={
+        data
+          ? `来源：当前登录账号 ${data.sourceUid.slice(0, 8)}… → 目标：${target?.name}（${target?.variantLabel}）`
+          : '复制会给每个会话生成新的会话 id，源账号的数据完全不受影响'
+      }
+      footer={
+        <>
+          <span className="mr-auto text-xs text-zinc-500">
+            已选 <b className="tabular-nums text-zinc-800">{selected.size}</b> 个 · 约{' '}
+            <b className="tabular-nums text-zinc-800">{fmtBytes(selectedBytes)}</b>
+          </span>
+          <Button onClick={onClose} disabled={busy}>
+            取消
+          </Button>
+          <Button
+            variant="primary"
+            loading={busy}
+            disabled={!selected.size || blocked || loading || !data?.supported}
+            onClick={run}
+            title={
+              blocked
+                ? 'WorkBuddy 正在运行：请勾选「自动退出 WorkBuddy」或自己先退出'
+                : `${selected.size} 个会话${wbRunning && stopApp ? '（会先自动退出 WorkBuddy）' : ''}`
+            }
+          >
+            <IconCopy className="w-3.5 h-3.5" />
+            {mode === 'switch' ? '复制并切换' : '开始复制'}
+          </Button>
+        </>
+      }
+    >
+      <div className="space-y-3">
+        {/* 前置条件与副作用：这两条是用户最容易踩的坑，必须写在最上面 */}
+        <div
+          className={`flex items-start gap-2 rounded-xl border px-3.5 py-2.5 text-xs leading-relaxed ${
+            blocked ? 'border-red-200 bg-red-50 text-red-800' : 'border-amber-200 bg-amber-50 text-amber-800'
+          }`}
+        >
+          <IconWarning className={`mt-px w-3.5 h-3.5 shrink-0 ${blocked ? 'text-red-500' : 'text-amber-500'}`} />
+          <span>
+            {blocked ? (
+              <>
+                <b>WorkBuddy 正在运行，无法复制。</b>运行中的实例看不到写入，继续对话会让副本与源会话分叉。
+                勾选下面的「自动退出 WorkBuddy」，或自己先完全退出后重试。
+              </>
+            ) : (
+              <>
+                复制前的写入要求 WorkBuddy 不在运行
+                {wbRunning && stopApp ? '——下面已勾选自动退出，由本工具结束后台进程并确认退出' : ''}。
+                复制出的会话是独立副本，WorkBuddy 下次启动时会把它们<b>上传到云端</b>，会占用云端空间与流量。
+              </>
+            )}
+          </span>
+        </div>
+
+        {wbRunning && <StopAppRow checked={stopApp} onChange={setStopApp} />}
+
+        {loading && (
+          <div className="flex items-center gap-2 py-10 text-sm text-zinc-400">
+            <Spinner className="w-4 h-4" />
+            正在读取会话列表（本机数千个会话，需要索引一次正文目录）…
+          </div>
+        )}
+
+        {!loading && loadError && (
+          <div className="flex items-start gap-2 rounded-xl border border-red-200 bg-red-50 px-3.5 py-2.5 text-xs text-red-700">
+            <IconWarning className="mt-px w-3.5 h-3.5 shrink-0 text-red-500" />
+            <span>{loadError}</span>
+          </div>
+        )}
+
+        {!loading && !loadError && data && !data.supported && (
+          <div className="rounded-xl border border-amber-200 bg-amber-50 px-3.5 py-2.5 text-xs text-amber-800">
+            该档位暂不支持会话复制：数据根下缺少 <span className="font-mono">projects/</span> 目录或
+            <span className="font-mono"> sessions</span> 表。
+          </div>
+        )}
+
+        {!loading && !loadError && data?.supported && (
+          <>
+            <Toolbar>
+              <div className="relative min-w-[180px] flex-1">
+                <IconSearch className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-zinc-400" />
+                <input
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  placeholder="搜索标题 / 工作区 / 会话 id"
+                  className="h-8 w-full rounded-xl border border-zinc-200 bg-white pl-8 pr-3 text-xs text-zinc-700 outline-none transition-colors focus:border-indigo-400"
+                />
+              </div>
+              <Button size="sm" onClick={() => setSelected(new Set(selectableIds))} disabled={!selectableIds.length}>
+                全选当前
+              </Button>
+              <Button size="sm" onClick={() => setSelected(new Set())} disabled={!selected.size}>
+                清空
+              </Button>
+              <Button size="sm" variant="ghost" onClick={() => setHideCopied((v) => !v)}>
+                {hideCopied ? `显示已复制的（${copiedCount}）` : '隐藏已复制的'}
+              </Button>
+            </Toolbar>
+
+            <div className="text-[11px] text-zinc-400 leading-relaxed">
+              共 {data.stats.total} 个会话（有正文 {data.stats.withBody} 个，合计 {fmtBytes(data.stats.bytes)}），
+              当前筛选出 <b className="tabular-nums text-zinc-600">{filtered.length}</b> 个
+              {filtered.length > visible.length ? `，只渲染前 ${SESSION_RENDER_LIMIT} 条，请用搜索缩小范围` : ''}
+            </div>
+
+            <div className="max-h-[38vh] space-y-1.5 overflow-y-auto pr-0.5">
+              {visible.length === 0 && (
+                <div className="py-10 text-center text-xs text-zinc-400">
+                  {sessions.length === 0 ? '当前账号没有可复制的会话' : '没有匹配的会话'}
+                </div>
+              )}
+              {visible.map((s) => {
+                const disabled = !s.hasBody || s.copied;
+                const checked = selected.has(s.id);
+                return (
+                  <label
+                    key={s.id}
+                    title={s.cwd || '(无工作区)'}
+                    className={`flex items-center gap-3 rounded-xl border px-3 py-2 transition-colors ${
+                      disabled
+                        ? 'border-zinc-100 bg-zinc-50/60'
+                        : checked
+                          ? 'cursor-pointer border-indigo-300 bg-indigo-50/50'
+                          : 'cursor-pointer border-zinc-200 hover:border-indigo-200 hover:bg-indigo-50/30'
+                    }`}
+                  >
+                    <input
+                      type="checkbox"
+                      className="h-3.5 w-3.5 shrink-0 accent-indigo-600"
+                      checked={checked}
+                      disabled={disabled}
+                      onChange={(e) => toggle(s.id, e.target.checked)}
+                    />
+                    <div className="min-w-0 flex-1">
+                      <div className="flex min-w-0 items-center gap-1.5">
+                        <span className={`truncate text-sm ${disabled ? 'text-zinc-400' : 'font-medium text-zinc-800'}`}>
+                          {s.title}
+                        </span>
+                        {s.isPlayground && <Badge color="violet">任务</Badge>}
+                        {s.copied && <Badge color="green">已复制</Badge>}
+                        {!s.hasBody && <Badge color="amber">无正文</Badge>}
+                      </div>
+                      <div className="mt-0.5 flex min-w-0 items-center gap-x-2.5 text-[11px] text-zinc-400">
+                        <span className="truncate">{s.workspace}</span>
+                        <span className="shrink-0 tabular-nums">{fmtBytes(s.bytes)}</span>
+                        <span className="shrink-0 tabular-nums">{s.updatedAt ? fmtDateTime(s.updatedAt) : '—'}</span>
+                      </div>
+                    </div>
+                  </label>
+                );
+              })}
+            </div>
+          </>
+        )}
+
+        {/* 复制结果：成功 / 跳过 / 失败逐条列出，避免"点了没反应" */}
+        {report && (
+          <div className="space-y-2 rounded-xl border border-zinc-200 bg-zinc-50/70 px-3.5 py-3 text-xs">
+            <div className="font-medium text-zinc-700">
+              复制结果：成功 <b className="tabular-nums text-emerald-600">{report.copied.length}</b> 个 ·
+              跳过 <b className="tabular-nums text-zinc-500">{report.skipped.length}</b> 个 ·
+              失败 <b className="tabular-nums text-red-600">{report.errors.length}</b> 个 ·
+              共 {fmtBytes(report.totalBytes)} · 用时 {(report.elapsedMs / 1000).toFixed(1)}s
+            </div>
+            {report.backupPath && (
+              <div className="truncate font-mono text-[11px] text-zinc-400" title={report.backupPath}>
+                复制前已备份会话库：{report.backupPath}
+              </div>
+            )}
+            {report.errors.length > 0 && (
+              <ul className="max-h-32 space-y-0.5 overflow-y-auto text-[11px] text-red-600">
+                {report.errors.slice(0, 50).map((e) => (
+                  <li key={e.id} className="truncate" title={`${e.id}：${e.error}`}>
+                    {e.id.slice(0, 8)}… — {e.error}
+                  </li>
+                ))}
+              </ul>
+            )}
+            {report.skipped.length > 0 && report.copied.length === 0 && report.errors.length === 0 && (
+              <div className="text-[11px] text-zinc-500">
+                选中的会话此前已经复制过，本次全部跳过（不会在目标账号里堆出重复会话）。
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </Modal>
+  );
+}
+
 export default function AccountsPage() {
   const toast = useToast();
   const confirm = useConfirm();
@@ -831,6 +1295,14 @@ export default function AccountsPage() {
   const [variant, setVariant] = useState<'cn' | 'ai'>('cn');
   /** WorkBuddy 进程是否在运行：运行时切换会被它改写回去，需要提前提醒 */
   const [wbRunning, setWbRunning] = useState(false);
+  /** 「退出 WorkBuddy」按钮的进行态 */
+  const [stopping, setStopping] = useState(false);
+  /** 会话复制弹窗的目标账号；`sessionMode` 决定按钮是「开始复制」还是「复制并切换」 */
+  const [sessionTarget, setSessionTarget] = useState<AccountInfo | null>(null);
+  const [sessionMode, setSessionMode] = useState<'copy' | 'switch'>('copy');
+  /** 切换确认框里两个勾选的值（弹窗消息是快照，只能靠 ref 传出来） */
+  const copyOnSwitchRef = useRef(false);
+  const stopAppRef = useRef(true);
 
   const load = useCallback(async () => {
     try {
@@ -902,37 +1374,100 @@ export default function AccountsPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const doSwitch = async (account: AccountInfo) => {
-    const ok = await confirm({
-      title: '切换账号',
-      message: (
-        <>
-          将把账号「<b>{account.name}</b>」写入 WorkBuddy 登录态文件。
-          <div className="mt-2.5 space-y-2 text-xs text-zinc-500 leading-relaxed">
-            <div className="flex items-start gap-1.5">
-              <IconWarning className="w-3.5 h-3.5 shrink-0 mt-px text-amber-500" />
-              <span>
-                <b className="text-amber-700">请先完全退出 WorkBuddy。</b>
-                若 WorkBuddy 正在运行，它会在检测到登录态变化后用自己的会话把文件改写回去，导致切换不生效。
-              </span>
-            </div>
-            <div>切换前会自动备份当前登录态（~/.wb-switch/backups/），写入后需重新打开 WorkBuddy。</div>
-          </div>
-        </>
-      ),
-      confirmText: '已退出，切换',
-    });
-    if (!ok) return;
+  /** 切换账号的收尾：写登录态文件（可先自动退出 WorkBuddy、再复制会话） */
+  const switchNow = async (account: AccountInfo, copySessionIds: string[] = [], stopApp = true) => {
     setBusyId(account.id);
     try {
-      const r = await post<{ backupPath: string | null }>('/api/accounts/switch', { id: account.id });
-      toast('ok', `已切换到「${account.name}」，请重新打开 WorkBuddy`);
+      const r = await post<SwitchAccountResult>('/api/accounts/switch', {
+        id: account.id,
+        copySessionIds: copySessionIds.length ? copySessionIds : undefined,
+        stopApp,
+      });
+      const copied = r?.sessionCopy?.copied.length || 0;
+      const wasStopped = !!r?.appStop?.wasRunning;
+      const reopenFailed = r?.relaunch ? r.relaunch.launched === false : false;
+      const tail = reopenFailed
+        ? 'WorkBuddy 已退出但重新打开失败，请手动打开'
+        : wasStopped
+          ? 'WorkBuddy 已自动重新打开'
+          : '请重新打开 WorkBuddy';
+      toast(
+        reopenFailed ? 'err' : 'ok',
+        `已切换到「${account.name}」${copied ? `，并复制了 ${copied} 个会话` : ''}，${tail}`
+      );
       if (r?.backupPath) console.info('登录态备份：', r.backupPath);
+      setSessionTarget(null);
       load();
     } catch (e: any) {
       toast('err', e?.message || '切换失败');
     } finally {
       setBusyId(null);
+    }
+  };
+
+  const doSwitch = async (account: AccountInfo) => {
+    copyOnSwitchRef.current = false;
+    stopAppRef.current = true;
+    const ok = await confirm({
+      title: '切换账号',
+      message: (
+        <>
+          将把账号「<b>{account.name}</b>」写入 WorkBuddy 登录态文件。
+          <div className="mt-2.5 text-xs text-zinc-500 leading-relaxed">
+            切换前会自动备份当前登录态（~/.wb-switch/backups/）。
+          </div>
+          <StopAppToggleRef flagRef={stopAppRef} />
+          <CopyOnSwitchToggle flagRef={copyOnSwitchRef} />
+          <div className="mt-2 flex items-start gap-1.5 text-xs leading-relaxed text-zinc-400">
+            <IconWarning className="w-3.5 h-3.5 shrink-0 mt-px text-amber-400" />
+            <span>
+              取消勾选「自动退出」就必须自己先完全退出 WorkBuddy；否则它会把登录态改写回去，切换不生效。
+            </span>
+          </div>
+        </>
+      ),
+      confirmText: '开始切换',
+    });
+    if (!ok) return;
+    // 勾了「同时复制会话」就先打开选择列表，由那次操作一并完成退出、复制与切换
+    if (copyOnSwitchRef.current) {
+      setSessionMode('switch');
+      setSessionTarget(account);
+      return;
+    }
+    await switchNow(account, [], stopAppRef.current);
+  };
+
+/** 一键结束后台全部 WorkBuddy 进程（与切换/复制里的自动退出同一条服务端逻辑） */
+  const stopNow = async () => {
+    const ok = await confirm({
+      title: '退出 WorkBuddy',
+      message: (
+        <>
+          将结束后台<b>全部</b> WorkBuddy 相关进程，并确认它们真的退出。
+          <div className="mt-2.5 text-xs leading-relaxed text-zinc-500">
+            正在进行的对话会<b className="text-red-600">立即中断</b>；关闭前未落盘的内容可能丢失。
+            切换账号时勾选「自动退出 WorkBuddy」会自动完成这一步，并在切换后重新打开它。
+          </div>
+        </>
+      ),
+      confirmText: '退出',
+      danger: true,
+    });
+    if (!ok) return;
+    setStopping(true);
+    try {
+      const r = await post<AppStopResult>('/api/workbuddy/stop');
+      if (r?.wasRunning) {
+        toast('ok', `已退出 WorkBuddy（结束 ${r.killed.length} 个进程${r.forced ? '，强制结束' : ''}）`);
+      } else {
+        toast('ok', 'WorkBuddy 本来就没有在运行');
+      }
+      setWbRunning(false);
+    } catch (e: any) {
+      toast('err', e?.message || '退出 WorkBuddy 失败');
+    } finally {
+      setStopping(false);
     }
   };
 
@@ -1083,11 +1618,16 @@ export default function AccountsPage() {
 
       {/* 运行中提醒：WorkBuddy 会把登录态改写回去，这是切换不生效的主因 */}
       {wbRunning && (
-        <div className="flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3.5 py-2.5 text-xs text-amber-800 leading-relaxed">
+        <div className="flex flex-wrap items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3.5 py-2.5 text-xs text-amber-800 leading-relaxed">
           <IconWarning className="w-3.5 h-3.5 shrink-0 mt-px text-amber-500" />
-          <span>
-            <b>WorkBuddy 正在运行。</b>此时切换账号会被它改写回原账号，请先完全退出 WorkBuddy 再切换。
+          <span className="min-w-[220px] flex-1">
+            <b>WorkBuddy 正在运行。</b>此时切换账号会被它改写回原账号。切换 / 复制时勾选
+            「自动退出 WorkBuddy」即可由本工具直接结束后台进程，不需要你手动关闭。
           </span>
+          <Button size="sm" variant="danger" className="shrink-0" loading={stopping} onClick={stopNow}>
+            <IconPower className="w-3.5 h-3.5" />
+            退出 WorkBuddy
+          </Button>
         </div>
       )}
 
@@ -1189,6 +1729,10 @@ export default function AccountsPage() {
                 balance={balanceOf(a.id)}
                 balanceLoading={balanceLoading && !balanceOf(a.id)}
                 onSwitch={() => doSwitch(a)}
+                onSyncSessions={() => {
+                  setSessionMode('copy');
+                  setSessionTarget(a);
+                }}
                 onRename={() => setEditing(a)}
                 onDelete={() => doDelete(a)}
                 onShowPackages={() => setPkgTarget(a)}
@@ -1212,6 +1756,14 @@ export default function AccountsPage() {
       </div>
 
       <RenameDialog account={editing} onClose={() => setEditing(null)} onSaved={load} />
+      <SessionCopyDialog
+        open={!!sessionTarget}
+        target={sessionTarget}
+        mode={sessionMode}
+        wbRunning={wbRunning}
+        onClose={() => setSessionTarget(null)}
+        onDone={load}
+      />
       <PackagesDialog account={pkgTarget} balance={pkgTarget ? balanceOf(pkgTarget.id) : null} onClose={() => setPkgTarget(null)} />
       <ScanAddDialog
         open={scanOpen}

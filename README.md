@@ -30,7 +30,7 @@ npm run app          # 以桌面窗口运行（Electron）
 
 | 页面 | 说明 |
 | --- | --- |
-| **账号管理** | 扫码添加（OAuth 设备码，二维码本地渲染、服务端常驻采集）、导入本机登录态、一键切换（自动备份 + 原子写入 + 失败回滚）、备注、删除；顶部标明当前登录态与 WorkBuddy 运行状态 |
+| **账号管理** | 扫码添加（OAuth 设备码，二维码本地渲染、服务端常驻采集）、导入本机登录态、一键切换（**自动结束 WorkBuddy 后台进程** → 备份 + 原子写入 + 失败回滚 → **自动重新打开**）、**会话复制**（把当前账号的对话按新会话 id 复制给目标账号，切换时可勾选一并执行）、备注、删除；顶部标明当前登录态与 WorkBuddy 运行状态 |
 | **免费模型广场** | 三个子页签合并在一个入口：**免费模型**（只看各平台免费模型，搜索 + 排序，一键写入 `models.json` 或导出给其他 agent）、**平台额度**（各平台 Key 的免费额度与余额）、**API Keys**（多 Key 轮换、测试、设为活跃）+ 模型列表缓存管理 |
 | **反向代理** | 把 WorkBuddy 的官方对话能力**按四种主流协议**暴露给本机 agent：OpenAI Chat Completions（`/v1/chat/completions`）、Anthropic Messages（`/v1/messages`）、OpenAI Responses（`/v1/responses`）、Google Gemini 原生（`/v1beta/models/{model}:generateContent`）；账号池轮询、401 自动刷新 token 并换号、流式/非流式都支持（上游只收流式，非流式由代理聚合）；按协议族分组的接入示例（Claude Code / Codex CLI / Gemini CLI / Cherry Studio / Cline / Cursor / TRAE / 小米 MiMo / 豆包 等）、请求日志与连通性自检；默认关闭，需在页面显式开启 |
 | **Token 统计** | 扫描本机会话日志（JSONL），统计请求数、输入/输出/缓存读写/思考 Token、缓存命中率、模型与项目排行、会话明细；**按档位（国内版 / 国际版）分别归档**，可选「全部档位」合并查看 |
@@ -42,6 +42,40 @@ npm run app          # 以桌面窗口运行（Electron）
 - `total = input + output + cacheWrite`，其中 `input` **已包含** cacheRead，因此不再重复累加 `cacheRead`。
 - 真实日志中 cacheRead 只落在 `inputTokensDetails[].cached_tokens`，扁平别名（如 `cache_read_input_tokens`）恒为 0，已同时兼容两种结构。
 - 档位数据根：国内版 `~/.workbuddy`（可在设置里覆盖），国际版 `~/.workbuddy-ai`。
+
+## 会话复制（切号时把对话带给目标账号）
+
+WorkBuddy 的对话记录**按账号隔离**：`workbuddy.db` 的 `sessions` 表带 `user_id`，侧栏只显示当前账号的会话。所以换账号登录后就看不到旧账号的对话——本工具提供「复制会话」把这个缺口补上。
+
+在账号卡片上点 **同步会话**，或在切换账号时勾选「同时复制会话」，即可把**当前登录账号**的会话复制给目标账号。
+
+**会话数据是「三件套」，缺一不可**（结论来自参考实现 workbuddy-switch 的 `session.rs`）：
+
+| 位置 | 作用 | 复制时怎么处理 |
+| --- | --- | --- |
+| `<数据根>/projects/<工作区>/<会话id>.jsonl` | 正文（每行一条 JSON，行内有 `sessionId`） | 用**新 UUID** 另存一份，并把正文里所有旧 id 替换成新 id |
+| `<数据根>/workbuddy.db` 的 `sessions` 表 | 元数据（`user_id` 决定归属） | 复制源行，`user_id` 改成目标账号，时间戳刷新，`deleted_at` 置空 |
+| `<数据根>/edge-sync-mapping-v*.db` | 云端归属映射 | **故意不写** |
+
+- **为什么不写第三项**：预写映射会让客户端的 edge-sync 判定「已迁移」而跳过上传，结果是云端根本没有这条会话，客户端之后对它的改名 / 活跃度上报会全部 404。客户端下次启动会自己登记。
+- **源账号一个字不动**：副本是独立的新会话（新 UUID + 新库行），与源会话不共享任何 id；源账号的侧栏与云端数据都不受影响。
+- **复制时清空云端同步痕迹**（`agent_dirty` / `agent_dirty_at` / `agent_last_synced` / `verified_at`）并把 `unread` 归零，让客户端把副本当成尚未上传的新会话；源会话若正处于 `working`，副本会写成 `completed`，避免客户端尝试续跑副本。
+- **不用手动退 WorkBuddy，工具自己关**：运行中的实例看不到我们的写入，继续对话会让副本与源会话分叉；而 WorkBuddy 关窗只是缩到系统托盘，经常"看着关了其实还活着"。所以切换 / 复制前本工具会**自动结束全部 WorkBuddy / CodeBuddy 进程**（Electron 应用，本机实测有 9 个：主进程 + 渲染 / GPU / 工具子进程），并在结束后**把 WorkBuddy 重新打开**，让你直接拿到一个已登录新账号的客户端。不想要这个行为，就取消勾选「先退出 WorkBuddy」——那时若检测到它正在运行，写入会被直接拒绝（不会偷偷改库）。
+- **退出流程是"确认过才继续"**：每轮都重新枚举进程再关（先关子进程会被主进程立刻拉起来，反复枚举才能把名单收敛干净）→ 先发正常关闭信号（保住正在落盘的数据）→ 关不掉再强杀进程树 → **等进程表真的空了 + 700ms 让 SQLite 放开 `-wal`/`-shm` 句柄**，才动数据库。任何一种探测方式本身失败时**保守拒绝**，绝不当成"它没在运行"。
+- **写入安全**：备份 `workbuddy.db`（含 `-wal` / `-shm`）到 `~/.wb-switch/backups/session-copy-*/` → 写正文（临时文件 + fsync + 改名）→ 回读校验（旧 id 不得残留、行内 `sessionId` 必须全指向副本、行数一致）→ 插入会话行 → 回读校验归属；任一步失败只回滚该会话（删掉刚写的正文与刚插入的行），不影响其他会话。
+- **记账去重**：已复制过的会话记在 `~/.wb-switch/session_copies.json`，再次复制默认跳过、列表里标「已复制」，避免目标账号里堆出重复会话。
+- **体积与副作用**：正文是整份另存，复制会等量占用磁盘；WorkBuddy 下次启动会把副本**上传到云端**。本机实测当前账号有 3300+ 个会话、约 3.9 GB，所以界面默认是**勾选复制**而不是全量复制。
+- **不参与复制的会话**：Claw 工作区（绑定当前账号的 IM 渠道）、已删除、没有正文文件的会话。
+- **不复制的东西**：`session_usage` 本地用量缓存（客户端会自行重建）。
+
+自动化测试（隔离临时数据根与临时账号库，不联网、不碰真实会话数据）：
+
+```bash
+node scripts/test-session-copy.mjs   # 会话复制 / 门禁 / 回滚 / 账本（91 项断言）
+node scripts/test-stop-process.mjs   # 自动退出 WorkBuddy 的进程链路（17 项断言，仅 Windows）
+```
+
+`test-stop-process.mjs` 会把 `node.exe` 复制成同名替身 `WorkBuddyFake.exe` 后台拉起，再走完整的「枚举 → 优雅退出 → 强杀 → 确认消失」流程，并断言**真实 WorkBuddy 的进程一个都没被误杀**。
 
 ## 桌面版（Windows / macOS）
 
@@ -152,6 +186,8 @@ node scripts/test-proxy-protocols.mjs
 | --- | --- |
 | 账号库（与 workbuddy-switch 共享） | `~/.wb-switch/accounts.json` |
 | 登录态备份 | `~/.wb-switch/backups/` |
+| 会话复制账本（本工具私有） | `~/.wb-switch/session_copies.json` |
+| 会话复制前的会话库备份 | `~/.wb-switch/backups/session-copy-*/workbuddy.db`（含 `-wal` / `-shm`） |
 | WorkBuddy 登录态（国内版 / 国际版） | `%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info` / `workbuddy-desktop-ai.info` |
 | 积分快照（与 workbuddy-switch 共享，结构兼容） | `~/.wb-switch/credit_usage_snapshots.json` |
 | 积分用量缓存（本工具私有） | `~/.wb-switch/credit_stats_cache.json` |
@@ -182,11 +218,12 @@ workbuddy-free-token-manage/
 │   │   └── sanitize.mjs     # 出站 system 文本净化（上游渠道风控 code 11128）
 │   ├── providers/           # 各平台适配（OpenRouter / 硅基流动 / 魔搭 / Agnes / Groq ...）
 │   ├── stats/               # Token 日志扫描（worker 线程，支持多档位数据根）
-│   ├── targets/workbuddy.mjs# WorkBuddy 数据目录检测、models.json 读写、重启
+│   ├── targets/workbuddy.mjs# 数据目录检测、models.json 读写、进程枚举与退出/重启
 │   └── workbuddy/
 │       ├── variant.mjs      # 国内版 / 国际版路径与常量
 │       ├── accounts.mjs     # 账号存储（读写 / 备份 / 掩码）
 │       ├── auth.mjs         # 登录态切换（原子写入 + 回读校验 + 回滚）
+│       ├── sessions.mjs     # 会话读取与复制（workbuddy.db + projects/ 正文 + 复制账本）
 │       ├── oauth.mjs        # 扫码登录（服务端常驻轮询）
 │       ├── credits.mjs      # 积分统计（官方接口 + 离线预估）
 │       ├── checkin.mjs      # 每日签到
@@ -205,5 +242,9 @@ workbuddy-free-token-manage/
 │       ├── StatsPage.tsx        # Token 统计
 │       ├── CreditStatsPage.tsx  # 积分统计
 │       └── SettingsPage.tsx     # 设置
+├── scripts/
+│   ├── test-proxy-protocols.mjs # 四协议转换回归（离线）
+│   ├── test-session-copy.mjs    # 会话复制回归（隔离临时数据根）
+│   └── test-stop-process.mjs    # 退出 WorkBuddy 的进程链路回归（同名替身进程）
 └── electron/main.mjs        # 桌面壳（内嵌 Express + 窗口）
 ```

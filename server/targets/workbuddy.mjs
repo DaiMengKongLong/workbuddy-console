@@ -230,6 +230,15 @@ function shortExecError(err) {
   return first ? first.slice(0, 120) : '命令执行失败或不被允许';
 }
 
+/**
+ * WorkBuddy 桌面端的进程名（PowerShell 的 `-Name` 与 tasklist 的 `IMAGENAME` 都用它）。
+ *
+ * 探测与结束进程的函数都接受 `names` 覆盖它——**只为自动化测试**：
+ * 测试机上真实 WorkBuddy 多半正在运行，用同名替身进程才能真实验证
+ * 「优雅退出 → 强杀 → 确认消失」这条升级逻辑，而不必关掉真的客户端。
+ */
+export const WORKBUDDY_PROCESS_NAMES = ['WorkBuddy', 'CodeBuddy'];
+
 /** 解析 PowerShell 序列化的启动时间：PS 5.1 为 "/Date(ms)/"，PS 7 为 ISO 字符串 */
 function parseStartTime(v) {
   if (!v) return null;
@@ -239,80 +248,117 @@ function parseStartTime(v) {
   return Number.isFinite(t) ? t : null;
 }
 
-/** Windows 主路径：PowerShell 能拿到可执行文件路径与启动时间 */
-async function detectViaPowerShell() {
-  // 不再用 Sort-Object StartTime：个别进程取不到 StartTime 时会让整条管道报错，
+/**
+ * Windows 主路径：枚举**全部**匹配进程，按启动时间升序。
+ * 对默认进程名来说，第一个就是主进程（Electron 的渲染/GPU/工具进程都是它的子进程）。
+ */
+async function listViaPowerShell(names = WORKBUDDY_PROCESS_NAMES) {
+  // 不用 Sort-Object StartTime：个别进程取不到 StartTime 时会让整条管道报错，
   // 改为取回全部进程后在 JS 里排序。
   const ps =
-    `Get-Process -Name WorkBuddy,CodeBuddy -ErrorAction SilentlyContinue | ` +
+    `Get-Process -Name ${names.join(',')} -ErrorAction SilentlyContinue | ` +
     `Select-Object Id,ProcessName,Path,StartTime | ConvertTo-Json -Compress`;
   const stdout = await run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], 15000);
   const t = stdout.trim();
-  if (!t) return null;
+  if (!t) return [];
   const parsed = JSON.parse(t);
-  const arr = (Array.isArray(parsed) ? parsed : [parsed]).filter(Boolean);
-  if (!arr.length) return null;
+  return (Array.isArray(parsed) ? parsed : [parsed])
+    .filter(Boolean)
+    .map((o) => ({
+      pid: Number(o.Id),
+      name: o.ProcessName,
+      exePath: o.Path || null,
+      startTime: parseStartTime(o.StartTime),
+    }))
+    .filter((p) => Number.isFinite(p.pid) && p.pid > 0)
+    .sort((a, b) => (a.startTime || Number.MAX_SAFE_INTEGER) - (b.startTime || Number.MAX_SAFE_INTEGER));
+}
+
+/** Windows 主路径的探测版：取启动最早的那个 = 应用真正启动的时刻 */
+async function detectViaPowerShell(names = WORKBUDDY_PROCESS_NAMES) {
+  const rows = await listViaPowerShell(names);
+  if (!rows.length) return null;
   // WorkBuddy 基于 Electron，会有多个进程（主进程 + 渲染/GPU/工具子进程）。
-  // 取启动最早的那个 = 应用真正启动的时刻，用于判断 models.json 是否在其启动后被改写。
-  const rows = arr.map((o) => ({ ...o, _t: parseStartTime(o.StartTime) }));
-  rows.sort((a, b) => (a._t || Number.MAX_SAFE_INTEGER) - (b._t || Number.MAX_SAFE_INTEGER));
   const main = rows[0];
   return {
     running: true,
-    pid: main.Id,
-    name: main.ProcessName,
-    exePath: main.Path || null,
-    startTime: main._t,
-    processCount: arr.length,
+    pid: main.pid,
+    name: main.name,
+    exePath: main.exePath,
+    startTime: main.startTime,
+    processCount: rows.length,
     platform: 'win32',
     method: 'powershell',
   };
 }
 
-/** Windows 兜底：tasklist 不依赖 PowerShell，被安全策略限制的环境下通常仍可用 */
-async function detectViaTasklist() {
-  for (const exe of ['WorkBuddy.exe', 'CodeBuddy.exe']) {
+/**
+ * Windows 兜底：tasklist 不依赖 PowerShell，被安全策略限制的环境下通常仍可用。
+ *
+ * 返回**全部**匹配行（每个 PID 一行）。tasklist 给不了启动时间，
+ * 所以这里连主进程是谁都分不出来——靠 `taskkill /T` 顺着进程树倒推。
+ */
+async function listViaTasklist(names = WORKBUDDY_PROCESS_NAMES) {
+  const out = [];
+  for (const name of names) {
+    const exe = /\.exe$/i.test(name) ? name : `${name}.exe`;
     let stdout = '';
     try {
       stdout = await run('tasklist', ['/FI', `IMAGENAME eq ${exe}`, '/FO', 'CSV', '/NH'], 10000);
     } catch {
       continue;
     }
-    const line = stdout
+    for (const line of stdout
       .split('\n')
-      .map((s) => s.trim())
-      .find((s) => s.toLowerCase().includes(exe.toLowerCase()));
-    if (!line) continue;
-    const cols = line.split('","').map((s) => s.replace(/^"|"$/g, ''));
-    const pid = Number(cols[1]);
-    if (!Number.isFinite(pid) || pid <= 0) continue;
-    return {
-      running: true,
-      pid,
-      name: exe.replace(/\.exe$/i, ''),
-      exePath: null,
-      startTime: null, // tasklist 不提供启动时间，因此无法判断配置是否"待重启"
-      platform: 'win32',
-      method: 'tasklist',
-      startTimeUnknown: true,
-    };
+      .map((s) => s.trim())) {
+      // 无匹配时 tasklist 会打印 "INFO: No tasks are running..." 之类的说明，不含 exe 名
+      if (!line.toLowerCase().includes(exe.toLowerCase())) continue;
+      const cols = line.split('","').map((s) => s.replace(/^"|"$/g, ''));
+      const pid = Number(cols[1]);
+      if (!Number.isFinite(pid) || pid <= 0) continue;
+      out.push({
+        pid,
+        name: exe.replace(/\.exe$/i, ''),
+        exePath: null,
+        startTime: null, // tasklist 不提供启动时间，因此无法判断配置是否"待重启"
+        startTimeUnknown: true,
+      });
+    }
   }
-  return null;
+  return out;
 }
 
-export async function detectWorkbuddyProcess() {
+/** Windows 兜底探测版：只关心"有没有在跑"，随便取一个 PID 即可 */
+async function detectViaTasklist(names = WORKBUDDY_PROCESS_NAMES) {
+  const rows = await listViaTasklist(names);
+  const first = rows[0];
+  if (!first) return null;
+  return {
+    running: true,
+    pid: first.pid,
+    name: first.name,
+    exePath: null,
+    startTime: null,
+    processCount: rows.length,
+    platform: 'win32',
+    method: 'tasklist',
+    startTimeUnknown: true,
+  };
+}
+
+export async function detectWorkbuddyProcess({ names = WORKBUDDY_PROCESS_NAMES } = {}) {
   const platform = process.platform;
 
   if (platform === 'win32') {
     const errors = [];
     try {
-      const r = await detectViaPowerShell();
+      const r = await detectViaPowerShell(names);
       if (r) return r;
     } catch (err) {
       errors.push(`PowerShell 不可用（${shortExecError(err)}）`);
     }
     try {
-      const r = await detectViaTasklist();
+      const r = await detectViaTasklist(names);
       if (r) return { ...r, warning: errors.length ? errors.join('；') : null };
     } catch (err) {
       errors.push(`tasklist 不可用（${shortExecError(err)}）`);
@@ -349,6 +395,159 @@ function findWorkbuddyExe(detectedPath) {
       return false;
     }
   });
+}
+
+/**
+ * 枚举 WorkBuddy / CodeBuddy 的全部进程（判定「是否已退出」与「逐个关掉」都用它）。
+ *
+ * 返回 `{ processes, method, complete?, warning?, error? }`。
+ * `complete: false` 表示只用 tasklist 拿到了单个 PID（没有启动时间），
+ * 此时靠 `taskkill /T` 杀进程树来兜底。
+ * `error` 非空表示**无法判定**当前状态，调用方必须保守处理，不能当成"没在运行"。
+ */
+export async function listWorkbuddyProcesses({ names = WORKBUDDY_PROCESS_NAMES } = {}) {
+  if (process.platform === 'win32') {
+    try {
+      return { processes: await listViaPowerShell(names), method: 'powershell', complete: true };
+    } catch (err) {
+      const psError = shortExecError(err);
+      try {
+        const rows = await listViaTasklist(names);
+        return rows.length
+          ? {
+              processes: rows,
+              method: 'tasklist',
+              complete: false,
+              warning: `PowerShell 不可用（${psError}），改用 tasklist（拿不到启动时间，会靠进程树兜底）`,
+            }
+          : { processes: [], method: 'tasklist', warning: `PowerShell 不可用（${psError}）` };
+      } catch (err2) {
+        return { processes: [], error: `PowerShell（${psError}）与 tasklist（${shortExecError(err2)}）都不可用` };
+      }
+    }
+  }
+  const pattern = names.map((n) => n.replace(/\.exe$/i, '')).join('|');
+  try {
+    const stdout = await run('pgrep', ['-if', pattern], 8000);
+    const processes = String(stdout)
+      .split('\n')
+      .map((s) => Number(s.trim()))
+      .filter((n) => Number.isFinite(n) && n > 0)
+      .map((pid) => ({ pid, name: null, exePath: null, startTime: null }));
+    return { processes, method: 'pgrep', complete: true };
+  } catch (err) {
+    // pgrep 无匹配时退出码为 1 —— 那是"没有进程"，不是探测失败
+    if (err?.code === 1) return { processes: [], method: 'pgrep', complete: true };
+    return { processes: [], error: err?.message || String(err) };
+  }
+}
+
+/** 轮询等待进程消失 */
+async function waitUntilGone(timeoutMs, names) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const { processes, error } = await listWorkbuddyProcesses({ names });
+    if (!processes.length) return { gone: true, unconfirmed: !!error };
+    if (Date.now() >= deadline) return { gone: false, remaining: processes };
+    await new Promise((r) => setTimeout(r, 400));
+  }
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** 优雅退出的等待窗口：够 WM_CLOSE 走完，又不至于让界面等太久 */
+const STOP_GRACEFUL_MS = 2500;
+/** 强杀后的等待上限 */
+const STOP_FORCE_MS = 12000;
+
+/** 给单个 PID 发终止信号（win32 走 taskkill，其他平台走 kill） */
+function terminatePid(pid, force) {
+  const args =
+    process.platform === 'win32'
+      ? ['/PID', String(pid), '/T', ...(force ? ['/F'] : [])]
+      : [force ? '-KILL' : '-TERM', String(pid)];
+  // 单个进程杀不掉不影响其余：主进程一死，它的子进程通常已经一起没了
+  return run(process.platform === 'win32' ? 'taskkill' : 'kill', args).catch(() => {});
+}
+
+/**
+ * 退出 WorkBuddy（全部相关进程），并**确认真的消失了**才返回。
+ *
+ * 两步走：先 `taskkill`（不带 `/F`，向窗口发 WM_CLOSE，能保住正在落盘的数据），
+ * 等不到就逐个 `/T /F` 强杀。第二步不是多余的——WorkBuddy 关窗会缩到系统托盘，
+ * 优雅退出经常"看起来关掉了其实还活着"，那样切号会被它把登录态改写回去。
+ *
+ * **每轮都重新枚举再杀**，而不是开局枚举一次就照着那份 PID 名单猛敲：
+ * 一来 tasklist 兜底时一次只能看到部分 PID、连主进程是谁都分不出；
+ * 二来先杀 helper 会被主进程立刻重新拉起来。反复枚举能让名单自然收敛
+ * （先冒出来的子进程被清掉 → 主进程暴露出来 → 再清掉它），直到进程表真的空了。
+ *
+ * @returns `{ stopped, wasRunning, killed, forced, exePath }`；关不掉时抛错（绝不静默返回成功）
+ */
+export async function stopWorkbuddy({
+  names = WORKBUDDY_PROCESS_NAMES,
+  gracefulMs = STOP_GRACEFUL_MS,
+  forceMs = STOP_FORCE_MS,
+} = {}) {
+  const first = await listWorkbuddyProcesses({ names });
+  if (first.error) {
+    throw new Error(`无法确认 WorkBuddy 的运行状态（${first.error}），为安全起见没有结束任何进程`);
+  }
+  if (!first.processes.length) {
+    return { stopped: true, wasRunning: false, killed: [], forced: false, exePath: null };
+  }
+
+  const exePath = first.processes.find((p) => p.exePath)?.exePath || null;
+  const killed = new Set();
+
+  /**
+   * 一轮"枚举 → 全杀 → 轮询到消失或超时"。
+   * 探测失败时抛错而不是当作"已经关掉了"——那会让切号在客户端还活着的情况下继续。
+   */
+  const round = async (force, timeoutMs) => {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const { processes, error } = await listWorkbuddyProcesses({ names });
+      if (error) throw new Error(`无法确认 WorkBuddy 是否已退出（${error}），已中止`);
+      if (!processes.length) return true;
+      for (const p of processes) killed.add(p.pid);
+      for (const p of processes) await terminatePid(p.pid, force);
+      if (Date.now() >= deadline) return false;
+      await sleep(400);
+    }
+  };
+
+  if (await round(false, gracefulMs)) {
+    return { stopped: true, wasRunning: true, killed: [...killed], forced: false, exePath };
+  }
+
+  if (!(await round(true, forceMs))) {
+    throw new Error(`无法退出 WorkBuddy（仍在运行：PID ${[...killed].join(', ')}），请手动退出后重试`);
+  }
+  // 进程刚没，让 SQLite 把 -wal/-shm 的句柄彻底放开，再动数据库
+  await sleep(700);
+  const confirm = await waitUntilGone(1000, names);
+  if (!confirm.gone) throw new Error('WorkBuddy 退出后又重新启动，请手动退出后重试');
+  return { stopped: true, wasRunning: true, killed: [...killed], forced: true, exePath };
+}
+
+/**
+ * 重新打开 WorkBuddy（切换账号后调用，让用户拿到一个已登录新账号的客户端）。
+ * 只在 Windows 上可用——macOS 未做验证，宁可让用户手动打开也不猜。
+ */
+export function launchWorkbuddy(exePath) {
+  if (process.platform !== 'win32') {
+    throw new Error(`当前平台（${process.platform}）不支持自动重新打开 WorkBuddy，请手动打开`);
+  }
+  const exe = findWorkbuddyExe(exePath);
+  if (!exe) {
+    throw new Error(
+      '未能定位 WorkBuddy 可执行文件，请手动重新打开 WorkBuddy。' + (exePath ? `（检测到的路径：${exePath}）` : '')
+    );
+  }
+  const child = spawn(exe, [], { detached: true, stdio: 'ignore' });
+  child.unref();
+  return { launched: true, exePath: exe };
 }
 
 export async function restartWorkbuddy() {

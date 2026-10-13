@@ -41,6 +41,8 @@ import { checkinAll, checkinAccount, fetchCheckinStatus, loadCheckinLogs, allChe
 import { checkPermissions } from './workbuddy/diagnostics.mjs';
 import { listBackups, restoreBackup, deleteBackup, cleanBackups, backupVariants } from './workbuddy/backups.mjs';
 import { registerProxyRoutes, refreshModelsCache } from './proxy/index.mjs';
+import { stopWorkbuddy, launchWorkbuddy } from './targets/workbuddy.mjs';
+import { listSessionsForSwitch, copySessions } from './workbuddy/sessions.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -61,6 +63,19 @@ const wrap = (fn) => (req, res) => {
     res.status(500).json({ error: err?.message || '服务器内部错误' });
   });
 };
+
+/**
+ * 只有"确实是我们把 WorkBuddy 关掉的"才重新打开它，并保证**不把用户的应用留在关闭状态**。
+ * 重新打开本身失败只回报，不抛错——登录态已经写好，重启失败不该让整个切换算失败。
+ */
+async function relaunchIfStopped(appStop) {
+  if (!appStop?.wasRunning) return null;
+  try {
+    return launchWorkbuddy(appStop.exePath);
+  } catch (err) {
+    return { launched: false, error: err?.message || String(err) };
+  }
+}
 
 const platformFromReq = (req) => {
   const id = String(req.query.platform || req.body?.platform || 'openrouter');
@@ -537,13 +552,67 @@ app.get('/api/accounts', (req, res) => {
   });
 });
 
-/** 切换账号：写登录态文件（内部先备份、失败回滚） */
+/**
+ * 切换账号：写登录态文件（内部先备份、失败回滚）。
+ *
+ * 两个可选动作，都由界面显式传入：
+ * - `stopApp`：切换前**直接结束 WorkBuddy 的全部相关进程**（用户不必手动退出）。
+ *   运行中的实例会把登录态改写回原账号，所以不关掉的话切换本来就无效；
+ *   关进程后还会**重新打开** WorkBuddy，让用户拿到一个已登录新账号的客户端。
+ * - `copySessionIds`：切换前把**当前登录账号**的这些会话复制给目标账号。
+ *   顺序不能反——来源账号是「当前登录账号」，登录态一旦被改写就再也读不出源账号是谁。
+ */
 app.post(
   '/api/accounts/switch',
   wrap(async (req, res) => {
     const id = String(req.body?.id || '');
     if (!id) return res.status(400).json({ error: '缺少账号 id' });
-    res.json(switchAccount(id));
+    const ids = Array.isArray(req.body?.copySessionIds) ? req.body.copySessionIds : [];
+    const stopApp = req.body?.stopApp === true;
+
+    // 1) 先退出 WorkBuddy（未运行则空转）
+    let appStop = null;
+    if (stopApp) {
+      try {
+        appStop = await stopWorkbuddy();
+      } catch (err) {
+        return res.status(400).json({ error: `退出 WorkBuddy 失败，已中止切换：${err?.message || err}` });
+      }
+    }
+
+    // 2) 复制会话（此刻 App 已退出，门禁能直接通过）
+    let sessionCopy = null;
+    if (ids.length) {
+      try {
+        sessionCopy = await copySessions({ targetAccountId: id, ids });
+      } catch (err) {
+        // 会话没复制成功就不要再动登录态了：用户的本意是"把对话带过去"，半途切号更糟
+        await relaunchIfStopped(appStop);
+        return res.status(400).json({ error: `会话复制失败，已中止切换：${err?.message || err}` });
+      }
+    }
+
+    // 3) 写登录态；无论成败都不把用户的应用留在"被关掉"的状态
+    let result;
+    try {
+      result = switchAccount(id);
+    } catch (err) {
+      await relaunchIfStopped(appStop);
+      throw err;
+    }
+    const relaunch = await relaunchIfStopped(appStop);
+    res.json({ ...result, sessionCopy, appStop, relaunch });
+  })
+);
+
+/**
+ * 退出 WorkBuddy（结束后台全部相关进程）。供界面上的「退出 WorkBuddy」按钮直接调用。
+ * 返回 `{ stopped, wasRunning, killed, forced, exePath }`。
+ */
+app.post(
+  '/api/workbuddy/stop',
+  wrap(async (req, res) => {
+    res.json(await stopWorkbuddy());
   })
 );
 
@@ -595,6 +664,53 @@ app.patch(
       res.json(updateAccountDisplay(String(req.params.id), req.body || {}));
     } catch (err) {
       res.status(400).json({ error: err?.message || '保存失败' });
+    }
+  })
+);
+
+/* ---------------- 会话（对话记录）复制 ---------------- */
+
+/**
+ * 列出「当前登录账号 → 目标账号」可复制的会话。
+ * 只读：不写任何文件、不改数据库；供账号页的会话选择弹窗渲染。
+ */
+app.get(
+  '/api/sessions',
+  wrap(async (req, res) => {
+    const target = String(req.query.accountId || '');
+    if (!target) return res.status(400).json({ error: '缺少 accountId' });
+    res.json(await listSessionsForSwitch({ targetAccountId: target }));
+  })
+);
+
+/**
+ * 把选中的会话复制给目标账号（副本用新 UUID，源账号数据不受影响）。
+ *
+ * `stopApp: true` 时由本工具先结束 WorkBuddy 的进程再复制，并在结束后重新打开它。
+ * 进程生命周期放在这一层而不是 `copySessions` 里，是因为只有这里能保证
+ * "无论复制成功还是失败都把用户的 WorkBuddy 重新打开"。
+ * `copySessions` 内部仍会自查 App 是否已退出（写库前的最后一道门）。
+ */
+app.post(
+  '/api/sessions/copy',
+  wrap(async (req, res) => {
+    const accountId = String(req.body?.accountId || '');
+    if (!accountId) return res.status(400).json({ error: '缺少 accountId' });
+
+    let appStop = null;
+    if (req.body?.stopApp === true) {
+      try {
+        appStop = await stopWorkbuddy();
+      } catch (err) {
+        return res.status(400).json({ error: `退出 WorkBuddy 失败，已中止复制：${err?.message || err}` });
+      }
+    }
+    try {
+      const report = await copySessions({ targetAccountId: accountId, ids: req.body?.ids });
+      res.json({ ...report, appStop, relaunch: await relaunchIfStopped(appStop) });
+    } catch (err) {
+      await relaunchIfStopped(appStop);
+      throw err;
     }
   })
 );
