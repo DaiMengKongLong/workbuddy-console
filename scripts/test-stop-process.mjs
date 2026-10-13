@@ -128,6 +128,11 @@ async function main() {
 
     const detectedAfter = await detectWorkbuddyProcess({ names: FAKE_NAMES });
     check('detectWorkbuddyProcess 之后报告 running:false', detectedAfter.running === false, detectedAfter);
+    check(
+      '探测结果里 error 为空（否则切号会在最后一道门上被自己拦住）',
+      detectedAfter.error === null || detectedAfter.error === undefined,
+      detectedAfter
+    );
   } finally {
     await killFakeHard(fakePid);
   }
@@ -141,6 +146,31 @@ async function main() {
       `测试前存在且属于真实 WorkBuddy 的进程没有被误杀（共 ${realBefore.length} 个）`,
       vanished.length === 0,
       { vanished }
+    );
+  }
+
+  section('5. 「确实没有进程」不得被误报成「无法判定」');
+  {
+    /**
+     * 这条守的是真实踩过的坑：探测函数曾把"另一种探测方式不可用"也算成"无法判定"。
+     * 而本机 PowerShell 被安全策略拦掉，于是**杀掉 WorkBuddy 之后的那次复检**必然报"无法确认"，
+     * 切号被自己拦住、登录态永远写不进去，界面还回一句误导文案（「请手动退出后重试」）。
+     */
+    const ABSENT = ['WorkBuddyDefinitelyAbsentXyz'];
+    const d = await detectWorkbuddyProcess({ names: ABSENT });
+    check('确定没有该进程时 running = false', d.running === false, d);
+    check('确定没有该进程时 error 为空（关键断言）', d.error === null || d.error === undefined, d);
+
+    const l = await listWorkbuddyProcesses({ names: ABSENT });
+    check('listWorkbuddyProcesses 同样不报 error', !l.error, l);
+    check('listWorkbuddyProcesses 列表为空', l.processes.length === 0, l);
+
+    // 反向断言：真的在跑时必须能探测到（别为了修 above 把探测改瞎了）
+    const real = await detectWorkbuddyProcess();
+    check(
+      '真实 WorkBuddy 若在运行则仍能被探测到（未把探测改瞎）',
+      real.running === true || real.error != null || realBefore.length === 0,
+      { real, realBeforeCount: realBefore.length }
     );
   }
 

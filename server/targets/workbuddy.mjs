@@ -354,32 +354,50 @@ export async function detectWorkbuddyProcess({ names = WORKBUDDY_PROCESS_NAMES }
   const platform = process.platform;
 
   if (platform === 'win32') {
-    const errors = [];
+    const failures = []; // 探测方式**本身**没能执行（不代表"没进程"）
+    let probed = false; // 是否至少有一种方式成功执行完
+
     try {
       const r = await detectViaPowerShell(names);
+      probed = true;
       if (r) return r;
     } catch (err) {
-      errors.push(`PowerShell 不可用（${shortExecError(err)}）`);
+      failures.push(`PowerShell 不可用（${shortExecError(err)}）`);
     }
     try {
       const r = await detectViaTasklist(names);
-      if (r) return { ...r, warning: errors.length ? errors.join('；') : null };
+      probed = true;
+      if (r) return { ...r, warning: failures.length ? failures.join('；') : null };
     } catch (err) {
-      errors.push(`tasklist 不可用（${shortExecError(err)}）`);
+      failures.push(`tasklist 不可用（${shortExecError(err)}）`);
     }
-    // 两条路径都没发现进程。若其中任一方式本身报错，说明是"检测失败"而不是"确实未运行"，
-    // 必须把 error 透出给界面，否则会出现 WorkBuddy 明明开着却显示"未运行"的误导。
-    return { running: false, platform, error: errors.length ? errors.join('; ') : null };
+
+    /**
+     * 只要有一种方式**成功跑完**并且没找到进程，这就是"确实没在运行"的确定答案。
+     *
+     * 早先这里写反了：把"另一种方式不可用"也当成"无法判定"（只要 failures 非空就报 error）。
+     * 后果是——在 PowerShell 被安全策略拦掉的机器上（本机就是），**杀掉 WorkBuddy 之后的那次复检
+     * 必然报"无法确认"**，于是切号在最后一道门上被自己拦住、登录态永远写不进去，
+     * 界面还显示一句把人往"手动退出"引的误导文案。实测踩过。
+     *
+     * 安全性没有降低：全都被拦（probed === false）时仍然返回 error，调用方照旧保守拒绝。
+     */
+    if (probed) {
+      return { running: false, platform, error: null, warning: failures.length ? failures.join('；') : null };
+    }
+    return { running: false, platform, error: failures.join('; ') };
   }
 
   // macOS / Linux 粗略探测（同 workbuddy-switch 的进程命名习惯）
   try {
-    const stdout = await run('pgrep', ['-if', 'workbuddy|codebuddy'], 8000);
+    const stdout = await run('pgrep', ['-if', names.map((n) => n.replace(/\.exe$/i, '')).join('|')], 8000);
     const pid = parseInt(String(stdout).split('\n')[0], 10);
     if (Number.isFinite(pid) && pid > 0) return { running: true, pid, exePath: null, platform, method: 'pgrep' };
     return { running: false, platform, method: 'pgrep' };
   } catch (err) {
-    return { running: false, error: err.message, platform };
+    // pgrep 无匹配时退出码为 1 —— 那是"没有进程"，不是探测失败（与 listWorkbuddyProcesses 同口径）
+    if (err?.code === 1) return { running: false, platform, method: 'pgrep' };
+    return { running: false, error: err?.message || String(err), platform };
   }
 }
 
