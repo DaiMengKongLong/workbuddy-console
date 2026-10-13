@@ -281,6 +281,28 @@ const CLIENT_SAMPLES: ClientSample[] = [
   },
 ];
 
+/** Key 携带方式 → 中文（日志里「没带」和「带错」要能分清，两者都是 401 但修法不同） */
+const AUTH_LABEL: Record<string, string> = {
+  bearer: 'Bearer',
+  raw: 'Authorization 裸 Key',
+  'x-api-key': 'x-api-key',
+  'x-goog-api-key': 'x-goog-api-key',
+  query: '?key=',
+  none: '未设置 Key',
+  absent: '未携带 Key',
+  mismatch: 'Key 不匹配',
+};
+
+/** UA → 一眼能认出的短名（日志列窄，只取关键词），用来判断「到底是哪个客户端在用」 */
+function shortUa(ua?: string | null): string {
+  if (!ua) return '—';
+  const m = ua.match(
+    /(CherryStudio|Claude[- ]Code|claude-cli|codex|Cursor|Cline|Roo|Continue|Aider|Trae|ZCode|GeminiCLI|gemini-cli|openai-python|python-requests|axios|curl|okhttp|Go-http|node)/i
+  );
+  if (m) return m[1];
+  return ua.split(/[\s/]/)[0].slice(0, 24) || '—';
+}
+
 export default function ProxyPage() {
   const toast = useToast();
   const [data, setData] = useState<ProxyStatus | null>(null);
@@ -670,6 +692,14 @@ export default function ProxyPage() {
           </Button>
         }
       >
+        {data.logs[0] && !data.logs[0].ok && (
+          <Note tone="amber" title="最近一次请求失败">
+            {data.logs[0].error || '未知错误'}
+            {data.logs[0].path ? ` · 路径 ${data.logs[0].path}` : ''}
+            {data.logs[0].auth ? ` · Key 方式 ${AUTH_LABEL[data.logs[0].auth] || data.logs[0].auth}` : ''}
+            {data.logs[0].ua ? ` · 来自 ${shortUa(data.logs[0].ua)}` : ''}
+          </Note>
+        )}
         <Card className="overflow-hidden">
           {data.logs.length === 0 ? (
             <div className="px-4 py-8 text-center text-sm text-zinc-400">还没有请求记录</div>
@@ -678,6 +708,7 @@ export default function ProxyPage() {
               <thead>
                 <tr className="border-b border-zinc-100 text-left text-xs text-zinc-400">
                   <th className="px-4 py-2 font-medium">时间</th>
+                  <th className="px-4 py-2 font-medium">客户端</th>
                   <th className="px-4 py-2 font-medium">账号</th>
                   <th className="px-4 py-2 font-medium">模型</th>
                   <th className="px-4 py-2 font-medium">类型</th>
@@ -689,15 +720,18 @@ export default function ProxyPage() {
                 {data.logs.map((l, i) => (
                   <tr key={`${l.at}-${i}`} className="hover:bg-zinc-50/60 transition-colors">
                     <td className="px-4 py-2 whitespace-nowrap text-xs text-zinc-500 tabular-nums">{fmtDateTime(l.at)}</td>
+                    <td className="px-4 py-2 text-xs text-zinc-600" title={l.ua || ''}>
+                      {shortUa(l.ua)}
+                    </td>
                     <td className="px-4 py-2 text-zinc-700">{l.account || '—'}</td>
-                    <td className="px-4 py-2 font-mono text-xs text-zinc-600">{l.model}</td>
+                    <td className="px-4 py-2 font-mono text-xs text-zinc-600">{l.model || '—'}</td>
                     <td className="px-4 py-2 text-xs text-zinc-500">{l.stream ? '流式' : '非流式'}</td>
                     <td className="px-4 py-2 text-xs text-zinc-500 tabular-nums">{l.ms} ms</td>
                     <td className="px-4 py-2">
                       {l.ok ? (
                         <Badge color="green">{l.status}</Badge>
                       ) : (
-                        <span className="text-xs text-red-600" title={l.error}>
+                        <span className="text-xs text-red-600" title={l.errorRaw || l.error}>
                           {l.error ? l.error.slice(0, 60) : l.status}
                         </span>
                       )}

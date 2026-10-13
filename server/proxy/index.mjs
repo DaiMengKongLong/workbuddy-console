@@ -137,24 +137,142 @@ export function buildUpstreamBody(inbound) {
 }
 
 /**
- * 鉴权：未配置 Key 时不鉴权（本地工具，方便直接试）；配置了就必须带对。
+ * 客户端把 Key 放在哪儿了：返回携带方式，认不出来返回 null。
  *
- * 三种携带方式对应三类客户端的默认行为：
+ * 四种携带方式对应不同客户端的默认行为：
  *   - `Authorization: Bearer`（OpenAI SDK / Codex CLI / 多数 IDE）
+ *   - `Authorization: <key>`（少数脚本 / 手写客户端直接把 Key 塞进去，不带前缀）
  *   - `x-api-key`（Anthropic 客户端，Claude Code 用 Bearer，但 ZCode 等用这个）
  *   - `x-goog-api-key`（Gemini CLI / Gemini 原生 SDK 的默认机制）
  * 另外 Gemini 客户端在部分版本会把 Key 放在 `?key=` 查询串里，一并接受。
+ *
+ * 未配置 Key 时返回 `'none'`（本地工具，方便直接试）。
+ *
+ * 返回值同时进请求日志：排查「401 到底是没带、还是带错」时，一眼能看出客户端把
+ * Key 放在了哪个头上 —— 这比让用户抓包快得多。
  */
+export function authMode(req) {
+  const key = loadConfig().proxy?.apiKey;
+  if (!key) return 'none';
+  const auth = String(req.headers.authorization || '').trim();
+  if (auth.startsWith('Bearer ')) {
+    if (auth.slice(7).trim() === key) return 'bearer';
+  } else if (auth === key) {
+    return 'raw';
+  }
+  if (String(req.headers['x-api-key'] || '').trim() === key) return 'x-api-key';
+  if (String(req.headers['x-goog-api-key'] || '').trim() === key) return 'x-goog-api-key';
+  if (String(req.query?.key || '').trim() === key) return 'query';
+  return null;
+}
+
+/** 鉴权：见 authMode。认不出携带方式即为不通过。 */
 function authorized(req) {
-  const cfg = loadConfig();
-  const key = cfg.proxy?.apiKey;
-  if (!key) return true;
-  const auth = String(req.headers.authorization || '');
-  const bearer = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
-  const apiKey = String(req.headers['x-api-key'] || '').trim();
-  const googKey = String(req.headers['x-goog-api-key'] || '').trim();
-  const queryKey = String(req.query?.key || '').trim();
-  return bearer === key || apiKey === key || googKey === key || queryKey === key;
+  return !!authMode(req);
+}
+
+/**
+ * 日志用的人话鉴权标签 —— 把「没带 Key」和「带了但不对」分开。
+ * 这两种在用户侧都表现为 401，但处理方式完全不同（前者去配 Key，后者去对 Key）。
+ */
+export function authLabel(req) {
+  const mode = authMode(req);
+  if (mode) return mode;
+  const any = req.headers.authorization || req.headers['x-api-key'] || req.headers['x-goog-api-key'] || req.query?.key;
+  return any ? 'mismatch' : 'absent';
+}
+
+/** 客户端标识（截断，只用于日志，不影响任何逻辑） */
+const uaOf = (req) => String(req.headers['user-agent'] || '').slice(0, 120) || null;
+
+/** 请求路径（去掉查询串；Gemini 的模型名在路径里，出问题时这行最有信息量） */
+const pathOf = (req) => String(req.originalUrl || req.url || '').split('?')[0];
+
+/**
+ * 上游错误码 → 中文人话。
+ * 只收实测碰到过的码；没登记的码回落到上游自己的 zh 文案。
+ */
+const UPSTREAM_CODE_HINT = {
+  11102: '模型不可用（上游没有这个模型，请在「反向代理」页面挑清单里的模型）',
+  11128: '上游渠道风控拦截：客户端的「系统提示词」被判定为非官方客户端',
+};
+
+/**
+ * 把上游那一大坨 JSON 压成一行能读的话。
+ *
+ * 上游错误原文形如
+ *   `账号名: HTTP 400: {"code":11128,"msg":"Illegal API invocation…","displayMsg":{"zh":"…"}`
+ * 直接塞进界面（截 60 字）只会看到 `{"code":11128,"msg":"Illegal API invocation from an un…`，
+ * 完全看不出该干什么。这里抽出 code 与中文提示，压成
+ *   `账号名: 上游 11128：上游渠道风控拦截：客户端的「系统提示词」被判定为非官方客户端`
+ */
+export function briefUpstream(text) {
+  const s = String(text ?? '');
+  const i = s.indexOf('{');
+  const head = (i > 0 ? s.slice(0, i) : '').replace(/\s*HTTP \d+:\s*$/, ' ');
+  const body = i > 0 ? s.slice(i) : s;
+  const m = body.match(/"code"\s*:\s*(\d+)\s*,\s*"msg"\s*:\s*"([^"]*)"/);
+  if (!m) return s.length > 300 ? `${head}${body.slice(0, 300)}…` : s;
+  const zh = (body.match(/"zh"\s*:\s*"([^"]*)"/) || [])[1];
+  return `${head}上游 ${m[1]}：${UPSTREAM_CODE_HINT[Number(m[1])] || zh || m[2]}`;
+}
+
+/** 多账号错误列表 → 一行简报（给客户端响应体与日志共用） */
+export function briefErrors(errors, n = 3) {
+  return (errors || [])
+    .slice(0, n)
+    .map(briefUpstream)
+    .join(' | ');
+}
+
+/** 响应体里挑出一句人话（鉴权/参数类拒绝的日志用） */
+function shortReject(body) {
+  if (!body) return '未知错误';
+  if (typeof body === 'string') return body.slice(0, 200);
+  if (typeof body.error === 'string') return body.error.slice(0, 200);
+  if (typeof body.error?.message === 'string') return body.error.message.slice(0, 200);
+  if (typeof body.message === 'string') return body.message.slice(0, 200);
+  return JSON.stringify(body).slice(0, 200);
+}
+
+/**
+ * 「没进入转发」的请求也要留痕。
+ *
+ * 此前只有真正打到账号池的请求才写日志：Key 不对、代理没开、body 缺字段这些在
+ * handler 开头就被 `return` 掉了，界面「请求日志」一片空白 —— 用户看到的现象恰好
+ * 就是「反向代理用不了，日志里什么都没有」。而这类拒绝往往正是问题本身。
+ *
+ * 做法：包一层 `res.json` 抓住响应体，`finish` 时若状态码 ≥ 400 且 handler 没记过，
+ * 就补一条日志（带客户端 UA、Key 携带方式、请求路径）。
+ */
+function watchRejections(req, res, next) {
+  const started = Date.now();
+  const sendJson = res.json.bind(res);
+  let body = null;
+  res.json = (b) => {
+    body = b;
+    return sendJson(b);
+  };
+  res.on('finish', () => {
+    if (res.statusCode < 400) return;
+    if (res.locals?.proxyLogged) return; // 账号池已记过（markFailed / handleChat）
+    summarizeLog();
+    state.stats.failed += 1;
+    log({
+      at: Date.now(),
+      ok: false,
+      status: res.statusCode,
+      model: req.body?.model ? String(req.body.model) : null,
+      stream: !!req.body?.stream,
+      account: null,
+      ms: Date.now() - started,
+      error: shortReject(body),
+      ua: uaOf(req),
+      auth: authLabel(req),
+      path: pathOf(req),
+    });
+  });
+  next();
 }
 
 /**
@@ -223,6 +341,9 @@ async function handleChat(req, res) {
             stream: isStream,
             account: accountMeta(account).name,
             ms: Date.now() - started,
+            ua: uaOf(req),
+            auth: authLabel(req),
+            path: pathOf(req),
           });
           if (isStream) {
             res.status(out.status);
@@ -254,6 +375,7 @@ async function handleChat(req, res) {
 
   summarizeLog();
   state.stats.failed += 1;
+  res.locals.proxyLogged = true;
   log({
     at: Date.now(),
     ok: false,
@@ -262,9 +384,13 @@ async function handleChat(req, res) {
     stream: isStream,
     account: null,
     ms: Date.now() - started,
-    error: errors.slice(0, 3).join(' | '),
+    error: briefErrors(errors, 1) || '所有账号都请求失败',
+    errorRaw: errors.join(' | ').slice(0, 4000),
+    ua: uaOf(req),
+    auth: authLabel(req),
+    path: pathOf(req),
   });
-  res.status(502).json({ error: '所有账号都请求失败', details: errors.slice(0, 5) });
+  res.status(502).json({ error: '所有账号都请求失败', details: errors.slice(0, 5).map(briefUpstream) });
 }
 
 async function handleModels(req, res) {
@@ -323,7 +449,7 @@ const sseHeaders = (res) => {
 };
 
 /** 结算一次成功请求（轮转指针前进 + 日志） */
-function markOk({ started, model, stream, account, status = 200 }) {
+function markOk({ started, model, stream, account, status = 200, req }) {
   summarizeLog();
   state.stats.ok += 1;
   log({
@@ -334,13 +460,21 @@ function markOk({ started, model, stream, account, status = 200 }) {
     stream,
     account: accountMeta(account).name,
     ms: Date.now() - started,
+    ua: req ? uaOf(req) : null,
+    auth: req ? authLabel(req) : null,
+    path: req ? pathOf(req) : null,
   });
 }
 
-/** 结算一次失败请求 */
-function markFailed({ started, model, stream, errors }) {
+/**
+ * 结算一次失败请求。
+ * 传 `res` 是为了在响应上打标记，避免外层的「拒绝请求监听」把同一次失败记两遍。
+ */
+function markFailed(res, { started, model, stream, errors }) {
   summarizeLog();
   state.stats.failed += 1;
+  if (res?.locals) res.locals.proxyLogged = true;
+  const raw = (errors || []).join(' | ');
   log({
     at: Date.now(),
     ok: false,
@@ -349,7 +483,8 @@ function markFailed({ started, model, stream, errors }) {
     stream,
     account: null,
     ms: Date.now() - started,
-    error: errors.slice(0, 3).join(' | '),
+    error: briefErrors(errors, 1) || '所有账号都请求失败',
+    errorRaw: raw.slice(0, 4000),
   });
 }
 
@@ -435,7 +570,7 @@ async function handleMessages(req, res) {
           res.end();
         }
       }
-      markOk({ started, model: upstream.model, stream: true, account });
+      markOk({ started, model: upstream.model, stream: true, account, req });
       return 'done';
     }
 
@@ -448,7 +583,7 @@ async function handleMessages(req, res) {
         return { error: '上游响应解析失败' };
       }
       res.json(buildAnthropicMessage(parsed, upstream.model));
-      markOk({ started, model: upstream.model, stream: false, account });
+      markOk({ started, model: upstream.model, stream: false, account, req });
       return 'done';
     }
     if ((out.status === 401 || out.status === 403) && attempt === 0) return 'retry-auth';
@@ -456,8 +591,8 @@ async function handleMessages(req, res) {
   });
 
   if (!result.ok && !res.headersSent) {
-    markFailed({ started, model: upstream.model, stream: isStream, errors: result.errors });
-    return anthropicError(res, 502, `所有账号都请求失败：${result.errors.slice(0, 3).join(' | ')}`);
+    markFailed(res, { started, model: upstream.model, stream: isStream, errors: result.errors, req });
+    return anthropicError(res, 502, `所有账号都请求失败：${briefErrors(result.errors, 3)}`);
   }
 }
 
@@ -504,7 +639,7 @@ async function handleResponses(req, res) {
           res.end();
         }
       }
-      markOk({ started, model: upstream.model, stream: true, account });
+      markOk({ started, model: upstream.model, stream: true, account, req });
       return 'done';
     }
 
@@ -517,7 +652,7 @@ async function handleResponses(req, res) {
         return { error: '上游响应解析失败' };
       }
       res.json(buildResponsesReply(parsed, upstream.model));
-      markOk({ started, model: upstream.model, stream: false, account });
+      markOk({ started, model: upstream.model, stream: false, account, req });
       return 'done';
     }
     if ((out.status === 401 || out.status === 403) && attempt === 0) return 'retry-auth';
@@ -525,8 +660,8 @@ async function handleResponses(req, res) {
   });
 
   if (!result.ok && !res.headersSent) {
-    markFailed({ started, model: upstream.model, stream: isStream, errors: result.errors });
-    return responsesError(res, 502, `所有账号都请求失败：${result.errors.slice(0, 3).join(' | ')}`);
+    markFailed(res, { started, model: upstream.model, stream: isStream, errors: result.errors, req });
+    return responsesError(res, 502, `所有账号都请求失败：${briefErrors(result.errors, 3)}`);
   }
 }
 
@@ -597,7 +732,7 @@ async function handleGemini(req, res) {
           res.end();
         }
       }
-      markOk({ started, model: upstream.model, stream: true, account });
+      markOk({ started, model: upstream.model, stream: true, account, req });
       return 'done';
     }
 
@@ -610,7 +745,7 @@ async function handleGemini(req, res) {
         return { error: '上游响应解析失败' };
       }
       res.json(buildGeminiResponse(parsed, upstream.model));
-      markOk({ started, model: upstream.model, stream: false, account });
+      markOk({ started, model: upstream.model, stream: false, account, req });
       return 'done';
     }
     if ((out.status === 401 || out.status === 403) && attempt === 0) return 'retry-auth';
@@ -618,8 +753,8 @@ async function handleGemini(req, res) {
   });
 
   if (!result.ok && !res.headersSent) {
-    markFailed({ started, model: upstream.model, stream: isStream, errors: result.errors });
-    return geminiError(res, 502, `所有账号都请求失败：${result.errors.slice(0, 3).join(' | ')}`);
+    markFailed(res, { started, model: upstream.model, stream: isStream, errors: result.errors, req });
+    return geminiError(res, 502, `所有账号都请求失败：${briefErrors(result.errors, 3)}`);
   }
 }
 
@@ -756,6 +891,10 @@ export function registerProxyRoutes(app, { port }) {
   };
   app.use('/v1', corsV1);
   app.use('/v1beta', corsV1);
+
+  // 拒绝也要留痕（必须在各端点之前挂）
+  app.use('/v1', watchRejections);
+  app.use('/v1beta', watchRejections);
 
   app.get('/api/proxy/status', (req, res) => res.json(publicStatus(port, { reveal: req.query.reveal === '1' })));
 

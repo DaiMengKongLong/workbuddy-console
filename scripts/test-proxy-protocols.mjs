@@ -303,6 +303,23 @@ const parseSse = (text) =>
   ok(devMsgs[0].content === 'see the vendor docs', '净化：developer 条目同样处理');
 }
 
+/* ---------------- B0. 上游错误简报（把一坨 JSON 压成一行人话） ---------------- */
+{
+  const { briefUpstream, briefErrors } = await import('../server/proxy/index.mjs');
+  const raw =
+    '时光悠悠: HTTP 400: {"code":11128,"msg":"Illegal API invocation from an unapproved channel",' +
+    '"requestId":"de10c63a7fe09264","displayMsg":{"en":"Request blocked","zh":"请求被拦截，请重新发送"}}';
+  const b = briefUpstream(raw);
+  ok(b.startsWith('时光悠悠: ') && b.includes('11128') && b.includes('渠道风控'), `简报：保留账号名并给出 11128 中文含义（${b}）`);
+  ok(!b.includes('requestId'), '简报：丢掉 requestId 之类的噪音');
+  ok(
+    briefUpstream('laopo的手机: HTTP 400: {"code":11102,"msg":"model [gpt-4o] service info not found"}').includes('模型不可用'),
+    '简报：11102 → 模型不可用（提示换模型）'
+  );
+  ok(briefUpstream('账号: 连接超时').includes('连接超时'), '简报：非上游 JSON 的错误原样保留');
+  ok(briefErrors(['a: {"code":11128}', 'b: {"code":11128}'], 1).split('|').length === 1, '简报：多账号列表按 n 截断');
+}
+
 /* ---------------- B. 路由与鉴权冒烟 ---------------- */
 {
   const express = (await import('express')).default;
@@ -321,9 +338,10 @@ const parseSse = (text) =>
   const base = `http://127.0.0.1:${port}`;
   const KEY = 'sk-wb-testkey';
 
-  const call = async (method, p, { key, goog, apiKey, body } = {}) => {
+  const call = async (method, p, { key, rawKey, goog, apiKey, body } = {}) => {
     const headers = { 'content-type': 'application/json' };
     if (key) headers.authorization = `Bearer ${key}`;
+    if (rawKey) headers.authorization = rawKey; // 不带 Bearer 前缀
     if (goog) headers['x-goog-api-key'] = goog;
     if (apiKey) headers['x-api-key'] = apiKey;
     const r = await fetch(base + p, { method, headers, body: body ? JSON.stringify(body) : undefined });
@@ -372,6 +390,25 @@ const parseSse = (text) =>
   ok((await call('POST', '/v1/chat/completions', { key: KEY, body: okBody })).status === 503, 'OpenAI：Bearer 鉴权');
   ok((await call('POST', '/v1/messages', { apiKey: KEY, body: { messages: [] } })).status === 503, 'Anthropic：x-api-key 鉴权');
   ok((await call('POST', '/v1/responses', { key: KEY, body: { input: [] } })).status === 503, 'Responses：Bearer 鉴权');
+
+  // —— Authorization 不带 Bearer 前缀（少数脚本客户端直接塞 Key） ——
+  const bareAuth = await call('POST', '/v1/chat/completions', { rawKey: KEY, body: okBody });
+  ok(bareAuth.status === 503, 'OpenAI：Authorization 裸 Key 也认（不走 Bearer 前缀）');
+
+  // —— 被拒绝的请求必须留痕：否则界面「请求日志」一片空白，
+  //     用户看到的现象就是「反向代理用不了，却查不到任何线索」 ——
+  const wrongKey = await call('POST', '/v1/chat/completions', { key: 'sk-wb-wrong', body: okBody });
+  ok(wrongKey.status === 401, 'OpenAI：Key 不对 → 401');
+  const logWrong = await call('GET', '/api/proxy/logs');
+  const lw = logWrong.json?.logs?.[0];
+  ok(lw?.status === 401 && lw?.ok === false, '拒绝留痕：401 也写进请求日志');
+  ok(lw?.auth === 'mismatch', `拒绝留痕：能区分「带了但不对」（auth=${lw?.auth}）`);
+  ok(typeof lw?.path === 'string' && lw.path.endsWith('/v1/chat/completions'), `拒绝留痕：记下请求路径（${lw?.path}）`);
+
+  const noKey = await call('POST', '/v1/chat/completions', { body: okBody });
+  ok(noKey.status === 401, 'OpenAI：没带 Key → 401');
+  const lnk = (await call('GET', '/api/proxy/logs')).json?.logs?.[0];
+  ok(lnk?.auth === 'absent', `拒绝留痕：能区分「根本没带」（auth=${lnk?.auth}）`);
 
   server.close();
 }

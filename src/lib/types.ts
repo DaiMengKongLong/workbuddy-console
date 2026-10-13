@@ -743,7 +743,16 @@ export interface ProxyLog {
   stream: boolean;
   account: string | null;
   ms: number;
+  /** 人话版失败原因（上游错误码已翻成中文） */
   error?: string;
+  /** 上游错误原文，鼠标悬停看全（已截断到 4000 字） */
+  errorRaw?: string;
+  /** 调用方 UA —— 用来判断「到底是哪个客户端在用」 */
+  ua?: string | null;
+  /** Key 的携带方式：bearer / raw / x-api-key / x-goog-api-key / query / none */
+  auth?: string | null;
+  /** 请求路径（Gemini 的模型名在路径里） */
+  path?: string | null;
 }
 
 export interface ProxyStatus {

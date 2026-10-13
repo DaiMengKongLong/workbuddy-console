@@ -1,5 +1,6 @@
 import express from 'express';
 import fs from 'node:fs';
+import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
@@ -1010,7 +1011,7 @@ app.get(/^\/(?!api\/).*/, (req, res) => {
   res.sendFile(path.join(DIST, 'index.html'));
 });
 
-app.listen(PORT, '127.0.0.1', () => {
+const onListening = () => {
   const url = `http://127.0.0.1:${PORT}`;
   console.log(`workbuddy控制台已启动: ${url}`);
   if (process.env.NO_OPEN !== '1') {
@@ -1022,4 +1023,23 @@ app.listen(PORT, '127.0.0.1', () => {
           : spawn('xdg-open', [url], { detached: true, stdio: 'ignore' });
     cmd.unref();
   }
-});
+};
+
+app.listen(PORT, '127.0.0.1', onListening);
+
+/*
+ * 同时监听 IPv6 环回。
+ *
+ * 只绑 127.0.0.1 时，把 `localhost` 解析成 `::1` 的客户端（本机 ping localhost 就是
+ * ::1）会连不上：实测 `http://[::1]:57891/...` 返回 HTTP 000。现象是「反向代理用不了」，
+ * 而且**连一条请求日志都不会有** —— 请求根本没到进程里，最容易被误判成代理坏了。
+ *
+ * 两个地址都只在环回范围内，不增加对外暴露面。绑不上（机器禁用 IPv6）只提示、不影响 IPv4。
+ */
+if (process.env.NO_IPV6 !== '1') {
+  const server6 = http.createServer(app);
+  server6.on('error', (err) => {
+    console.warn(`IPv6 环回监听失败（不影响 IPv4 访问）: ${err?.code || err?.message}`);
+  });
+  server6.listen(PORT, '::1');
+}
