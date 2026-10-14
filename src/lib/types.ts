@@ -363,6 +363,8 @@ export interface SessionCopyReport {
   copied: SessionCopyItem[];
   skipped: { id: string; reason: string; newId?: string }[];
   errors: { id: string; error: string }[];
+  /** 往返复制时回写到原会话的改名（源会话是本账号某会话的副本时触发） */
+  titleSynced?: { sourceId: string; originId: string; title: string }[];
   totalBytes: number;
   backupPath: string;
   appStop: AppStopResult | null;

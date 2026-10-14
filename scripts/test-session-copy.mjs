@@ -211,7 +211,7 @@ fs.writeFileSync(edgeSyncPath, Buffer.from('EDGE-SYNC-PLACEHOLDER'));
 const edgeSyncBytes = fs.readFileSync(edgeSyncPath).toString();
 
 /* ---------- 被测模块 ---------- */
-const { listSessionsForSwitch, copySessions, sessionDataRoot, sessionCopySupported, sessionCopyLedger } =
+const { listSessionsForSwitch, copySessions, sessionDataRoot, sessionCopySupported, sessionCopyLedger, SESSION_COPIES_FILE } =
   await import('../server/workbuddy/sessions.mjs');
 
 const readDb = () => new DatabaseSync(dbPath, { readOnly: true });
@@ -457,6 +457,53 @@ ok(
   fs.readFileSync(edgeSyncPath).toString() === edgeSyncBytes,
   '回滚路径同样没有触碰 edge-sync-mapping'
 );
+
+/* ---------- 8. 往返复制：改名同步回原会话 ---------- */
+out('\n== 8. 往返复制：改名同步回原会话 ==');
+// 场景：CID.other（目标账号）曾复制给源账号成为 CID.plain（反向账本可查）；
+// 用户在源账号里给 CID.plain 改了名，再次切回目标账号时，新名字要回到 CID.other 上。
+const REVERSE_KEY = `cn|${TARGET_UID}|${SOURCE_UID}`;
+const ledgerFile = JSON.parse(fs.readFileSync(SESSION_COPIES_FILE, 'utf8'));
+ledgerFile.pairs[REVERSE_KEY] = { [CID.other]: CID.plain };
+fs.writeFileSync(SESSION_COPIES_FILE, JSON.stringify(ledgerFile), 'utf8');
+
+// 模拟用户在源账号里改名（客户端会同时写 title 与 custom_title）
+{
+  const d = new DatabaseSync(dbPath);
+  d.prepare('UPDATE sessions SET title = ?, custom_title = ? WHERE id = ?').run(
+    '往返改名后的标题',
+    '往返改名后的标题',
+    CID.plain
+  );
+  d.close();
+}
+
+const beforeRoundFiles = listJsonl().length;
+const beforeRoundRows = countRows(TARGET_UID);
+const roundReport = await copySessions({ targetAccountId: TARGET_ACCOUNT_ID, ids: [CID.plain] });
+ok(roundReport.skipped.length === 1 && roundReport.copied.length === 0, '往返复制命中账本被跳过（不产生重复会话）');
+ok(
+  Array.isArray(roundReport.titleSynced) && roundReport.titleSynced.length === 1,
+  '报告带出 titleSynced 记录'
+);
+ok(
+  roundReport.titleSynced?.[0]?.originId === CID.other && roundReport.titleSynced?.[0]?.title === '往返改名后的标题',
+  'titleSynced 指向目标账号的原会话并带回新标题'
+);
+{
+  const d = readDb();
+  const row = d.prepare('SELECT title, custom_title FROM sessions WHERE id = ? AND user_id = ?').get(CID.other, TARGET_UID);
+  d.close();
+  ok(row?.title === '往返改名后的标题' && row?.custom_title === '往返改名后的标题', '原会话行的 title 与 custom_title 都已更新');
+}
+ok(listJsonl().length === beforeRoundFiles && countRows(TARGET_UID) === beforeRoundRows, '标题同步不产生新的正文文件或会话行');
+// 只动标题两列：其他列原样保留
+{
+  const d = readDb();
+  const row = d.prepare('SELECT unread, agent_dirty, group_title, status FROM sessions WHERE id = ?').get(CID.other);
+  d.close();
+  ok(row?.unread === 3 && Number(row?.agent_dirty) === 1 && row?.group_title === '分组标题', '原会话的其他列不受标题回写影响');
+}
 
 /* ---------- 汇总 ---------- */
 out(`\n${pass}/${total} 断言通过`);

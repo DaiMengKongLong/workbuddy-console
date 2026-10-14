@@ -1305,6 +1305,12 @@ function SessionCopyDialog({
                 复制前已备份会话库：{report.backupPath}
               </div>
             )}
+            {!!report.titleSynced?.length && (
+              <div className="text-[11px] text-emerald-700">
+                改名同步：<b className="tabular-nums">{report.titleSynced.length}</b>{' '}
+                个会话的新名字已回写到本账号的原会话（客户端会给导入的副本重新生成自动标题，原会话带上固定名后不再被覆盖）。
+              </div>
+            )}
             {report.errors.length > 0 && (
               <ul className="max-h-32 space-y-0.5 overflow-y-auto text-[11px] text-red-600">
                 {report.errors.slice(0, 50).map((e) => (

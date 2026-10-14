@@ -560,6 +560,13 @@ export async function copySessions({ targetAccountId, ids, stopApp = false }) {
   const root = sessionDataRoot(variantId);
   const index = indexProjectBodies(variantId);
   const ledger = sessionCopyLedger(variantId, sourceUid, targetUid);
+  // 往返识别：查「目标 → 本账号」方向的账本。若当前要复制的源会话本来就是上次
+  // 从目标账号复制出去的副本，则本次把它的最新标题回写给目标账号里的原会话行——
+  // 实测客户端会给导入的副本重新生成自动标题（复制过去的名字会被覆盖），
+  // 而原会话一旦带上 custom_title 就不会再被自动命名改写，改名才能跟着内容走。
+  const originOfCopy = new Map(
+    Object.entries(sessionCopyLedger(variantId, targetUid, sourceUid)).map(([originId, copyId]) => [copyId, originId])
+  );
 
   const backupPath = backupSessionDb(variantId);
 
@@ -567,8 +574,41 @@ export async function copySessions({ targetAccountId, ids, stopApp = false }) {
   const copied = [];
   const skipped = [];
   const errors = [];
+  const titleSynced = [];
   const ledgerAdds = [];
   let totalBytes = 0;
+
+  /**
+   * 标题回写：把源会话当前的 title / custom_title 写到目标账号的原会话行上。
+   * 只动这两个列，内容一字不碰；字段没变化时不写。返回同步结果或 null（无需同步）。
+   */
+  const syncTitleBack = (originId, sourceTitle, sourceCustomTitle) => {
+    const cur = db.prepare('SELECT title, custom_title FROM sessions WHERE id = ? AND user_id = ?').get(originId, targetUid);
+    if (!cur) return null;
+    const same =
+      String(cur.title ?? '') === String(sourceTitle ?? '') &&
+      String(cur.custom_title ?? '') === String(sourceCustomTitle ?? '');
+    if (same) return null;
+    db.prepare('UPDATE sessions SET title = ?, custom_title = ? WHERE id = ? AND user_id = ?').run(
+      sourceTitle ?? null,
+      sourceCustomTitle ?? null,
+      originId,
+      targetUid
+    );
+    return { originId, title: displayTitle(sourceTitle, sourceCustomTitle) };
+  };
+
+  /** 往返场景的标题回写入口：cid 是目标账号某会话的副本时执行；失败只记错误不中断 */
+  const syncTitleForRoundTrip = (cid, sourceTitle, sourceCustomTitle) => {
+    const originId = originOfCopy.get(cid);
+    if (!originId) return;
+    try {
+      const synced = syncTitleBack(originId, sourceTitle, sourceCustomTitle);
+      if (synced) titleSynced.push({ sourceId: cid, ...synced });
+    } catch (err) {
+      errors.push({ id: cid, error: `标题回写失败（内容不受影响）：${err?.message || err}` });
+    }
+  };
 
   try {
     for (const cid of list) {
@@ -576,6 +616,13 @@ export async function copySessions({ targetAccountId, ids, stopApp = false }) {
         assertSafeSessionId(cid);
         if (Object.prototype.hasOwnProperty.call(ledger, cid)) {
           skipped.push({ id: cid, reason: '已复制过（账本命中）', newId: ledger[cid] });
+          // 账本命中也要做标题回写：改过名的副本再次切回来时，原会话的名称要跟上
+          try {
+            const srow = db.prepare('SELECT title, custom_title FROM sessions WHERE id = ?').get(cid);
+            if (srow) syncTitleForRoundTrip(cid, srow.title, srow.custom_title);
+          } catch (err) {
+            errors.push({ id: cid, error: `标题回写失败（内容不受影响）：${err?.message || err}` });
+          }
           continue;
         }
         const sourcePath = index.get(cid);
@@ -634,6 +681,8 @@ export async function copySessions({ targetAccountId, ids, stopApp = false }) {
           workspace: workspaceName(sourceRow.cwd),
           bytes: writtenBytes,
         });
+        // 往返场景：内容复制成了新会话，改名也要同步回目标账号里的原会话
+        syncTitleForRoundTrip(cid, sourceRow.title, sourceRow.custom_title);
         ledgerAdds.push({ sourceId: cid, newId });
         totalBytes += writtenBytes;
       } catch (err) {
@@ -660,6 +709,8 @@ export async function copySessions({ targetAccountId, ids, stopApp = false }) {
     copied,
     skipped,
     errors,
+    /** 往返复制时同步回原会话的改名（含会话 id、原会话 id 与新标题） */
+    titleSynced,
     totalBytes,
     backupPath,
     /** 本次是否结束了 WorkBuddy 的进程（供界面提示"客户端已被关闭，需要重新打开"） */
