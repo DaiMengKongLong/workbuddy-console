@@ -6,15 +6,6 @@
 
 > 把 **WorkBuddy 账号管理**、**多平台免费模型**、**Token 用量统计**、**积分统计** 收进同一个本地工具。
 
-这个仓库由两个工具融合而成：
-
-| 能力 | 来源 |
-| --- | --- |
-| 多平台免费模型广场（OpenRouter / 硅基流动 / 魔搭 / Agnes AI 等） | [free-token](../free-token) |
-| 账号管理、Token 统计、积分统计 | [workbuddy-switch](../workbuddy-switch-main) |
-
-账号库 `~/.wb-switch/accounts.json` 与 workbuddy-switch **完全共享**，两个工具可以同时安装、随时切换使用，互不干扰。
-
 ---
 
 ## 使用说明（普通用户看这里）
@@ -87,7 +78,7 @@ WorkBuddy 的对话记录**按账号隔离**：`workbuddy.db` 的 `sessions` 表
 
 在账号卡片上点 **同步会话**，或在切换账号时勾选「同时复制会话」，即可把**当前登录账号**的会话复制给目标账号。
 
-**会话数据是「三件套」，缺一不可**（结论来自参考实现 workbuddy-switch 的 `session.rs`）：
+**会话数据是「三件套」，缺一不可**（依据客户端对会话库的实际读写行为验证）：
 
 | 位置 | 作用 | 复制时怎么处理 |
 | --- | --- | --- |
@@ -323,12 +314,12 @@ node scripts/test-proxy-pool.mjs        # 32 项断言：账号池准入、凭�
 
 | 内容 | 路径 |
 | --- | --- |
-| 账号库（与 workbuddy-switch 共享） | `~/.wb-switch/accounts.json` |
+| 账号库 | `~/.wb-switch/accounts.json` |
 | 登录态备份 | `~/.wb-switch/backups/` |
 | 会话复制账本（本工具私有） | `~/.wb-switch/session_copies.json` |
 | 会话复制前的会话库备份 | `~/.wb-switch/backups/session-copy-*/workbuddy.db`（含 `-wal` / `-shm`） |
 | WorkBuddy 登录态（国内版 / 国际版） | `%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info` / `workbuddy-desktop-ai.info` |
-| 积分快照（与 workbuddy-switch 共享，结构兼容） | `~/.wb-switch/credit_usage_snapshots.json` |
+| 积分快照 | `~/.wb-switch/credit_usage_snapshots.json` |
 | 积分用量缓存（本工具私有） | `~/.wb-switch/credit_stats_cache.json` |
 | 签到与成长中心日志（本工具私有） | `~/.wb-switch/checkin_logs.json` |
 | 凭据刷新日志（本工具私有，不含 token） | `~/.wb-switch/token_refresh_logs.json` |
@@ -336,8 +327,7 @@ node scripts/test-proxy-pool.mjs        # 32 项断言：账号池准入、凭�
 | 版本自检缓存（6 小时） | `~/.free-token/cache/update-check.json` |
 | 写入 WorkBuddy 的模型配置 | `~/.workbuddy/models.json`（国内版）/ `~/.workbuddy-ai/models.json`（国际版） |
 
-> 与 workbuddy-switch 同目录共存时，**只有账号库、备份与积分快照是刻意共用的**；
-> 缓存与日志各写各的文件，避免两边结构不同导致读取错乱。
+> 账号库、备份与积分快照放在 `~/.wb-switch/` 下；缓存与日志各写各的文件，避免结构不同导致读取错乱。
 
 ## 技术栈
 
