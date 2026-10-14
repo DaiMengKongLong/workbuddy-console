@@ -14,10 +14,15 @@ const net = require('node:net');
 
 const buildRes = (name) => path.join(__dirname, '..', 'build', name);
 
-// 单实例锁：二次启动唤起已有窗口
-if (!app.requestSingleInstanceLock()) {
+// 单实例锁：二次启动唤起已有窗口。
+// ⚠️ app.quit() 是异步的——锁失败后若不把生命周期代码隔离开，whenReady 的启动流程
+// 仍会继续跑：新进程会抢下一个空闲端口起第二个服务、创建窗口，随后被退出流程打断，
+// loadURL 以 ERR_FAILED (-2) 告终并弹出「启动失败」错误框（用户看起来就是"打开报错"）。
+// 因此所有初始化必须收在拿到锁的分支里。
+const gotLock = app.requestSingleInstanceLock();
+if (!gotLock) {
   app.quit();
-}
+} else {
 
 // 控制台是纯 UI + 本地服务，不需要 GPU：远程桌面 / 虚拟机里 GPU 进程可能不可用，
 // 禁用硬件加速避免窗口渲染崩溃（软件渲染对这种界面毫无压力）
@@ -191,3 +196,4 @@ app.on('window-all-closed', () => {
   // 不主动退出：托盘常驻负责自动签到；退出统一走托盘菜单 / Cmd+Q
   if (process.platform !== 'darwin' && !tray) app.quit();
 });
+} // 单实例锁 else 分支结束：没拿到锁的进程只 quit，不做任何初始化
