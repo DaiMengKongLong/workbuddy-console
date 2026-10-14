@@ -17,14 +17,52 @@
 
 ---
 
-## 快速开始
+## 使用说明（普通用户看这里）
+
+### 一、下载安装（推荐，无需安装 Node.js）
+
+1. 打开 [GitHub Releases 下载页](https://github.com/walter-io/workbuddy-console/releases/latest)；
+2. 按系统下载安装包：
+
+| 系统 | 文件 | 说明 |
+| --- | --- | --- |
+| Windows 10/11（64 位） | `WorkBuddy-Console-<版本>-win-x64.exe` | NSIS 安装向导，可选安装目录，自动创建桌面快捷方式 |
+| macOS Apple Silicon | `WorkBuddy-Console-<版本>-mac-arm64.dmg` | 拖入 Applications 即完成安装 |
+| macOS Intel | `WorkBuddy-Console-<版本>-mac-x64.dmg` | 同上 |
+
+3. **macOS 首次打开**：安装包未做 Apple 公证，需「右键 → 打开」，或在「系统设置 → 隐私与安全性」里放行一次；
+4. 启动后窗口可以关闭——**只是缩到系统托盘**，每日签到巡检继续在后台跑；右键托盘图标可恢复窗口或真正退出。
+
+### 二、首次使用三步走
+
+1. **添加账号**：进「账号管理」→ 点「扫码添加」，用 WorkBuddy 客户端扫码登录（二维码在本机渲染，不经过任何第三方）；也可「导入本机登录态」直接复用已登录的 WorkBuddy；
+2. **切换账号**：在目标账号卡片上点「切换」——工具会自动退出 WorkBuddy → 备份并切换登录态 → 自动重启 WorkBuddy，你直接拿到已登录新账号的客户端；切换时可勾选「同时复制会话」把当前对话带给新账号；
+3. **开启自动化（可选）**：进「设置 → 每日签到与成长中心」，保持自动巡检开启，每天自动签到并领取旅行礼物 / 任务 / 补签 / 兑换 / 盲盒等全部奖励。
+
+### 三、常见操作速查
+
+| 想做什么 | 去哪里 |
+| --- | --- |
+| 添加 / 切换 / 刷新凭据 / 删除账号 | 「账号管理」 |
+| 让 Claude Code、Codex、Gemini CLI 等用 WorkBuddy 的额度 | 「反向代理」→ 开启 → 复制 Base URL 与 API Key，接入示例可直接复制 |
+| 查看 Token 用量与缓存命中率 | 「Token 统计」 |
+| 查看积分余额与逐请求明细 | 「积分统计」 |
+| 手动签到 / 一键领取成长中心奖励 | 「设置 → 每日签到与成长中心」 |
+| 给免费模型平台配置 Key、写入 models.json | 「免费模型广场」三个子页签 |
+| 检查更新 / 关掉自动更新检查 | 左下角版本号，或「设置 → 关于」 |
+
+### 四、从源码运行（开发者）
 
 ```bash
 npm install          # 安装依赖
-npm run build        # 构建前端
+npm run build        # 构建前端（改了 src/ 后必须执行，界面才会更新）
 npm start            # 启动服务（默认 http://127.0.0.1:57891）
 npm run app          # 以桌面窗口运行（Electron）
+npm run app:win      # 本地打包 Windows 安装包（release/*.exe）
+npm run test:proxy   # 其余测试脚本见下文各节
 ```
+
+> 桌面版与 `npm start` 走的是同一套本地服务；日常使用装 Release 安装包即可，源码运行只在本机开发时需要。
 
 ## 功能
 
