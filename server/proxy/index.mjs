@@ -9,7 +9,11 @@
  * - **不另起端口**：复用控制台自身的 Express（默认 57891 / 桌面版动态端口），
  *   少一个监听端口、少一处防火墙与"端口被占"的故障面。
  * - **默认关闭**：会对外暴露一个本地 HTTP 接口，必须用户显式开启。
- * - **账号轮换**：按请求轮询账号池；401/403 先刷新 token 重试，仍失败再换下一个账号。
+ * - **账号出站顺序**：按「积分最早过期优先」排序——先烧快过期的积分，避免浪费；
+ *   余额数据后台低频刷新（10 分钟），绝不阻塞请求。
+ * - **限额换号**：某账号对某模型撞限额（429 / 积分不足类错误）→ 该「账号×模型」
+ *   冷却 10 分钟，本请求与后续请求自动改用其他账号；401/403 先刷新 token 重试，
+ *   仍失败换下一个账号。
  * - **只透传必要字段**：OpenAI 入站 body 里的未知字段（如某些客户端的私货）不往上游带。
  */
 import { Readable } from 'node:stream';
@@ -18,6 +22,7 @@ import fs from 'node:fs';
 import { loadConfig, saveConfig, DEFAULT_PROXY } from '../store/config.mjs';
 import { loadAccounts, accountMeta, secretValue } from '../workbuddy/accounts.mjs';
 import { variantOf, VARIANT_LIST, authFilePath } from '../workbuddy/variant.mjs';
+import { getAccountBalances } from '../workbuddy/credits.mjs';
 import { chatComplete, refreshAccessToken, fetchUpstreamModels, openUpstreamStream } from './wb.mjs';
 import { anthropicToOpenAi, buildAnthropicMessage, pipeAnthropicStream } from './anthropic.mjs';
 import { responsesToOpenAi, buildResponsesReply, pipeResponsesStream } from './responses.mjs';
@@ -45,12 +50,21 @@ const ALLOWED_FIELDS = [
 
 const LOG_LIMIT = 200;
 
-/** 进程内状态：轮转下标、请求日志、累计统计、模型缓存 */
+/** 限额冷却时长：撞限额的「账号×模型」在这段时间内被排到队尾，之后自动恢复 */
+const COOLDOWN_MS = 10 * 60 * 1000;
+
+/** 余额（积分过期时间）后台刷新间隔：只影响排序，不用新鲜到分钟级 */
+const EXPIRY_REFRESH_MS = 10 * 60 * 1000;
+
+/** 进程内状态：请求日志、累计统计、模型缓存、限额冷却、积分过期时间 */
 const state = {
-  rr: 0,
   logs: [],
   stats: { total: 0, ok: 0, failed: 0, lastAt: null },
   models: { ids: [], fetchedAt: null, error: null, account: null },
+  /** 限额冷却表：`${accountId}|${model}` → 冷却截止时间戳（毫秒） */
+  cooldown: new Map(),
+  /** 积分过期时间表：accountId → 最早到期的未过期积分包时间戳（毫秒）；at 为上次刷新时间 */
+  expiry: { at: 0, map: new Map() },
 };
 
 function ensureKey() {
@@ -128,6 +142,95 @@ export function currentLoginUids() {
 function log(entry) {
   state.logs.unshift(entry);
   if (state.logs.length > LOG_LIMIT) state.logs.length = LOG_LIMIT;
+}
+
+/**
+ * 上游错误文本是否属于「该账号这个模型用不了」的限额类失败。
+ * 典型：HTTP 429（限流/限额）、积分不足、额度用尽。这类失败换号是**确定有效**的
+ * （别的账号大概率还有额度），所以除了换号，还给该「账号×模型」记一次冷却，
+ * 避免后续每个请求都先来撞一下。
+ */
+export function isQuotaError(text) {
+  return /(^|[^0-9])429([^0-9]|$)|insufficient|exhaust|rate.?limit|积分不足|余额不足|额度(不足|用尽|已用完)|限额|配额/i.test(
+    String(text ?? '')
+  );
+}
+
+/** 给「账号×模型」记限额冷却 */
+function markCooldown(accountId, model) {
+  if (!accountId || !model) return;
+  state.cooldown.set(`${accountId}|${model}`, Date.now() + COOLDOWN_MS);
+}
+
+/** 「账号×模型」是否还在冷却期内 */
+function isCooling(accountId, model) {
+  const until = state.cooldown.get(`${accountId}|${model}`);
+  return Number.isFinite(until) && until > Date.now();
+}
+
+/**
+ * 后台低频刷新「积分过期时间表」：从余额缓存（getAccountBalances 自带 2 分钟进程内缓存）
+ * 里取每个账号「剩余>0 且未过期」的最早积分包到期时间。
+ *
+ * 刻意 **fire-and-forget**：余额接口慢（逐账号打官方接口），绝不能阻塞代理请求；
+ * 拉不到（网络不通/接口失败）就沿用上一次的结果，排序退化为「无过期信息、按原顺序」。
+ */
+async function refreshExpiryMap() {
+  try {
+    const payload = await getAccountBalances({ refresh: false });
+    const map = new Map();
+    const now = Date.now();
+    for (const row of payload?.accounts || []) {
+      const pkgs = row?.balance?.packages;
+      if (!Array.isArray(pkgs)) continue;
+      let earliest = null;
+      for (const p of pkgs) {
+        const exp = Number(p?.expireAt);
+        const rem = Number(p?.remaining);
+        if (!Number.isFinite(exp) || exp <= now) continue; // 已过期/长期有效的不参与
+        if (Number.isFinite(rem) && rem <= 0) continue; // 用完的包排序无意义
+        if (earliest == null || exp < earliest) earliest = exp;
+      }
+      if (earliest != null) map.set(row.accountId, earliest);
+    }
+    state.expiry = { at: Date.now(), map };
+  } catch {
+    state.expiry.at = Date.now(); // 失败也推进节流时间，避免每个请求都重试
+  }
+}
+
+/** 到期时间表过期了就后台补一次（不 await） */
+function maybeRefreshExpiry() {
+  if (Date.now() - state.expiry.at < EXPIRY_REFRESH_MS) return;
+  state.expiry.at = Date.now(); // 先推进再拉，防止并发请求重复触发
+  void refreshExpiryMap();
+}
+
+/**
+ * 出站顺序：**积分最早过期优先**（先烧快到期的积分）+ 限额冷却的后账号排最后。
+ *
+ * - 排序键：账号最早到期的未过期积分包时间升序；查不到过期信息的账号排后面
+ *   （可能是长期有效或余额接口没拉到，优先级让位给"再不用就作废"的积分）；
+ * - 冷却中的「账号×模型」不剔除、只沉底：万一是误判（比如瞬时 429），
+ *   兜底尝试仍然存在，只是不在前面浪费正式请求的时间；
+ * - 同分组内保持 loadAccounts 的原始顺序，保证确定性。
+ */
+export function orderPool(pool, model) {
+  maybeRefreshExpiry();
+  // 顺手清掉过期冷却项，防止长驻进程里 Map 无限增长
+  const now = Date.now();
+  for (const [k, until] of state.cooldown) if (until <= now) state.cooldown.delete(k);
+  const active = [];
+  const cooling = [];
+  for (const a of pool) (isCooling(a.id, model) ? cooling : active).push(a);
+  const byExpiry = (x, y) => {
+    const ex = state.expiry.map.get(x.id) ?? Number.POSITIVE_INFINITY;
+    const ey = state.expiry.map.get(y.id) ?? Number.POSITIVE_INFINITY;
+    return ex === ey ? 0 : ex < ey ? -1 : 1;
+  };
+  active.sort(byExpiry);
+  cooling.sort(byExpiry);
+  return [...active, ...cooling];
 }
 
 function summarizeLog() {
@@ -337,7 +440,7 @@ async function handleChat(req, res) {
     return res.status(400).json({ error: err.message });
   }
 
-  const pool = poolAccounts();
+  const pool = orderPool(poolAccounts(), String(body.model));
   if (!pool.length) {
     return res.status(503).json({
       error: '没有可用账号：反向代理需要至少 1 个带明文凭据的 WorkBuddy 账号（扫码登录导入的账号才有）',
@@ -348,15 +451,15 @@ async function handleChat(req, res) {
   const isStream = !!body.stream;
   const errors = [];
 
-  // 每个账号最多两轮（一轮直发，401/403 时刷新后重试一轮），全部失败才放弃
+  // 按出站顺序逐个账号试：每个账号最多两轮（一轮直发，401/403 时刷新后重试一轮），
+  // 撞限额的「账号×模型」记 10 分钟冷却，全部失败才放弃
   for (let i = 0; i < pool.length; i++) {
-    const account = pool[(state.rr + i) % pool.length];
+    const account = pool[i];
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
         if (attempt === 0 && needsRefresh(account)) await refreshAccessToken(account);
         const out = await chatComplete(account, body, { timeoutMs });
         if (out.ok) {
-          state.rr = (state.rr + i + 1) % pool.length;
           summarizeLog();
           state.stats.ok += 1;
           log({
@@ -390,9 +493,12 @@ async function handleChat(req, res) {
           await refreshAccessToken(account).catch(() => {});
           continue;
         }
+        // 限额类失败：给该「账号×模型」记冷却，后续请求直接跳过它
+        if (out.status === 429 || isQuotaError(out.error)) markCooldown(account.id, String(body.model));
         errors.push(`${accountMeta(account).name}: ${out.error || `HTTP ${out.status}`}`);
         break;
       } catch (err) {
+        if (err?.status === 429) markCooldown(account.id, String(body.model));
         errors.push(`${accountMeta(account).name}: ${err?.message || '请求失败'}`);
         break;
       }
@@ -516,28 +622,30 @@ function markFailed(res, { started, model, stream, errors }) {
 
 /**
  * 账号池遍历执行器（Anthropic / Responses 端点共用）。
+ * 传入的 pool 应已按 orderPool 排好序（积分过期优先 + 冷却沉底）。
  *
  * task 的返回约定：
  *   'done'          —— 已成功响应，收工
  *   'retry-auth'    —— 401/403，刷新同一账号后再试一轮
- *   其它对象         —— 该账号失败（取 .error 记日志），换下一个账号
+ *   其它对象         —— 该账号失败（取 .error 记日志），换下一个账号；
+ *                      错误属限额类时给该「账号×模型」记冷却
  */
-async function runAcrossPool(pool, task) {
+async function runAcrossPool(pool, task, model) {
   const errors = [];
   for (let i = 0; i < pool.length; i++) {
-    const account = pool[(state.rr + i) % pool.length];
+    const account = pool[i];
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
         if (attempt === 0 && needsRefresh(account)) await refreshAccessToken(account).catch(() => {});
         const r = await task(account, attempt);
         if (r === 'done') {
-          state.rr = (state.rr + i + 1) % pool.length;
           return { ok: true };
         }
         if (r === 'retry-auth' && attempt === 0) {
           await refreshAccessToken(account).catch(() => {});
           continue;
         }
+        if (isQuotaError(r?.error)) markCooldown(account.id, model);
         errors.push(`${accountMeta(account).name}: ${r?.error || '请求失败'}`);
         break;
       } catch (err) {
@@ -547,6 +655,7 @@ async function runAcrossPool(pool, task) {
             continue;
           }
         }
+        if (err?.status === 429) markCooldown(account.id, model);
         errors.push(`${accountMeta(account).name}: ${err?.message || '请求失败'}`);
         break;
       }
@@ -579,7 +688,7 @@ async function handleMessages(req, res) {
   const timeoutMs = Number(cfg.proxy?.timeoutMs) || DEFAULT_PROXY.timeoutMs;
   const signal = clientAbort(res);
 
-  const result = await runAcrossPool(pool, async (account, attempt) => {
+  const result = await runAcrossPool(orderPool(pool, upstream.model), async (account, attempt) => {
     if (isStream) {
       const up = await openUpstreamStream(account, upstream, { signal });
       sseHeaders(res);
@@ -614,7 +723,7 @@ async function handleMessages(req, res) {
     }
     if ((out.status === 401 || out.status === 403) && attempt === 0) return 'retry-auth';
     return { error: out.error || `HTTP ${out.status}` };
-  });
+  }, upstream.model);
 
   if (!result.ok && !res.headersSent) {
     markFailed(res, { started, model: upstream.model, stream: isStream, errors: result.errors, req });
@@ -648,7 +757,7 @@ async function handleResponses(req, res) {
   const timeoutMs = Number(cfg.proxy?.timeoutMs) || DEFAULT_PROXY.timeoutMs;
   const signal = clientAbort(res);
 
-  const result = await runAcrossPool(pool, async (account, attempt) => {
+  const result = await runAcrossPool(orderPool(pool, upstream.model), async (account, attempt) => {
     if (isStream) {
       const up = await openUpstreamStream(account, upstream, { signal });
       sseHeaders(res);
@@ -683,7 +792,7 @@ async function handleResponses(req, res) {
     }
     if ((out.status === 401 || out.status === 403) && attempt === 0) return 'retry-auth';
     return { error: out.error || `HTTP ${out.status}` };
-  });
+  }, upstream.model);
 
   if (!result.ok && !res.headersSent) {
     markFailed(res, { started, model: upstream.model, stream: isStream, errors: result.errors, req });
@@ -742,7 +851,7 @@ async function handleGemini(req, res) {
   const timeoutMs = Number(cfg.proxy?.timeoutMs) || DEFAULT_PROXY.timeoutMs;
   const signal = clientAbort(res);
 
-  const result = await runAcrossPool(pool, async (account, attempt) => {
+  const result = await runAcrossPool(orderPool(pool, upstream.model), async (account, attempt) => {
     if (isStream) {
       const up = await openUpstreamStream(account, upstream, { signal });
       sseHeaders(res);
@@ -776,7 +885,7 @@ async function handleGemini(req, res) {
     }
     if ((out.status === 401 || out.status === 403) && attempt === 0) return 'retry-auth';
     return { error: out.error || `HTTP ${out.status}` };
-  });
+  }, upstream.model);
 
   if (!result.ok && !res.headersSent) {
     markFailed(res, { started, model: upstream.model, stream: isStream, errors: result.errors, req });

@@ -514,8 +514,9 @@ export default function ProxyPage() {
             </div>
             <p className="mt-1.5 text-xs leading-5 text-zinc-500">
               开启后，本机其他 agent（Claude Code、Codex CLI、Gemini CLI、Cherry Studio、Cline、TRAE、小米 MiMo、豆包等）
-              把地址指向下面的 Base URL，就能用 WorkBuddy 账号的积分与模型额度发请求。请求按账号池轮询，
-              401 时自动刷新 token 并换号重试。桌面端当前登录的账号会自动排除在池外，
+              把地址指向下面的 Base URL，就能用 WorkBuddy 账号的积分与模型额度发请求。出站按「积分最早过期优先」
+              排序，先用快过期的积分；某账号对某模型撞限额时自动换号并冷却 10 分钟；401 时自动刷新 token 再重试。
+              桌面端当前登录的账号会自动排除在池外，
               避免同一账号被上游风控连坐（11128）导致官方客户端不可用。
             </p>
           </div>
