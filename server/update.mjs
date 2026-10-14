@@ -24,8 +24,8 @@ import { atomicWriteJson, cachePath } from './store/config.mjs';
 const PKG = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
 export const LOCAL_VERSION = String(PKG.version || '0.0.0');
 
-/** Release 所在仓库（与 package.json 的 repository 保持一致） */
-export const RELEASE_REPO = 'walter-io/workbuddy-free-token-manage';
+/** Release 所在仓库（GitHub 仓库已改名，发布与 Actions 都在 workbuddy-console） */
+export const RELEASE_REPO = 'walter-io/workbuddy-console';
 
 const CACHE_FILE_NAME = 'update-check.json';
 const CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 小时

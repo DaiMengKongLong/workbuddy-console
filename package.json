@@ -1,13 +1,13 @@
 {
   "name": "workbuddy-console",
   "private": true,
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "workbuddy控制台：账号切换、多平台免费模型广场、Token 与积分用量统计",
   "author": "walter-io",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/walter-io/workbuddy-free-token-manage.git"
+    "url": "git+https://github.com/walter-io/workbuddy-console.git"
   },
   "main": "electron/main.cjs",
   "type": "module",

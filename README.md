@@ -385,3 +385,8 @@ workbuddy-free-token-manage/
 │   └── test-growth.mjs          # 成长中心六模块 + 补登候选回归（官方接口用桩替换）
 └── electron/main.mjs        # 桌面壳（内嵌 Express + 窗口）
 ```
+
+## 许可证
+
+本项目基于 [MIT License](LICENSE) 开源，可自由使用、修改与分发。
+
