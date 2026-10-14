@@ -79,21 +79,23 @@ function VersionFooter() {
 
   const target = info?.downloadUrl || info?.releaseUrl || '';
   return (
-    <div className="flex items-center justify-between border-t border-zinc-100 pt-2.5">
-      <span className="text-[10px] font-medium tracking-wide text-zinc-300">workbuddy控制台</span>
-      <div className="flex items-center gap-1.5">
-        {info?.hasUpdate && target && (
-          <button
-            onClick={() => window.open(target, '_blank', 'noopener')}
-            title={`发现新版本 v${info.latest}${info.assetName ? `（${info.assetName}）` : ''}，点击前往下载`}
-            className="flex h-5 items-center gap-1 rounded-full bg-indigo-600 pl-1.5 pr-2 text-[10px] font-medium text-white transition-colors hover:bg-indigo-500"
-          >
-            <IconDownload className="h-3 w-3" />
-            升级 v{info.latest}
-          </button>
-        )}
-        <span className="text-[10px] tabular-nums text-zinc-300">{info ? `v${info.current}` : ''}</span>
+    <div className="space-y-1.5 border-t border-zinc-100 pt-2.5">
+      {/* 第一行：产品名 + 当前版本。两个字段一行刚好，不会被升级按钮挤到换行 */}
+      <div className="flex items-center justify-between gap-2">
+        <span className="min-w-0 truncate text-[10px] font-medium tracking-wide text-zinc-300">workbuddy控制台</span>
+        <span className="shrink-0 text-[10px] tabular-nums text-zinc-300">{info ? `v${info.current}` : ''}</span>
       </div>
+      {/* 第二行：升级按钮独立成通栏胶囊，宽度再窄也不与版本号打架 */}
+      {info?.hasUpdate && target && (
+        <button
+          onClick={() => window.open(target, '_blank', 'noopener')}
+          title={`发现新版本 v${info.latest}${info.assetName ? `（${info.assetName}）` : ''}，点击前往下载`}
+          className="flex h-5 w-full items-center justify-center gap-1 rounded-full bg-indigo-600 text-[10px] font-medium text-white transition-colors hover:bg-indigo-500"
+        >
+          <IconDownload className="h-3 w-3 shrink-0" />
+          <span className="whitespace-nowrap">升级到 v{info.latest}</span>
+        </button>
+      )}
     </div>
   );
 }
