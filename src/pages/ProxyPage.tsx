@@ -437,6 +437,70 @@ export default function ProxyPage() {
 
   return (
     <div className="space-y-5">
+      {/* 概览：累计请求等核心指标放最上方 */}
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+        <StatCard label="累计请求" value={fmtNumber(data.stats.total)} icon={<IconSwitch />} tone="indigo" />
+        <StatCard label="成功" value={fmtNumber(data.stats.ok)} accent="text-emerald-600" icon={<IconCheck />} tone="emerald" />
+        <StatCard label="失败" value={fmtNumber(data.stats.failed)} accent={data.stats.failed ? 'text-red-600' : undefined} icon={<IconWarning />} tone="rose" />
+        <StatCard
+          label="可用模型"
+          value={fmtNumber(data.models.ids.length)}
+          sub={data.models.fetchedAt ? `${fmtRelative(data.models.fetchedAt)}更新` : '未拉取'}
+          icon={<IconDatabase />}
+          tone="violet"
+        />
+      </div>
+
+      {/* 账号池：参与轮换的账号放最上方 */}
+      <PageSection
+        icon={<IconKey />}
+        title="参与轮换的账号"
+        count={`${data.poolCount}/${usableCount}`}
+        desc="只有扫码登录导入的账号（含明文凭据）能用于出站请求；桌面端当前登录的账号会被自动排除，避免同一账号被上游风控连坐"
+        actions={
+          <Button size="sm" variant="subtle" onClick={() => void load()}>
+            <IconRefresh className="w-3.5 h-3.5" />
+            刷新
+          </Button>
+        }
+      >
+        {data.accounts.length === 0 ? (
+          <EmptyState icon={<IconKey />} title="账号库里还没有账号" desc="请先到「账号管理」扫码添加或导入本机登录态" />
+        ) : (
+          <Card className="divide-y divide-zinc-100">
+            {data.accounts.map((a) => (
+              <label
+                key={a.id}
+                className={`flex flex-wrap items-center gap-3 px-4 py-3 ${a.usable && !a.isCurrentLogin ? 'cursor-pointer' : 'opacity-60'}`}
+              >
+                <input
+                  type="checkbox"
+                  checked={a.selected && a.usable && !a.isCurrentLogin}
+                  disabled={!a.usable || a.isCurrentLogin}
+                  onChange={(e) => void toggleAccount(a.id, e.target.checked)}
+                  className="accent-indigo-600 rounded"
+                />
+                <span className="min-w-0 flex-1 truncate text-sm text-zinc-800">{a.name}</span>
+                <Badge color="gray">{a.variantLabel}</Badge>
+                {a.isCurrentLogin && (
+                  <Badge color="blue" dot>
+                    桌面端登录中 · 不参与出站
+                  </Badge>
+                )}
+                {a.usable ? (
+                  <Badge color={a.expired ? 'amber' : 'green'} dot>
+                    {a.expired ? '凭据已过期（将自动刷新）' : '可用'}
+                  </Badge>
+                ) : (
+                  <Badge color="gray">无明文凭据，不可用</Badge>
+                )}
+                {a.expiresAt && <span className="text-[11px] text-zinc-400 tabular-nums">{fmtDateTime(a.expiresAt)} 过期</span>}
+              </label>
+            ))}
+          </Card>
+        )}
+      </PageSection>
+
       {/* 总开关 + 凭据 */}
       <Card className="p-5">
         <div className="flex flex-wrap items-start gap-4">
@@ -532,7 +596,7 @@ export default function ProxyPage() {
           <div className="mt-3">
             <Note tone="amber" title="当前账号池是空的">
               {eligibleCount > 0
-                ? '请在下方「参与轮换的账号」里至少勾选一个账号。'
+                ? '请在上方「参与轮换的账号」里至少勾选一个账号。'
                 : usableCount > 0
                   ? '可用的账号只有桌面端当前登录的那个——该账号不参与代理出站（避免同一账号被上游风控连坐官方客户端）。请先切换客户端登录账号，或再导入一个账号。'
                   : '账号库里没有可用于出站请求的账号（需要扫码登录导入的明文凭据），请先到「账号管理」添加。'}
@@ -540,70 +604,6 @@ export default function ProxyPage() {
           </div>
         )}
       </Card>
-
-      {/* 概览 */}
-      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-        <StatCard label="累计请求" value={fmtNumber(data.stats.total)} icon={<IconSwitch />} tone="indigo" />
-        <StatCard label="成功" value={fmtNumber(data.stats.ok)} accent="text-emerald-600" icon={<IconCheck />} tone="emerald" />
-        <StatCard label="失败" value={fmtNumber(data.stats.failed)} accent={data.stats.failed ? 'text-red-600' : undefined} icon={<IconWarning />} tone="rose" />
-        <StatCard
-          label="可用模型"
-          value={fmtNumber(data.models.ids.length)}
-          sub={data.models.fetchedAt ? `${fmtRelative(data.models.fetchedAt)}更新` : '未拉取'}
-          icon={<IconDatabase />}
-          tone="violet"
-        />
-      </div>
-
-      {/* 账号池 */}
-      <PageSection
-        icon={<IconKey />}
-        title="参与轮换的账号"
-        count={`${data.poolCount}/${usableCount}`}
-        desc="只有扫码登录导入的账号（含明文凭据）能用于出站请求；桌面端当前登录的账号会被自动排除，避免同一账号被上游风控连坐"
-        actions={
-          <Button size="sm" variant="subtle" onClick={() => void load()}>
-            <IconRefresh className="w-3.5 h-3.5" />
-            刷新
-          </Button>
-        }
-      >
-        {data.accounts.length === 0 ? (
-          <EmptyState icon={<IconKey />} title="账号库里还没有账号" desc="请先到「账号管理」扫码添加或导入本机登录态" />
-        ) : (
-          <Card className="divide-y divide-zinc-100">
-            {data.accounts.map((a) => (
-              <label
-                key={a.id}
-                className={`flex flex-wrap items-center gap-3 px-4 py-3 ${a.usable && !a.isCurrentLogin ? 'cursor-pointer' : 'opacity-60'}`}
-              >
-                <input
-                  type="checkbox"
-                  checked={a.selected && a.usable && !a.isCurrentLogin}
-                  disabled={!a.usable || a.isCurrentLogin}
-                  onChange={(e) => void toggleAccount(a.id, e.target.checked)}
-                  className="accent-indigo-600 rounded"
-                />
-                <span className="min-w-0 flex-1 truncate text-sm text-zinc-800">{a.name}</span>
-                <Badge color="gray">{a.variantLabel}</Badge>
-                {a.isCurrentLogin && (
-                  <Badge color="blue" dot>
-                    桌面端登录中 · 不参与出站
-                  </Badge>
-                )}
-                {a.usable ? (
-                  <Badge color={a.expired ? 'amber' : 'green'} dot>
-                    {a.expired ? '凭据已过期（将自动刷新）' : '可用'}
-                  </Badge>
-                ) : (
-                  <Badge color="gray">无明文凭据，不可用</Badge>
-                )}
-                {a.expiresAt && <span className="text-[11px] text-zinc-400 tabular-nums">{fmtDateTime(a.expiresAt)} 过期</span>}
-              </label>
-            ))}
-          </Card>
-        )}
-      </PageSection>
 
       {/* 模型 */}
       <PageSection

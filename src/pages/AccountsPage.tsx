@@ -156,6 +156,24 @@ function CreditPackageRow({ pkg }: { pkg?: CreditPackage }) {
   );
 }
 
+/**
+ * 状态占位行：与真实积分包行完全同构（同一套 grid、间距、进度条高度），
+ * 中间显示状态文案（查询中 / 余额不可用 / 暂无可用积分），
+ * 用来替代原来「一行小字」的状态展示——卡片在网格里等高、行与行左右对称对齐。
+ */
+function StatusPackageRow({ text }: { text: string }) {
+  return (
+    <div className="min-w-0">
+      <div className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-3 text-xs">
+        <span className="rounded-lg bg-zinc-100 px-2 py-1 tabular-nums text-zinc-300">—</span>
+        <span className="truncate text-zinc-400">{text}</span>
+        <span className="whitespace-nowrap tabular-nums text-zinc-300">—</span>
+      </div>
+      <div className="mt-1.5 h-1 rounded-full bg-zinc-100" />
+    </div>
+  );
+}
+
 /** 账号卡片：身份 + 积分余额 + 近期到期 + 操作条 */
 function AccountCard({
   account,
@@ -223,11 +241,17 @@ function AccountCard({
             <p className="mt-0.5 truncate font-mono text-xs leading-5 text-zinc-400" title={account.uid}>
               UID {account.uid}
             </p>
-            {/* 备注单独显示一行：即使展示名被「手机号/邮箱」占用，改完备注也能立刻看到 */}
-            {account.note && (
+            {/* 备注单独显示一行：即使展示名被「手机号/邮箱」占用，改完备注也能立刻看到。
+                没有备注时渲染同构的隐形占位行，保证每张卡片的头部等高、信息行对齐 */}
+            {account.note ? (
               <p className="mt-1 truncate text-xs leading-5 text-zinc-500" title={`备注：${account.note}`}>
                 <IconEdit className="mr-1 inline h-3 w-3 -mt-0.5 text-zinc-300" />
                 备注：{account.note}
+              </p>
+            ) : (
+              <p className="mt-1 truncate text-xs leading-5" aria-hidden="true">
+                <IconEdit className="mr-1 inline h-3 w-3 -mt-0.5" />
+                <span className="invisible">备注：占位</span>
               </p>
             )}
             <div className="mt-1.5 flex min-w-0 flex-wrap items-center gap-1.5">
@@ -239,62 +263,69 @@ function AccountCard({
       </header>
 
       <section className="flex min-w-0 flex-1 flex-col px-5 pb-5 pt-4">
-        {balanceLoading ? (
-          <div className="flex items-center gap-2 py-3 text-sm text-zinc-400">
-            <Spinner className="w-4 h-4" />
-            积分查询中…
-          </div>
-        ) : !balance ? (
-          <div className="flex min-w-0 items-center gap-2 py-3 text-sm text-zinc-400">
-            <IconInfo className="w-4 h-4 shrink-0" />
-            <span className="min-w-0 truncate" title={account.hasPlainToken ? '余额查询失败' : '该账号无可用凭据，无法查询余额'}>
-              {account.hasPlainToken ? '余额暂不可用' : '无可用凭据，无法查询余额'}
+        {/* 三个状态（查询中 / 不可用 / 正常）共用同一套结构：余额行 + 「近期到期」标签 + 两行积分包行。
+            没有数据的位置用同构占位行补齐，保证网格里每张卡片等高、信息行对称 */}
+        <div className="flex items-baseline gap-x-3 gap-y-1">
+          <span className="flex items-center gap-1.5">
+            <IconSparkles className="w-4 h-4 shrink-0 text-zinc-400" />
+            <strong className="text-[22px] font-semibold leading-none tracking-[-0.025em] tabular-nums text-zinc-900">
+              {balance ? fmtCredits(balance.remaining) : <span className="text-zinc-300">—</span>}
+            </strong>
+          </span>
+          <span className="text-xs text-zinc-400">{balance ? `${pkgTotal} 个积分包` : '—'}</span>
+          <div
+            className="ml-auto flex items-center gap-1.5 text-xs text-zinc-400"
+            title={
+              balanceLoading
+                ? '余额查询中'
+                : balance
+                  ? `共 ${fmtCredits(balance.total)}，已用 ${fmtCredits(balance.used)}`
+                  : account.hasPlainToken
+                    ? '余额查询失败'
+                    : '该账号无可用凭据，无法查询余额'
+            }
+          >
+            {balanceLoading ? <Spinner className="w-3.5 h-3.5" /> : <IconClock className="w-3.5 h-3.5 shrink-0" />}
+            <span className="whitespace-nowrap tabular-nums">
+              {balanceLoading ? '查询中…' : balance?.updatedAt ? `${fmtClock(balance.updatedAt)} 更新` : '—'}
             </span>
           </div>
-        ) : (
-          <>
-            <div className="flex items-baseline gap-x-3 gap-y-1">
-              <span className="flex items-center gap-1.5">
-                <IconSparkles className="w-4 h-4 shrink-0 text-zinc-400" />
-                <strong className="text-[22px] font-semibold leading-none tracking-[-0.025em] tabular-nums text-zinc-900">
-                  {fmtCredits(balance.remaining)}
-                </strong>
-              </span>
-              <span className="text-xs text-zinc-400">{pkgTotal} 个积分包</span>
-              <div
-                className="ml-auto flex items-center gap-1.5 text-xs text-zinc-400"
-                title={`共 ${fmtCredits(balance.total)}，已用 ${fmtCredits(balance.used)}`}
-              >
-                <IconClock className="w-3.5 h-3.5 shrink-0" />
-                <span className="whitespace-nowrap tabular-nums">
-                  {balance.updatedAt ? `${fmtClock(balance.updatedAt)} 更新` : '—'}
-                </span>
-              </div>
-            </div>
+        </div>
 
-            <div className="mt-4 flex items-center justify-between gap-2">
-              <span className="text-[11px] font-medium text-zinc-400">近期到期</span>
-              {pkgTotal > 2 && (
-                <button
-                  type="button"
-                  onClick={onShowPackages}
-                  className="inline-flex shrink-0 cursor-pointer items-center gap-1 text-[11px] font-medium text-indigo-600 transition-colors hover:text-indigo-500"
-                >
-                  查看全部积分包
-                  <IconArrowDown className="w-3 h-3 -rotate-90" />
-                </button>
-              )}
-            </div>
+        <div className="mt-4 flex items-center justify-between gap-2">
+          <span className="text-[11px] font-medium text-zinc-400">近期到期</span>
+          {balance && pkgTotal > 2 && (
+            <button
+              type="button"
+              onClick={onShowPackages}
+              className="inline-flex shrink-0 cursor-pointer items-center gap-1 text-[11px] font-medium text-indigo-600 transition-colors hover:text-indigo-500"
+            >
+              查看全部积分包
+              <IconArrowDown className="w-3 h-3 -rotate-90" />
+            </button>
+          )}
+        </div>
 
-            <div className="mt-4 space-y-2.5">
-              {pkgTotal === 0 ? (
-                <div className="py-1 text-[11px] text-zinc-400">暂无可用积分</div>
-              ) : (
-                [0, 1].map((i) => <CreditPackageRow key={i} pkg={pkgs[i]} />)
-              )}
-            </div>
-          </>
-        )}
+        <div className="mt-4 space-y-2.5">
+          {balanceLoading ? (
+            <>
+              <StatusPackageRow text="积分查询中…" />
+              <CreditPackageRow />
+            </>
+          ) : !balance ? (
+            <>
+              <StatusPackageRow text={account.hasPlainToken ? '余额暂不可用' : '无可用凭据，无法查询余额'} />
+              <CreditPackageRow />
+            </>
+          ) : pkgTotal === 0 ? (
+            <>
+              <StatusPackageRow text="暂无可用积分" />
+              <CreditPackageRow />
+            </>
+          ) : (
+            [0, 1].map((i) => <CreditPackageRow key={i} pkg={pkgs[i]} />)
+          )}
+        </div>
       </section>
 
       <footer className="flex flex-wrap items-center gap-2 border-t border-zinc-100 px-5 py-2.5">
