@@ -182,7 +182,16 @@ export async function checkForUpdate({ force = false } = {}) {
   const now = Date.now();
   const cached = readCache();
   if (!force && cached && now - Number(cached.checkedAt || 0) < CACHE_TTL_MS) {
-    return { ...cached, cached: true };
+    // ⚠️ 缓存里的 current 是「写入缓存那一刻」的本机版本。用户升级应用后（进程重启、
+    // LOCAL_VERSION 已变），6 小时内若直接沿用缓存的 current，界面会一直显示旧版本号，
+    // 且 hasUpdate 是按旧 current 算的（升级后按钮还会错误地继续挂着）。
+    // latest 来自远端不受升级影响，可以沿用；current 与 hasUpdate 必须按本机现值重算。
+    return {
+      ...cached,
+      current: LOCAL_VERSION,
+      hasUpdate: compareVersions(cached.latest, LOCAL_VERSION) > 0,
+      cached: true,
+    };
   }
 
   const fresh = await fetchLatest();
