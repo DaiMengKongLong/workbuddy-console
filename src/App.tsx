@@ -93,7 +93,7 @@ function VersionFooter() {
           className="flex h-5 w-full items-center justify-center gap-1 rounded-full bg-indigo-600 text-[10px] font-medium text-white transition-colors hover:bg-indigo-500"
         >
           <IconDownload className="h-3 w-3 shrink-0" />
-          <span className="whitespace-nowrap">升级到 v{info.latest}</span>
+          <span className="whitespace-nowrap">升级</span>
         </button>
       )}
     </div>
