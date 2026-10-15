@@ -41,6 +41,7 @@ import type {
   AccountsResponse,
   AppStopResult,
   CreditBalance,
+  CreditDetailsResponse,
   CreditPackage,
   LoadedInfo,
   OAuthPollResult,
@@ -82,6 +83,17 @@ function fmtPkgExpiry(ts: number | null | undefined): string {
   return `${String(d.getMonth() + 1).padStart(2, '0')}/${String(d.getDate()).padStart(2, '0')} ${hh}:${mm}`;
 }
 
+/** 明细行用的完整时刻：2026/10/15 11:40:29（与官方客户端「积分明细」一致，精确到秒） */
+function fmtFullDateTime(ts: number | null | undefined): string {
+  if (!ts) return '—';
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return '—';
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mm = String(d.getMinutes()).padStart(2, '0');
+  const ss = String(d.getSeconds()).padStart(2, '0');
+  return `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, '0')}/${String(d.getDate()).padStart(2, '0')} ${hh}:${mm}:${ss}`;
+}
+
 /** 余额更新时刻：只到分 */
 function fmtClock(ts: number | null | undefined): string {
   if (!ts) return '—';
@@ -101,12 +113,27 @@ function Avatar({ name, seed, size = 'md' }: { name: string; seed: string; size?
   );
 }
 
-/** 还有剩余的积分包，按到期时间升序 */
+/**
+ * 卡片上展示的积分包：**全部包**（含 0 剩余的），按官方客户端的类别顺序排列，
+ * 同类别按到期时间升序。
+ *
+ * 与官方客户端对齐：客户端会把已用完的「套餐基础积分」（如 0/500）也列出来，
+ * 之前在这里过滤掉 0 剩余的包，导致卡片上"看不到套餐基础积分"。
+ * 排序遵循客户端的三分类顺序：套餐基础积分 → 平台奖励积分 → 购买积分。
+ */
+const PACKAGE_CATEGORY_ORDER: Record<string, number> = {
+  套餐基础积分: 0,
+  平台奖励积分: 1,
+  购买积分: 2,
+};
+
 function usablePackages(balance: CreditBalance | null | undefined): CreditPackage[] {
   return (balance?.packages || [])
-    .filter((p) => p.remaining > 0 && !p.expired)
     .slice()
     .sort((a, b) => {
+      const ca = PACKAGE_CATEGORY_ORDER[a.name] ?? 3;
+      const cb = PACKAGE_CATEGORY_ORDER[b.name] ?? 3;
+      if (ca !== cb) return ca - cb;
       const ea = a.expireAt ?? Number.POSITIVE_INFINITY;
       const eb = b.expireAt ?? Number.POSITIVE_INFINITY;
       return ea === eb ? 0 : ea < eb ? -1 : 1;
@@ -293,14 +320,14 @@ function AccountCard({
         </div>
 
         <div className="mt-4 flex items-center justify-between gap-2">
-          <span className="text-[11px] font-medium text-zinc-400">近期到期</span>
-          {balance && pkgTotal > 2 && (
+          <span className="text-[11px] font-medium text-zinc-400">积分明细</span>
+          {balance && pkgTotal > 0 && (
             <button
               type="button"
               onClick={onShowPackages}
               className="inline-flex shrink-0 cursor-pointer items-center gap-1 text-[11px] font-medium text-indigo-600 transition-colors hover:text-indigo-500"
             >
-              查看全部积分包
+              查看全部
               <IconArrowDown className="w-3 h-3 -rotate-90" />
             </button>
           )}
@@ -828,59 +855,184 @@ function ScanAddDialog({
   );
 }
 
-/** 全部积分包弹窗 */
+/**
+ * 积分明细弹窗：逐笔列出官方明细接口的发放记录（与官方客户端「积分明细」同形）。
+ *
+ * 打开时请求 `/api/accounts/credit-details`（服务端缓存 5 分钟）；按
+ * 「有效期内 / 已过期」两个 tab 分组，行内展示包名、到期时刻（精确到秒）
+ * 与「已使用 x/y」进度条。明细查询失败时回落到汇总包视图并提示原因。
+ */
 function PackagesDialog({ account, balance, onClose }: { account: AccountInfo | null; balance: CreditBalance | null; onClose: () => void }) {
+  const [details, setDetails] = useState<CreditDetailsResponse | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  /** tab：'active' = 有效期内（含长期有效），'expired' = 已过期 */
+  const [tab, setTab] = useState<'active' | 'expired'>('active');
+
+  useEffect(() => {
+    if (!account) {
+      setDetails(null);
+      setError(null);
+      setTab('active');
+      return;
+    }
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    setDetails(null);
+    setTab('active');
+    get<CreditDetailsResponse>(`/api/accounts/credit-details?id=${encodeURIComponent(account.id)}`, { timeoutMs: TIMEOUT.quota })
+      .then((r) => {
+        if (!cancelled) setDetails(r);
+      })
+      .catch((e: any) => {
+        if (!cancelled) setError(e?.message || '明细查询失败');
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [account]);
+
   if (!account) return null;
-  const all = (balance?.packages || [])
-    .slice()
-    .sort((a, b) => {
-      const ea = a.expireAt ?? Number.POSITIVE_INFINITY;
-      const eb = b.expireAt ?? Number.POSITIVE_INFINITY;
-      return ea === eb ? 0 : ea < eb ? -1 : 1;
-    });
+
+  const records = details?.records || [];
+  const active = records.filter((r) => !r.expired);
+  const expired = records.filter((r) => r.expired);
+  const shown = tab === 'active' ? active : expired;
 
   return (
     <Modal
       open={!!account}
       onClose={onClose}
-      title="全部积分包"
-      subtitle={`${account.name} · 共 ${all.length} 个积分包`}
+      title="积分明细"
+      subtitle={
+        balance
+          ? `${account.name} · 剩余 ${fmtCredits(balance.remaining)} / 总额 ${fmtCredits(balance.total)} · 已用 ${fmtCredits(balance.used)}`
+          : account.name
+      }
       footer={<Button onClick={onClose}>关闭</Button>}
     >
-      {all.length === 0 ? (
-        <div className="py-6 text-center text-sm text-zinc-400">当前没有可展示的积分包。</div>
+      {loading ? (
+        <div className="flex items-center justify-center gap-2 py-10 text-sm text-zinc-400">
+          <Spinner className="w-4 h-4" />
+          正在获取逐笔明细…
+        </div>
+      ) : error ? (
+        <div className="space-y-3">
+          <div className="rounded-xl border border-amber-200 bg-amber-50 px-3.5 py-2.5 text-xs text-amber-800">
+            逐笔明细获取失败：{error}。以下为按包汇总的视图。
+          </div>
+          <PackagesFallback account={account} balance={balance} />
+        </div>
+      ) : records.length === 0 ? (
+        <div className="py-6 text-center text-sm text-zinc-400">当前没有积分明细记录。</div>
       ) : (
-        <div className="max-h-[60vh] min-w-0 overflow-y-auto divide-y divide-zinc-100">
-          {all.map((p, i) => {
-            const ratio = p.total > 0 ? Math.min(100, Math.max(0, (p.remaining / p.total) * 100)) : 0;
-            return (
-              <div key={`${p.packageCode || 'pkg'}-${i}`} className="min-w-0 py-3 first:pt-0 last:pb-0">
-                <div className="flex min-w-0 items-start justify-between gap-3">
-                  <div className="min-w-0">
-                    <div className="truncate text-sm font-medium text-zinc-800">{p.name}</div>
-                    <div className="mt-1 text-[11px] text-zinc-400">
-                      {p.expired ? '已到期' : p.expireAt ? `到期 ${fmtDateTime(p.expireAt)}` : '长期有效'}
-                    </div>
+        <div className="min-w-0">
+          {/* 分组 tab：与官方客户端一致（有效期内 / 已过期） */}
+          <div className="mb-4 grid grid-cols-2 gap-1 rounded-xl bg-zinc-100 p-1">
+            {(
+              [
+                { key: 'active' as const, label: `有效期内 ${active.length}` },
+                { key: 'expired' as const, label: `已过期 ${expired.length}` },
+              ]
+            ).map((t) => (
+              <button
+                key={t.key}
+                type="button"
+                onClick={() => setTab(t.key)}
+                className={`h-8 cursor-pointer rounded-lg text-xs font-medium transition-all ${
+                  tab === t.key ? 'bg-white text-zinc-900 shadow-sm' : 'text-zinc-500 hover:text-zinc-700'
+                }`}
+              >
+                {t.label}
+              </button>
+            ))}
+          </div>
+
+          <div className="max-h-[55vh] min-w-0 space-y-3 overflow-y-auto pr-1">
+            {shown.map((r, i) => {
+              const ratio = r.total > 0 ? Math.min(100, Math.max(0, (r.used / r.total) * 100)) : 0;
+              return (
+                <div key={`${r.packageCode || 'rec'}-${i}`} className="min-w-0">
+                  <div className="truncate text-sm font-medium text-zinc-800">{r.name}</div>
+                  <div className="mt-0.5 flex min-w-0 items-baseline justify-between gap-3 text-xs">
+                    <span className="shrink-0 text-zinc-500">
+                      {r.expireAt ? `到期时间 ${fmtFullDateTime(r.expireAt)}` : '长期有效'}
+                    </span>
+                    <span className={`shrink-0 tabular-nums ${r.expired ? 'text-zinc-400' : 'text-zinc-700'}`}>
+                      已使用 {fmtCredits(r.used)}/{fmtCredits(r.total)}
+                    </span>
                   </div>
-                  <div className="shrink-0 text-right text-xs">
-                    <div className="font-medium tabular-nums text-zinc-700">
-                      {fmtCredits(p.remaining)} / {fmtCredits(p.total)}
-                    </div>
-                    <div className="mt-1 text-[11px] text-zinc-400">已用 {fmtCredits(p.used)}</div>
+                  <div className="mt-1.5 h-1.5 overflow-hidden rounded-full bg-zinc-100">
+                    <div
+                      className={`h-full rounded-full ${r.expired ? 'bg-zinc-300' : 'bg-emerald-500'}`}
+                      style={{ width: `${ratio}%` }}
+                    />
                   </div>
                 </div>
-                <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-zinc-100">
-                  <div
-                    className={`h-full rounded-full ${p.expired ? 'bg-red-400/70' : p.expiringSoon ? 'bg-amber-500/80' : 'bg-indigo-500/75'}`}
-                    style={{ width: `${ratio}%` }}
-                  />
-                </div>
+              );
+            })}
+            {shown.length === 0 && (
+              <div className="py-6 text-center text-sm text-zinc-400">
+                {tab === 'expired' ? '没有已过期的记录。' : '有效期内没有记录。'}
               </div>
-            );
-          })}
+            )}
+          </div>
         </div>
       )}
     </Modal>
+  );
+}
+
+/** 明细接口失败时的回落视图：按包汇总展示（旧「全部积分包」的内容） */
+function PackagesFallback({ account, balance }: { account: AccountInfo; balance: CreditBalance | null }) {
+  const all = (balance?.packages || [])
+    .slice()
+    .sort((a, b) => {
+      const ca = PACKAGE_CATEGORY_ORDER[a.name] ?? 3;
+      const cb = PACKAGE_CATEGORY_ORDER[b.name] ?? 3;
+      if (ca !== cb) return ca - cb;
+      const ea = a.expireAt ?? Number.POSITIVE_INFINITY;
+      const eb = b.expireAt ?? Number.POSITIVE_INFINITY;
+      return ea === eb ? 0 : ea < eb ? -1 : 1;
+    });
+
+  if (all.length === 0) {
+    return <div className="py-6 text-center text-sm text-zinc-400">当前没有可展示的积分包。</div>;
+  }
+  return (
+    <div className="min-w-0 divide-y divide-zinc-100">
+      {all.map((p, i) => {
+        const ratio = p.total > 0 ? Math.min(100, Math.max(0, (p.remaining / p.total) * 100)) : 0;
+        return (
+          <div key={`${p.packageCode || 'pkg'}-${i}`} className="min-w-0 py-3 first:pt-0 last:pb-0">
+            <div className="flex min-w-0 items-start justify-between gap-3">
+              <div className="min-w-0">
+                <div className="truncate text-sm font-medium text-zinc-800">{p.name}</div>
+                <div className="mt-1 text-[11px] text-zinc-400">
+                  {p.expired ? '已到期' : p.expireAt ? `到期 ${fmtDateTime(p.expireAt)}` : '长期有效'}
+                </div>
+              </div>
+              <div className="shrink-0 text-right text-xs">
+                <div className="font-medium tabular-nums text-zinc-700">
+                  {fmtCredits(p.remaining)} / {fmtCredits(p.total)}
+                </div>
+                <div className="mt-1 text-[11px] text-zinc-400">已用 {fmtCredits(p.used)}</div>
+              </div>
+            </div>
+            <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-zinc-100">
+              <div
+                className={`h-full rounded-full ${p.expired ? 'bg-red-400/70' : p.expiringSoon ? 'bg-amber-500/80' : 'bg-indigo-500/75'}`}
+                style={{ width: `${ratio}%` }}
+              />
+            </div>
+          </div>
+        );
+      })}
+    </div>
   );
 }
 
@@ -1075,11 +1227,15 @@ function SessionCopyDialog({
     setReport(null);
     try {
       if (mode === 'switch') {
-        const r = await post<SwitchAccountResult>('/api/accounts/switch', {
-          id: target.id,
-          copySessionIds: ids,
-          stopApp,
-        });
+        const r = await post<SwitchAccountResult>(
+          '/api/accounts/switch',
+          {
+            id: target.id,
+            copySessionIds: ids,
+            stopApp,
+          },
+          { timeoutMs: TIMEOUT.switch }
+        );
         const rep = r?.sessionCopy || null;
         const failed = rep?.errors?.length || 0;
         const reopenFailed = r?.relaunch ? r.relaunch.launched === false : false;
@@ -1097,11 +1253,15 @@ function SessionCopyDialog({
         else onClose();
         return;
       }
-      const rep = await post<SessionCopyReport>('/api/sessions/copy', {
-        accountId: target.id,
-        ids,
-        stopApp,
-      });
+      const rep = await post<SessionCopyReport>(
+        '/api/sessions/copy',
+        {
+          accountId: target.id,
+          ids,
+          stopApp,
+        },
+        { timeoutMs: TIMEOUT.switch }
+      );
       setReport(rep);
       const reopenFailed = rep.relaunch ? rep.relaunch.launched === false : false;
       const procNote = rep.appStop?.wasRunning
@@ -1311,6 +1471,14 @@ function SessionCopyDialog({
                 个会话的新名字已回写到本账号的原会话（客户端会给导入的副本重新生成自动标题，原会话带上固定名后不再被覆盖）。
               </div>
             )}
+            {!!report.contentSynced?.length && (
+              <div className="text-[11px] text-emerald-700">
+                内容同步：<b className="tabular-nums">{report.contentSynced.length}</b>{' '}
+                个往返副本里新聊的内容（共{' '}
+                <b className="tabular-nums">{report.contentSynced.reduce((s, c) => s + c.appendedLines, 0)}</b> 行）已
+                合并回本账号的原会话，不会再重复复制出新会话。
+              </div>
+            )}
             {report.errors.length > 0 && (
               <ul className="max-h-32 space-y-0.5 overflow-y-auto text-[11px] text-red-600">
                 {report.errors.slice(0, 50).map((e) => (
@@ -1432,11 +1600,15 @@ export default function AccountsPage() {
   const switchNow = async (account: AccountInfo, copySessionIds: string[] = [], stopApp = true) => {
     setBusyId(account.id);
     try {
-      const r = await post<SwitchAccountResult>('/api/accounts/switch', {
-        id: account.id,
-        copySessionIds: copySessionIds.length ? copySessionIds : undefined,
-        stopApp,
-      });
+      const r = await post<SwitchAccountResult>(
+        '/api/accounts/switch',
+        {
+          id: account.id,
+          copySessionIds: copySessionIds.length ? copySessionIds : undefined,
+          stopApp,
+        },
+        { timeoutMs: TIMEOUT.switch }
+      );
       const copied = r?.sessionCopy?.copied.length || 0;
       const wasStopped = !!r?.appStop?.wasRunning;
       const reopenFailed = r?.relaunch ? r.relaunch.launched === false : false;

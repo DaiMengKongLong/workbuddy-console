@@ -252,6 +252,33 @@ function parseStartTime(v) {
   return Number.isFinite(t) ? t : null;
 }
 
+/** PowerShell 的候选启动方式：PATH 里的 powershell.exe + 系统绝对路径兜底 */
+const POWERSHELL_CANDIDATES = [
+  'powershell.exe',
+  'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe',
+];
+
+/**
+ * 按候选列表依次尝试启动 PowerShell。
+ *
+ * 打包安装后的 Electron 应用环境变量可能与开发时不同（个别机器 PATH 里
+ * 找不到 powershell.exe，报 ENOENT → 界面显示"PowerShell 不可用"），
+ * 但 System32 下的绝对路径在所有 Windows 上都存在，作为兜底足够稳。
+ */
+async function runPowerShell(args, timeoutMs = 15000) {
+  let lastErr;
+  for (const cmd of POWERSHELL_CANDIDATES) {
+    try {
+      return await run(cmd, args, timeoutMs);
+    } catch (err) {
+      lastErr = err;
+      // ENOENT（找不到可执行文件）才值得换下一个候选；其他错误（超时/权限）换路径也没用
+      if (err?.code !== 'ENOENT') throw err;
+    }
+  }
+  throw lastErr;
+}
+
 /**
  * Windows 主路径：枚举**全部**匹配进程，按启动时间升序。
  * 对默认进程名来说，第一个就是主进程（Electron 的渲染/GPU/工具进程都是它的子进程）。
@@ -262,7 +289,7 @@ async function listViaPowerShell(names = WORKBUDDY_PROCESS_NAMES) {
   const ps =
     `Get-Process -Name ${names.join(',')} -ErrorAction SilentlyContinue | ` +
     `Select-Object Id,ProcessName,Path,StartTime | ConvertTo-Json -Compress`;
-  const stdout = await run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], 15000);
+  const stdout = await runPowerShell(['-NoProfile', '-NonInteractive', '-Command', ps], 15000);
   const t = stdout.trim();
   if (!t) return [];
   const parsed = JSON.parse(t);
@@ -362,14 +389,16 @@ export async function detectWorkbuddyProcess({ names = WORKBUDDY_PROCESS_NAMES }
       probed = true;
       if (r) return r;
     } catch (err) {
-      failures.push(`PowerShell 不可用（${shortExecError(err)}）`);
+      // 记录失败原因仅用于全失败时的 error 汇总；tasklist 兜底成功后不再对外透出
+      // ——探测已完成、结果可信，把内部降级细节摆给用户只会造成误导（实测反馈 2026-10）
+      failures.push(`PowerShell 探测失败（${shortExecError(err)}）`);
     }
     try {
       const r = await detectViaTasklist(names);
       probed = true;
-      if (r) return { ...r, warning: failures.length ? failures.join('；') : null };
+      if (r) return r;
     } catch (err) {
-      failures.push(`tasklist 不可用（${shortExecError(err)}）`);
+      failures.push(`tasklist 探测失败（${shortExecError(err)}）`);
     }
 
     /**
@@ -381,9 +410,10 @@ export async function detectWorkbuddyProcess({ names = WORKBUDDY_PROCESS_NAMES }
      * 界面还显示一句把人往"手动退出"引的误导文案。实测踩过。
      *
      * 安全性没有降低：全都被拦（probed === false）时仍然返回 error，调用方照旧保守拒绝。
+     * 曾在此处给"有降级"的确定答案附带 warning，用户反馈同样误导（2026-10），已去掉。
      */
     if (probed) {
-      return { running: false, platform, error: null, warning: failures.length ? failures.join('；') : null };
+      return { running: false, platform, error: null, warning: null };
     }
     return { running: false, platform, error: failures.join('; ') };
   }
@@ -440,9 +470,9 @@ export async function listWorkbuddyProcesses({ names = WORKBUDDY_PROCESS_NAMES }
               processes: rows,
               method: 'tasklist',
               complete: false,
-              warning: `PowerShell 不可用（${psError}），改用 tasklist（拿不到启动时间，会靠进程树兜底）`,
+              warning: `已改用 tasklist 完成检测（PowerShell 暂不可用：${psError}），拿不到启动时间，会靠进程树兜底`,
             }
-          : { processes: [], method: 'tasklist', warning: `PowerShell 不可用（${psError}）` };
+          : { processes: [], method: 'tasklist', warning: `已改用 tasklist 完成检测（PowerShell 暂不可用：${psError}）` };
       } catch (err2) {
         return { processes: [], error: `PowerShell（${psError}）与 tasklist（${shortExecError(err2)}）都不可用` };
       }

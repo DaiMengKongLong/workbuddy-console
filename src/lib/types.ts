@@ -365,6 +365,8 @@ export interface SessionCopyReport {
   errors: { id: string; error: string }[];
   /** 往返复制时回写到原会话的改名（源会话是本账号某会话的副本时触发） */
   titleSynced?: { sourceId: string; originId: string; title: string }[];
+  /** 往返复制时追加回原会话正文的增量内容（副本里新聊的消息原位合并） */
+  contentSynced?: { sourceId: string; originId: string; appendedLines: number; bytes: number }[];
   totalBytes: number;
   backupPath: string;
   appStop: AppStopResult | null;
@@ -413,6 +415,30 @@ export interface CreditBalance {
   packages: CreditPackage[];
   /** 余额最近一次成功查询的时刻 */
   updatedAt: number | null;
+}
+
+/** 单笔积分发放记录（官方 paid/free-packages 明细接口，「积分明细」弹窗逐行展示） */
+export interface CreditRecord {
+  packageCode: string | null;
+  name: string;
+  /** 到期时刻（毫秒时间戳）；null = 长期有效 */
+  expireAt: number | null;
+  cycleEnd: number | null;
+  /** 该笔的总额度（周期口径优先，单笔口径兜底） */
+  total: number;
+  used: number;
+  remaining: number;
+  createTime: number | null;
+  expired: boolean;
+}
+
+export interface CreditDetailsResponse {
+  accountId: string;
+  accountName: string;
+  variant: string;
+  collectedAt: number;
+  records: CreditRecord[];
+  cached?: boolean;
 }
 
 export interface CreditAccountRow {

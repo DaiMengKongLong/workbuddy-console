@@ -14,6 +14,12 @@ export const TIMEOUT = {
   stats: 300_000,
   /** 积分统计：需要逐账号分页扫官方用量接口，30 天窗口较慢 */
   credits: 240_000,
+  /**
+   * 切换账号/复制会话：单会话体积可达几十 MB，且要先优雅退出 WorkBuddy 再重启，
+   * 大批量复制 + 进程启停全程可能超过 1 分钟。此前沿用 25 秒默认值，
+   * 实测（0.2.2）复制几十个会话必然超时中断，但服务端其实还在继续干活。
+   */
+  switch: 600_000,
 } as const;
 
 export type ApiFailure = Error & { offline?: boolean; status?: number };

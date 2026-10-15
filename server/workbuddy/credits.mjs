@@ -17,6 +17,7 @@ import {
   loadAccounts,
   accountDisplayName,
   secretValue,
+  findAccount,
   CREDIT_SNAPSHOTS_FILE,
   OFFICIAL_USAGE_CACHE_FILE,
   readJsonFile,
@@ -264,32 +265,36 @@ export function recordSnapshot(account, total, remaining) {
 /**
  * 商品码 → 官方中文名。
  *
- * 来源与 workbuddy-switch 一致（官方客户端 asar 内的 package-name-resolver.ts）：
- * 国内版不直接用后端下发的 PackageName（那是运营原文），统一按商品码映射成前端文案，
- * 国际版才用 PackageName。未登记的商品码保持回落链，不会漏展示。
+ * 与官方客户端展示文案对齐（客户端把积分分成三类展示：套餐基础积分 / 平台奖励积分 / 购买积分）：
+ * - 套餐内基础额度（原"版本基础用量"系列）→ 套餐基础积分
+ * - 活动/裂变/赠送包 → 平台奖励积分
+ * - 付费购买的积分包 → 购买积分
+ *
+ * 来源：官方客户端 asar 内的 package-name-resolver.ts + 实机截图比对（2026-10）。
+ * 国际版才用后端下发的 PackageName。未登记的商品码保持回落链，不会漏展示。
  * 官方新增商品码时需手工同步。
  */
 const CREDIT_PACKAGE_NAMES = {
   TCACA_code_001_PqouKr6QWV: 'CodeBuddy 个人体验版',
-  TCACA_code_002_AkiJS3ZHF5: '版本基础用量',
+  TCACA_code_002_AkiJS3ZHF5: '套餐基础积分',
   TCACA_code_003_FAnt7lcmRT: 'CodeBuddy 个人标准版',
-  TCACA_code_005_maRGyrHhw1: '版本基础用量',
+  TCACA_code_005_maRGyrHhw1: '套餐基础积分',
   TCACA_code_006_DbXS0lrypC: 'CodeBuddy 个人体验版',
   TCACA_code_007_nzdH5h4Nl0: '平台奖励积分',
-  TCACA_code_008_cfWoLwvjU4: '版本基础用量',
+  TCACA_code_008_cfWoLwvjU4: '套餐基础积分',
   TCACA_code_009_0XmEQc2xOf: '购买积分',
-  TCACA_code_023_4xbGhMrE6q: '版本基础用量',
-  TCACA_code_026_BaESVICNoi: '版本基础用量',
-  TCACA_code_027_0FCGVA6vSa: '版本基础用量',
-  TCACA_code_028_NtpWi0jzXs: '版本赠送用量',
+  TCACA_code_023_4xbGhMrE6q: '套餐基础积分',
+  TCACA_code_026_BaESVICNoi: '套餐基础积分',
+  TCACA_code_027_0FCGVA6vSa: '套餐基础积分',
+  TCACA_code_028_NtpWi0jzXs: '平台奖励积分',
   TCACA_code_029_6wCGEWquYy: '平台奖励积分',
   TCACA_code_030_BjSt89qTvr: '平台奖励积分',
-  TCACA_code_035_ArVxJcGDsm: '版本基础用量',
-  TCACA_code_036_lupO5WgNdG: '版本赠送用量',
-  TCACA_code_037_WxOD3MpI2o: '版本赠送用量',
+  TCACA_code_035_ArVxJcGDsm: '套餐基础积分',
+  TCACA_code_036_lupO5WgNdG: '平台奖励积分',
+  TCACA_code_037_WxOD3MpI2o: '平台奖励积分',
   TCACA_code_038_OhvqZtiPKr: '购买积分',
-  TCACA_code_039_KRcQj7wUat: '版本基础用量',
-  TCACA_code_040_mi9rCYg46x: '版本基础用量',
+  TCACA_code_039_KRcQj7wUat: '套餐基础积分',
+  TCACA_code_040_mi9rCYg46x: '套餐基础积分',
 };
 
 /** 到期时间早于「扣除结束时间 + 该天数」时改用周期结束时间（视前者为长期占位） */
@@ -372,8 +377,13 @@ function parseTimestampMs(value) {
 /**
  * 解析单个资源包的到期时刻。
  *
- * 优先 DeductionEndTime / ExpiredTime；仅当 CycleEndTime 比其早超过 30 天时
- * 改用周期结束时间（前者是长期占位）。最终值距现在超过 365 天视为长期有效。
+ * 优先 DeductionEndTime / ExpiredTime；仅当 CycleEndTime 比其早 **≥30 天** 时
+ * 改用周期结束时间（前者是长期占位）。
+ *
+ * ⚠️ 必须是 ≥ 而不是 >：实测（2026-10，code_007 平台奖励积分 66 条记录）
+ * DeductionEndTime 恰好等于 CycleEndTime + 整 30 天（2,592,000,000ms），
+ * 用 > 会导致整 30 天的占位值漏判，到期时间普遍多算一个月。
+ * 最终值距现在超过 365 天视为长期有效。
  */
 function resolveExpireAt(raw, now) {
   const deductionEnd = parseTimestampMs(
@@ -382,7 +392,7 @@ function resolveExpireAt(raw, now) {
   const cycleEnd = parseTimestampMs(firstValue(raw, ['CycleEndTime', 'cycleEndTime']));
   const overrideMs = EXPIRY_CYCLE_OVERRIDE_DAYS * 24 * 3600 * 1000;
   let expireAt = null;
-  if (deductionEnd != null && cycleEnd != null && deductionEnd - cycleEnd > overrideMs) {
+  if (deductionEnd != null && cycleEnd != null && deductionEnd - cycleEnd >= overrideMs) {
     expireAt = cycleEnd;
   } else if (deductionEnd != null) {
     expireAt = deductionEnd;
@@ -416,14 +426,15 @@ async function fetchPackageExpiryMap(account, origin) {
     PackageCodes: PAID_PACKAGE_CODES,
     NeedRenewInfo: true,
   };
-  const today = dateStr(new Date());
+  // ⚠️ 不带 SlicePeriodStartTime/EndTime：实测（2026-10）带当天切片会漏掉
+  // 月度套餐包（如 code_008 套餐基础积分）的记录，导致"套餐基础积分"没有到期时间。
+  // 不带切片时返回全部历史记录（含已用完/已过期的），PageSize 200 内由 consider 过滤。
   const freeBody = {
     PageNumber: 1,
     PageSize: 200,
     Status: [0, 3],
     PackageCodes: FREE_PACKAGE_CODES,
-    SlicePeriodStartTime: `${today} 00:00:00`,
-    SlicePeriodEndTime: `${today} 23:59:59`,
+    NeedRenewInfo: true,
   };
 
   const [paidRes, freeRes] = await Promise.allSettled([
@@ -619,6 +630,130 @@ export async function getAccountBalances({ refresh = false } = {}) {
     errors,
   };
   balanceCache = { at: now, payload };
+  return { ...payload, cached: false };
+}
+
+/* ---------------- 逐笔积分明细（官方客户端的「积分明细」弹窗） ---------------- */
+
+/** 单账号逐笔明细的进程内缓存：accountId → { at, payload } */
+const detailsCache = new Map();
+const DETAILS_CACHE_TTL_MS = 5 * 60 * 1000;
+/** 单账号明细接口返回的记录上限（明细是逐笔成交记录，裂变包账号可能有几十上百条） */
+const DETAILS_MAX_RECORDS = 500;
+
+/**
+ * 拉取单账号的**逐笔**积分明细（官方客户端「积分明细」弹窗的数据源）。
+ *
+ * 与 fetchBalance 的区别：汇总接口只给「每类包一个总数」，而明细接口返回每一笔
+ * 发放记录（各自的到期时间与用量）——客户端弹窗里每行一条「到期时间 2026/10/15
+ * 11:40:29 · 已使用 6/6」就是这里的原始记录。
+ *
+ * 请求形态与 fetchPackageExpiryMap 相同（带 PackageCodes、不带当天切片），但
+ * **不过滤**已用完/已过期的记录：客户端的「已过期」tab 依赖它们。
+ */
+async function fetchCreditRecords(account) {
+  const variant = variantOf(account);
+  const origin = variant.apiEndpoint;
+  const now = Date.now();
+
+  const paidBody = {
+    PageNumber: 1,
+    PageSize: 200,
+    Status: [0, 3],
+    PackageCodes: PAID_PACKAGE_CODES,
+    NeedRenewInfo: true,
+  };
+  const freeBody = {
+    PageNumber: 1,
+    PageSize: 200,
+    Status: [0, 3],
+    PackageCodes: FREE_PACKAGE_CODES,
+    NeedRenewInfo: true,
+  };
+
+  const [paidRes, freeRes] = await Promise.allSettled([
+    authenticatedPost(account, origin + RESOURCE_PAID_PACKAGES_PATH, paidBody),
+    authenticatedPost(account, origin + RESOURCE_FREE_PACKAGES_PATH, freeBody),
+  ]);
+
+  const records = [];
+  const collect = (settled) => {
+    if (settled.status !== 'fulfilled') return;
+    let data;
+    try {
+      data = unwrap(settled.value);
+    } catch {
+      return; // 单侧失败不影响另一侧
+    }
+    const list = data?.Accounts ?? data?.accounts ?? (Array.isArray(data) ? data : []);
+    if (!Array.isArray(list)) return;
+    for (const raw of list) {
+      const expireAt = resolveExpireAt(raw, now);
+      const cycleTotal = num(raw?.CycleCapacitySize ?? raw?.cycleCapacitySize);
+      const cycleUsed = num(raw?.CycleCapacityUsed ?? raw?.cycleCapacityUsed);
+      const flatTotal = num(raw?.CapacitySize ?? raw?.capacitySize);
+      const flatUsed = num(raw?.CapacityUsed ?? raw?.capacityUsed);
+      // 周期口径优先（裂变包按周期切片），单笔口径兜底；两者都缺失时记 0
+      const total = cycleTotal != null && cycleTotal > 0 ? cycleTotal : flatTotal ?? 0;
+      const used = cycleUsed != null && cycleUsed > 0 ? cycleUsed : flatUsed ?? 0;
+      records.push({
+        name: creditPackageName(raw),
+        packageCode: firstValue(raw, ['PackageCode', 'packageCode']) ?? null,
+        /** 到期时刻（官方客户端展示的就是它）；null = 长期有效 */
+        expireAt,
+        /** 周期结束时间（与到期时刻同源展示，客户端不区分） */
+        cycleEnd: parseTimestampMs(firstValue(raw, ['CycleEndTime', 'cycleEndTime'])),
+        total: round2(total),
+        used: round2(used),
+        remaining: round2(Math.max(0, total - used)),
+        createTime: parseTimestampMs(raw?.CreateTime ?? raw?.createTime),
+        expired: expireAt != null && expireAt <= now,
+      });
+    }
+  };
+  collect(paidRes);
+  collect(freeRes);
+
+  if (!records.length && (paidRes.status === 'rejected' || freeRes.status === 'rejected')) {
+    // 两侧都失败时把第一个失败原因抛出去，让前端显示明确错误而不是"空明细"
+    const reason = (paidRes.reason || freeRes.reason)?.message || '明细接口查询失败';
+    throw new Error(reason);
+  }
+
+  // 到期时间升序（null 排最后），超出上限截断
+  records.sort((a, b) => (a.expireAt ?? Number.MAX_SAFE_INTEGER) - (b.expireAt ?? Number.MAX_SAFE_INTEGER));
+  return records.slice(0, DETAILS_MAX_RECORDS);
+}
+
+/**
+ * 单账号逐笔积分明细（带 5 分钟进程内缓存）。
+ *
+ * @param {object} opts
+ * @param {string} opts.accountId 账号库 id 或 uid
+ * @param {boolean} opts.refresh true 时绕过缓存重新打官方接口
+ */
+export async function getCreditDetails({ accountId, refresh = false } = {}) {
+  const account = findAccount(accountId);
+  if (!account) throw new Error('账号不存在');
+  if (!account.uid) throw new Error('该账号缺少 uid，无法查询积分明细');
+
+  const now = Date.now();
+  if (!refresh) {
+    const cached = detailsCache.get(account.id);
+    if (cached && now - cached.at < DETAILS_CACHE_TTL_MS) {
+      return { ...cached.payload, cached: true };
+    }
+  }
+
+  const records = await fetchCreditRecords(account);
+  const payload = {
+    accountId: account.id,
+    accountName: accountDisplayName(account),
+    variant: variantOf(account).id,
+    collectedAt: now,
+    records,
+  };
+  detailsCache.set(account.id, { at: now, payload });
   return { ...payload, cached: false };
 }
 

@@ -505,6 +505,73 @@ ok(listJsonl().length === beforeRoundFiles && countRows(TARGET_UID) === beforeRo
   ok(row?.unread === 3 && Number(row?.agent_dirty) === 1 && row?.group_title === '分组标题', '原会话的其他列不受标题回写影响');
 }
 
+/* ---------- 9. 往返复制：副本新增内容原位回写 ---------- */
+out('\n== 9. 往返复制：副本新增内容原位回写 ==');
+// 接第 8 节的账本（TARGET→SOURCE: CID.other → CID.plain）。
+// 用户在源账号里继续聊副本 CID.plain（正文多了 2 行），切回目标账号时
+// 新增内容要合并回 CID.other 的正文，而不是跳过了事或重复复制。
+{
+  const d = new DatabaseSync(dbPath);
+  // 副本被聊过：updated_at 推进到比原会话新的值
+  d.prepare('UPDATE sessions SET updated_at = ?, last_activity_at = ? WHERE id = ?').run(
+    1700000099000,
+    1700000099001,
+    CID.plain
+  );
+  d.close();
+}
+const plainBody = fs.readFileSync(bodyPath.plain, 'utf8');
+const extraLines = [
+  JSON.stringify({ id: 'msg-3', timestamp: 4, type: 'message', role: 'user', content: [{ type: 'input_text', text: '副本里新聊的第一句' }], sessionId: CID.plain }),
+  JSON.stringify({ id: 'msg-4', timestamp: 5, type: 'message', role: 'assistant', content: [{ type: 'output_text', text: '副本里新聊的第二句' }], sessionId: CID.plain }),
+];
+fs.writeFileSync(bodyPath.plain, plainBody + extraLines.join('\n') + '\n', 'utf8');
+
+const beforeSyncFiles = listJsonl().length;
+const beforeSyncRows = countRows(TARGET_UID);
+const syncReport = await copySessions({ targetAccountId: TARGET_ACCOUNT_ID, ids: [CID.plain] });
+ok(
+  syncReport.skipped.length === 1 && syncReport.copied.length === 0,
+  '往返副本不再走复制路径（不产生重复会话）'
+);
+ok(
+  Array.isArray(syncReport.contentSynced) && syncReport.contentSynced.length === 1,
+  '报告带出 contentSynced 记录'
+);
+ok(
+  syncReport.contentSynced?.[0]?.originId === CID.other && syncReport.contentSynced?.[0]?.appendedLines === 2,
+  'contentSynced 指向原会话且追加 2 行增量'
+);
+{
+  const merged = fs.readFileSync(bodyPath.other, 'utf8');
+  const lines = merged.split('\n').filter((l) => l.trim());
+  ok(lines.length === 5, '原会话正文从 3 行变为 5 行（追加了 2 行增量）');
+  ok(!merged.includes(CID.plain), '回写后的原正文不残留副本会话 id');
+  ok(lines[3].includes('msg-3') && lines[4].includes('msg-4'), '追加的两行就是副本新增的消息');
+}
+ok(listJsonl().length === beforeSyncFiles && countRows(TARGET_UID) === beforeSyncRows, '内容回写不产生新的正文文件或会话行');
+{
+  const d = readDb();
+  const row = d.prepare('SELECT updated_at, last_activity_at FROM sessions WHERE id = ? AND user_id = ?').get(CID.other, TARGET_UID);
+  d.close();
+  ok(row?.updated_at === 1700000099000 && row?.last_activity_at === 1700000099001, '原会话行的活动时间已推进到副本的新值');
+}
+// 备份产物里要有回写前的原正文
+ok(
+  fs.existsSync(path.join(syncReport.backupPath, `${CID.other}.jsonl`)),
+  '回写前的原正文已备份到本次操作的备份目录'
+);
+// 幂等：再跑一次，没有新增量就不追加
+const rerunReport = await copySessions({ targetAccountId: TARGET_ACCOUNT_ID, ids: [CID.plain] });
+ok(
+  (rerunReport.contentSynced || []).length === 0,
+  '再次往返时无新增量，不做重复追加（幂等）'
+);
+ok(
+  fs.readFileSync(bodyPath.other, 'utf8').split('\n').filter((l) => l.trim()).length === 5,
+  '原会话正文仍为 5 行（没有被二次追加）'
+);
+
 /* ---------- 汇总 ---------- */
 out(`\n${pass}/${total} 断言通过`);
 fs.rmSync(tmpRoot, { recursive: true, force: true });

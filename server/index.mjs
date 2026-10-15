@@ -36,7 +36,7 @@ import {
   deleteAccount,
   updateAccountDisplay,
 } from './workbuddy/auth.mjs';
-import { getCreditStatistics, getOfflineCreditProjection, getAccountBalances } from './workbuddy/credits.mjs';
+import { getCreditStatistics, getOfflineCreditProjection, getAccountBalances, getCreditDetails } from './workbuddy/credits.mjs';
 import { VARIANT_LIST, authFilePath, dataRoot } from './workbuddy/variant.mjs';
 import { checkinAll, checkinAccount, fetchCheckinStatus, loadCheckinLogs, allCheckedInToday, allGrowthDoneToday } from './workbuddy/checkin.mjs';
 import {
@@ -738,6 +738,20 @@ app.get(
   wrap(async (req, res) => {
     const refresh = req.query.refresh === '1' || req.query.refresh === 'true';
     res.json(await getAccountBalances({ refresh }));
+  })
+);
+
+/**
+ * 单账号的逐笔积分明细（官方客户端「积分明细」弹窗的数据源）。
+ * 进程内缓存 5 分钟；?refresh=1 强制重打官方接口。
+ */
+app.get(
+  '/api/accounts/credit-details',
+  wrap(async (req, res) => {
+    const id = String(req.query.id || '').trim();
+    if (!id) throw Object.assign(new Error('缺少账号 id'), { status: 400 });
+    const refresh = req.query.refresh === '1' || req.query.refresh === 'true';
+    res.json(await getCreditDetails({ accountId: id, refresh }));
   })
 );
 

@@ -433,6 +433,19 @@ function durableWrite(file, text) {
   }
 }
 
+/** 持久化追加：append 模式打开 + fsync，用于把副本的增量行写回原会话正文 */
+function durableAppend(file, currentText, lines) {
+  // 原正文若不以换行结尾，先补一个，避免把新行拼到最后一行半截上
+  const add = (currentText.length && !currentText.endsWith('\n') ? '\n' : '') + lines.join('\n') + '\n';
+  const fd = fs.openSync(file, 'a');
+  try {
+    fs.writeSync(fd, add, null, 'utf8');
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 /**
  * 目标正文路径：沿用源文件在 `projects/` 下的相对目录。
  *
@@ -575,6 +588,7 @@ export async function copySessions({ targetAccountId, ids, stopApp = false }) {
   const skipped = [];
   const errors = [];
   const titleSynced = [];
+  const contentSynced = [];
   const ledgerAdds = [];
   let totalBytes = 0;
 
@@ -598,13 +612,98 @@ export async function copySessions({ targetAccountId, ids, stopApp = false }) {
     return { originId, title: displayTitle(sourceTitle, sourceCustomTitle) };
   };
 
-  /** 往返场景的标题回写入口：cid 是目标账号某会话的副本时执行；失败只记错误不中断 */
-  const syncTitleForRoundTrip = (cid, sourceTitle, sourceCustomTitle) => {
+  /**
+   * 内容增量回写：把副本正文里**多出来的行**追加回原会话正文。
+   *
+   * 场景：A→B 复制过会话 X（副本 X'），用户在 B 里继续聊 X'——新增的消息只存在于
+   * X' 的正文里。切回 A 时如果照旧"已复制过→跳过"，这些新消息就永远回不到 X 上；
+   * 如果照旧重新复制，又会产生一个内容重复的新会话。正确做法是原位合并：
+   *
+   * - 复制时副本正文 = 原正文逐行做 `原id → 副本id` 替换的产物，所以把副本行
+   *   反向替换回原视角后，两边在复制时刻的行是**逐字节相等**的；
+   * - 取最长公共前缀 k（前 k 行 = 复制时刻的快照），副本第 k 行之后的就是
+   *   用户新聊出来的增量，归一化后追加回原正文；
+   * - 追加后校验：行数吻合、正文不残留副本 id；同时把原会话行的
+   *   updated_at / last_activity_at 推进到两侧较新的值，让客户端把它排到前面。
+   *
+   * 无增量（副本没被聊过）时不做任何写入，返回 null。
+   */
+  const syncContentBack = (copyId, originId) => {
+    const copyPath = index.get(copyId);
+    const originPath = index.get(originId);
+    if (!copyPath || !originPath) return null; // 任一侧没有正文：只做标题同步，内容无从合并
+
+    const copyText = fs.readFileSync(copyPath, 'utf8');
+    const originText = fs.readFileSync(originPath, 'utf8');
+    const toOrigin = (line) => (copyId === originId ? line : line.split(copyId).join(originId));
+    const copyLines = copyText.split('\n');
+    const originLines = originText.split('\n');
+
+    let k = 0;
+    const maxPrefix = Math.min(copyLines.length, originLines.length);
+    while (k < maxPrefix && toOrigin(copyLines[k]) === originLines[k]) k++;
+
+    const tail = copyLines
+      .slice(k)
+      .map(toOrigin)
+      .filter((l) => l.trim());
+    if (!tail.length) return null;
+
+    // 追加会**修改已有正文**，与只新增文件的复制路径不同——先把原正文备份下来，
+    // 备份失败就中止（宁可不同步，也不无备份地改用户的会话数据）
+    fs.mkdirSync(backupPath, { recursive: true });
+    fs.copyFileSync(originPath, path.join(backupPath, `${originId}.jsonl`));
+
+    durableAppend(originPath, originText, tail);
+
+    // 写后校验：行数必须精确吻合，且不得残留副本 id（追加是纯归一化文本，出现即说明替换漏了）
+    const after = fs.readFileSync(originPath, 'utf8');
+    const expect = originLines.filter((l) => l.trim()).length + tail.length;
+    const actual = after.split('\n').filter((l) => l.trim()).length;
+    if (actual !== expect) {
+      throw new Error(`内容回写后行数不一致（期望 ${expect}，实际 ${actual}）`);
+    }
+    if (after.includes(copyId)) {
+      throw new Error('内容回写后的原正文仍残留副本会话 id');
+    }
+
+    // 原会话行的活动时间推进到两侧较新的值（App 已退出，无并发写）
+    const copyRow = db.prepare('SELECT updated_at, last_activity_at FROM sessions WHERE id = ?').get(copyId);
+    const originRow = db
+      .prepare('SELECT updated_at, last_activity_at FROM sessions WHERE id = ? AND user_id = ?')
+      .get(originId, targetUid);
+    if (copyRow && originRow) {
+      const nextUpdated = Math.max(Number(originRow.updated_at) || 0, Number(copyRow.updated_at) || 0);
+      const nextActivity = Math.max(Number(originRow.last_activity_at) || 0, Number(copyRow.last_activity_at) || 0);
+      if (nextUpdated > (Number(originRow.updated_at) || 0) || nextActivity > (Number(originRow.last_activity_at) || 0)) {
+        db.prepare('UPDATE sessions SET updated_at = ?, last_activity_at = ? WHERE id = ? AND user_id = ?').run(
+          nextUpdated,
+          nextActivity > 0 ? nextActivity : null,
+          originId,
+          targetUid
+        );
+      }
+    }
+
+    return { originId, appendedLines: tail.length, bytes: Buffer.byteLength(tail.join('\n') + '\n', 'utf8') };
+  };
+
+  /** 往返场景的同步入口：cid 是目标账号某会话的副本时执行；失败只记错误不中断 */
+  const syncForRoundTrip = (cid) => {
     const originId = originOfCopy.get(cid);
     if (!originId) return;
     try {
-      const synced = syncTitleBack(originId, sourceTitle, sourceCustomTitle);
-      if (synced) titleSynced.push({ sourceId: cid, ...synced });
+      const synced = syncContentBack(cid, originId);
+      if (synced) contentSynced.push({ sourceId: cid, ...synced });
+    } catch (err) {
+      errors.push({ id: cid, error: `内容回写失败（本次未复制）：${err?.message || err}` });
+    }
+    try {
+      const srow = db.prepare('SELECT title, custom_title FROM sessions WHERE id = ?').get(cid);
+      if (srow) {
+        const synced = syncTitleBack(originId, srow.title, srow.custom_title);
+        if (synced) titleSynced.push({ sourceId: cid, ...synced });
+      }
     } catch (err) {
       errors.push({ id: cid, error: `标题回写失败（内容不受影响）：${err?.message || err}` });
     }
@@ -614,15 +713,22 @@ export async function copySessions({ targetAccountId, ids, stopApp = false }) {
     for (const cid of list) {
       try {
         assertSafeSessionId(cid);
+        // 往返识别**优先于一切复制判定**：cid 是目标账号某会话的副本时，
+        // 既不能"照旧重新复制"（会产生内容重复的新会话——0.2.2 用户实测踩过，
+        // 改名前后的会话都被复制了一份），也不能"只跳过"（副本里新聊的内容
+        // 会永远留在副本里）。正确动作是原位合并：内容增量 + 标题都回写原会话。
+        if (originOfCopy.has(cid)) {
+          assertSafeSessionId(originOfCopy.get(cid));
+          syncForRoundTrip(cid);
+          skipped.push({
+            id: cid,
+            reason: '往返副本：新增内容与改名已同步回原会话，不再重复复制',
+            newId: originOfCopy.get(cid),
+          });
+          continue;
+        }
         if (Object.prototype.hasOwnProperty.call(ledger, cid)) {
           skipped.push({ id: cid, reason: '已复制过（账本命中）', newId: ledger[cid] });
-          // 账本命中也要做标题回写：改过名的副本再次切回来时，原会话的名称要跟上
-          try {
-            const srow = db.prepare('SELECT title, custom_title FROM sessions WHERE id = ?').get(cid);
-            if (srow) syncTitleForRoundTrip(cid, srow.title, srow.custom_title);
-          } catch (err) {
-            errors.push({ id: cid, error: `标题回写失败（内容不受影响）：${err?.message || err}` });
-          }
           continue;
         }
         const sourcePath = index.get(cid);
@@ -681,8 +787,6 @@ export async function copySessions({ targetAccountId, ids, stopApp = false }) {
           workspace: workspaceName(sourceRow.cwd),
           bytes: writtenBytes,
         });
-        // 往返场景：内容复制成了新会话，改名也要同步回目标账号里的原会话
-        syncTitleForRoundTrip(cid, sourceRow.title, sourceRow.custom_title);
         ledgerAdds.push({ sourceId: cid, newId });
         totalBytes += writtenBytes;
       } catch (err) {
@@ -711,6 +815,8 @@ export async function copySessions({ targetAccountId, ids, stopApp = false }) {
     errors,
     /** 往返复制时同步回原会话的改名（含会话 id、原会话 id 与新标题） */
     titleSynced,
+    /** 往返复制时追加回原会话正文的增量内容（含追加行数与字节数） */
+    contentSynced,
     totalBytes,
     backupPath,
     /** 本次是否结束了 WorkBuddy 的进程（供界面提示"客户端已被关闭，需要重新打开"） */
