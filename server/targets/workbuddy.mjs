@@ -210,9 +210,9 @@ export function listLoaded() {
   return { exists, invalid, dir: workbuddyDir(), modelsJsonPath: modelsJsonPath(), loaded };
 }
 
-function run(cmd, args, timeoutMs = 10000) {
+function run(cmd, args, timeoutMs = 10000, opts = {}) {
   return new Promise((resolve, reject) => {
-    execFile(cmd, args, { timeout: timeoutMs, windowsHide: true }, (err, stdout, stderr) => {
+    execFile(cmd, args, { timeout: timeoutMs, windowsHide: true, ...opts }, (err, stdout, stderr) => {
       if (err) return reject(Object.assign(err, { stderr }));
       resolve(stdout);
     });
@@ -377,6 +377,75 @@ async function detectViaTasklist(names = WORKBUDDY_PROCESS_NAMES) {
   };
 }
 
+/* ---------------------------------------------------------------------- *
+ * macOS / Linux：ps 全量进程表（替代 pgrep，见 listViaPs 注释）
+ * ---------------------------------------------------------------------- */
+
+const PS_MONTHS = { Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4, Jun: 5, Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11 };
+
+/** 解析 `ps -axo pid=,ppid=,lstart=,command=` 输出；供 listViaPs 与单元测试使用 */
+export function parsePsProcessTable(stdout) {
+  const rows = [];
+  const re = /^\s*(\d+)\s+(\d+)\s+[A-Za-z]{3}\s+([A-Za-z]{3})\s+(\d{1,2})\s+(\d{2}):(\d{2}):(\d{2})\s+(\d{4})\s+(.*)$/;
+  for (const line of String(stdout).split('\n')) {
+    const m = line.match(re);
+    if (!m) continue;
+    const mo = PS_MONTHS[m[3]];
+    const pid = Number(m[1]);
+    const ppid = Number(m[2]);
+    const command = m[9] || '';
+    let startTime = null;
+    if (mo !== undefined) {
+      startTime = new Date(Number(m[8]), mo, Number(m[4]), Number(m[5]), Number(m[6]), Number(m[7])).getTime();
+    }
+    rows.push({ pid, ppid, command, startTime });
+  }
+  return rows;
+}
+
+/**
+ * macOS / Linux 主路径的**核心筛选**（纯函数，供单测）：
+ * 1) 剔除本工具自己的进程子树（自己 + 全部后代）——⚠️ 这是 macOS「意外退出」的根因修复：
+ *    pgrep 时代按完整命令行做子串匹配，而打包后的控制台进程名就叫 "WorkBuddy Console"
+ *    （web 版脚本路径也常含 workbuddy 字样），模式 WorkBuddy|CodeBuddy 必然连自己一起命中，
+ *    切号时把自己杀掉 → macOS 弹「意外退出」（macOS 用户实测 2026-10-17）。
+ *    Windows 分支无此问题：那里的匹配按映像名**精确**匹配。
+ * 2) 按名称模式匹配命令行（大小写不敏感）；
+ * 3) 按启动时间升序：最早 = 主进程，先杀主进程，Electron 子进程随之退出；
+ *    反过来先强杀 helper 会触发主进程 Chromium CHECK 失败（SIGTRAP）→ 真正的 WorkBuddy「意外退出」。
+ */
+export function selectWorkbuddyRows(rows, names = WORKBUDDY_PROCESS_NAMES) {
+  const own = new Set([process.pid]);
+  for (let grew = true; grew; ) {
+    grew = false;
+    for (const r of rows) {
+      if (own.has(r.pid) || !own.has(r.ppid)) continue;
+      own.add(r.pid);
+      grew = true;
+    }
+  }
+  const pattern = new RegExp(`(${names.map((n) => n.replace(/\.exe$/i, '')).join('|')})`, 'i');
+  return rows
+    .filter((r) => !own.has(r.pid) && pattern.test(r.command))
+    .map((r) => {
+      const exePath = r.command.split(/\s+/)[0] || null; // 首个空格前 = 可执行文件路径（无参启动的 Electron 主进程成立）
+      return {
+        pid: r.pid,
+        name: exePath ? exePath.split('/').pop() : null,
+        exePath,
+        startTime: r.startTime,
+        command: r.command,
+      };
+    })
+    .sort((a, b) => (a.startTime ?? Number.MAX_SAFE_INTEGER) - (b.startTime ?? Number.MAX_SAFE_INTEGER));
+}
+
+async function listViaPs(names = WORKBUDDY_PROCESS_NAMES) {
+  // 全量进程表可能很大（每行含完整命令行），放宽 execFile 的 1MB 默认上限
+  const stdout = await run('ps', ['-axo', 'pid=,ppid=,lstart=,command='], 8000, { maxBuffer: 16 * 1024 * 1024 });
+  return selectWorkbuddyRows(parsePsProcessTable(stdout), names);
+}
+
 export async function detectWorkbuddyProcess({ names = WORKBUDDY_PROCESS_NAMES } = {}) {
   const platform = process.platform;
 
@@ -418,17 +487,22 @@ export async function detectWorkbuddyProcess({ names = WORKBUDDY_PROCESS_NAMES }
     return { running: false, platform, error: failures.join('; ') };
   }
 
-  // macOS / Linux 粗略探测（同 workbuddy-switch 的进程命名习惯）
-  try {
-    const stdout = await run('pgrep', ['-if', names.map((n) => n.replace(/\.exe$/i, '')).join('|')], 8000);
-    const pid = parseInt(String(stdout).split('\n')[0], 10);
-    if (Number.isFinite(pid) && pid > 0) return { running: true, pid, exePath: null, platform, method: 'pgrep' };
-    return { running: false, platform, method: 'pgrep' };
-  } catch (err) {
-    // pgrep 无匹配时退出码为 1 —— 那是"没有进程"，不是探测失败（与 listWorkbuddyProcesses 同口径）
-    if (err?.code === 1) return { running: false, platform, method: 'pgrep' };
-    return { running: false, error: err?.message || String(err), platform };
-  }
+  // macOS / Linux：走 ps 全量进程表（pgrep 的自杀陷阱见 listViaPs 注释）
+  const { processes, method, error } = await listWorkbuddyProcesses({ names });
+  if (error) return { running: false, error, platform };
+  if (!processes.length) return { running: false, platform, method };
+  // 列表已按启动时间升序（ps 路径），第一个 = 主进程 = 应用真正启动的时刻
+  const main = processes[0];
+  return {
+    running: true,
+    pid: main.pid,
+    name: main.name,
+    exePath: main.exePath,
+    startTime: main.startTime,
+    processCount: processes.length,
+    platform,
+    method,
+  };
 }
 
 /** 定位 WorkBuddy 可执行文件：优先检测到的真实路径，再按常见安装位置兜底 */
@@ -478,19 +552,26 @@ export async function listWorkbuddyProcesses({ names = WORKBUDDY_PROCESS_NAMES }
       }
     }
   }
-  const pattern = names.map((n) => n.replace(/\.exe$/i, '')).join('|');
+  // macOS / Linux 主路径：ps 全量进程表（自动剔除本工具自己的进程子树，按启动时间升序）
   try {
-    const stdout = await run('pgrep', ['-if', pattern], 8000);
-    const processes = String(stdout)
-      .split('\n')
-      .map((s) => Number(s.trim()))
-      .filter((n) => Number.isFinite(n) && n > 0)
-      .map((pid) => ({ pid, name: null, exePath: null, startTime: null }));
-    return { processes, method: 'pgrep', complete: true };
+    return { processes: await listViaPs(names), method: 'ps', complete: true };
   } catch (err) {
-    // pgrep 无匹配时退出码为 1 —— 那是"没有进程"，不是探测失败
-    if (err?.code === 1) return { processes: [], method: 'pgrep', complete: true };
-    return { processes: [], error: err?.message || String(err) };
+    // 兜底用 pgrep：只拿得到 PID（无启动时间、无法剔除全部后代），
+    // 仅剔除自己一个 PID——ps 都不可用的机器已经非常罕见， degraded 路径可接受
+    const pattern = names.map((n) => n.replace(/\.exe$/i, '')).join('|');
+    try {
+      const stdout = await run('pgrep', ['-if', pattern], 8000);
+      const processes = String(stdout)
+        .split('\n')
+        .map((s) => Number(s.trim()))
+        .filter((n) => Number.isFinite(n) && n > 0 && n !== process.pid)
+        .map((pid) => ({ pid, name: null, exePath: null, startTime: null }));
+      return { processes, method: 'pgrep', complete: true };
+    } catch (err2) {
+      // pgrep 无匹配时退出码为 1 —— 那是"没有进程"，不是探测失败
+      if (err2?.code === 1) return { processes: [], method: 'pgrep', complete: true };
+      return { processes: [], error: `ps（${err?.message || String(err)}）与 pgrep（${err2?.message || String(err2)}）都不可用` };
+    }
   }
 }
 
@@ -585,9 +666,18 @@ export async function stopWorkbuddy({
 
 /**
  * 重新打开 WorkBuddy（切换账号后调用，让用户拿到一个已登录新账号的客户端）。
- * 只在 Windows 上可用——macOS 未做验证，宁可让用户手动打开也不猜。
+ * Windows 用 exe 直接拉起；macOS 从检测到的可执行文件路径反推 .app 包后用 `open`。
  */
 export function launchWorkbuddy(exePath) {
+  if (process.platform === 'darwin') {
+    const bundle = findWorkbuddyAppBundle(exePath);
+    if (!bundle) {
+      throw new Error('未能定位 WorkBuddy 的 .app 包（/Applications 下未找到），请手动重新打开 WorkBuddy');
+    }
+    const child = spawn('open', [bundle], { detached: true, stdio: 'ignore' });
+    child.unref();
+    return { launched: true, exePath: bundle };
+  }
   if (process.platform !== 'win32') {
     throw new Error(`当前平台（${process.platform}）不支持自动重新打开 WorkBuddy，请手动打开`);
   }
@@ -600,6 +690,24 @@ export function launchWorkbuddy(exePath) {
   const child = spawn(exe, [], { detached: true, stdio: 'ignore' });
   child.unref();
   return { launched: true, exePath: exe };
+}
+
+/** macOS：从检测到的可执行文件路径反推 .app 包路径（如 /Applications/WorkBuddy.app），失败按常见位置兜底 */
+function findWorkbuddyAppBundle(exePath) {
+  const m = String(exePath || '').match(/^(\/.+?\.app)\//i);
+  const candidates = [
+    m?.[1],
+    '/Applications/WorkBuddy.app',
+    '/Applications/CodeBuddy.app',
+    path.join(os.homedir(), 'Applications', 'WorkBuddy.app'),
+  ].filter(Boolean);
+  return candidates.find((p) => {
+    try {
+      return fs.statSync(p).isDirectory();
+    } catch {
+      return false;
+    }
+  });
 }
 
 export async function restartWorkbuddy() {
@@ -619,6 +727,18 @@ export async function restartWorkbuddy() {
     const child = spawn(exe, [], { detached: true, stdio: 'ignore' });
     child.unref();
     return { restarted: true, exePath: exe };
+  }
+  if (process.platform === 'darwin') {
+    if (!proc.pid) throw new Error('未获取到进程 ID，无法重启');
+    await terminatePid(proc.pid, true);
+    await new Promise((r) => setTimeout(r, 1500));
+    const bundle = findWorkbuddyAppBundle(proc.exePath);
+    if (!bundle) {
+      throw new Error('未能定位 WorkBuddy 的 .app 包，请手动重新打开 WorkBuddy');
+    }
+    const child = spawn('open', [bundle], { detached: true, stdio: 'ignore' });
+    child.unref();
+    return { restarted: true, exePath: bundle };
   }
   throw new Error(`当前平台（${process.platform}）暂不支持自动重启，请手动重启 WorkBuddy`);
 }

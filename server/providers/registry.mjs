@@ -6,7 +6,7 @@ import * as openrouter from './openrouter.mjs';
 import { OPENROUTER_BASE_URL } from './openrouter.mjs';
 import { defineOpenAIPlatform } from './genericOpenAI.mjs';
 import * as zen from './zen.mjs';
-import * as agnes from './agnes.mjs';
+import { agnesCn, agnesIntl } from './agnes.mjs';
 import * as siliconflow from './siliconflow.mjs';
 import * as modelscope from './modelscope.mjs';
 import * as zhipu from './zhipu.mjs';
@@ -21,10 +21,14 @@ import * as github from './github.mjs';
  * 后段为置灰展示的平台：不可浏览模型、不可添加 Key，点击时提示原因。
  * 适配器均保留，URL 识别不中断——此前载入的条目仍可在「已载入面板」中移除。
  * - region：地区封锁（对话请求由 WorkBuddy 直连发出，国内无 TUN 全局代理时必然 403）
- * - platform：国内可连但平台限制外部客户端调用 */
+ * - platform：国内可连但平台限制外部客户端调用
+ *
+ * Agnes 拆成中国站（agnes）/ 国际站（agnes-intl）两条：两站账号体系互不相通，
+ * key 与签发站点绑定（见 agnes.mjs 顶部说明）。 */
 export const PLATFORM_ORDER = [
   'openrouter',
   'agnes',
+  'agnes-intl',
   'siliconflow',
   'modelscope',
   'groq',
@@ -67,7 +71,8 @@ const generic = (cfg) => ({ ...cfg, quotaKind: cfg.fetchQuotaForKey ? 'balance' 
 export const providers = {
   openrouter: openrouterProvider,
   zen: generic(zen.platform),
-  agnes: generic(agnes.platform),
+  agnes: generic(agnesCn),
+  'agnes-intl': generic(agnesIntl),
   siliconflow: generic(siliconflow.platform),
   modelscope: generic(modelscope.platform),
   zhipu: generic(zhipu.platform),
@@ -109,11 +114,13 @@ export function listPlatforms() {
 }
 
 /** 判断一个 WorkBuddy models.json 条目的 url 属于哪个受管平台（null = 与本工具无关）。
- * 用全量适配器（而非 PLATFORM_ORDER）匹配，界面下线的平台此前载入的条目仍可被识别和移除。 */
+ * 用全量适配器（而非 PLATFORM_ORDER）匹配，界面下线的平台此前载入的条目仍可被识别和移除。
+ * 匹配范围是平台的全部节点（allBaseUrls = baseUrl + alternateBaseUrls）：
+ * Agnes 国际站的条目可能写在主节点或备用节点上，两者都要能归属到 agnes-intl。 */
 export function matchPlatformUrl(url) {
   if (typeof url !== 'string') return null;
   for (const p of Object.values(providers)) {
-    if (url.startsWith(p.baseUrl)) return p.id;
+    if ((p.allBaseUrls || [p.baseUrl]).some((b) => b && url.startsWith(b))) return p.id;
   }
   return null;
 }

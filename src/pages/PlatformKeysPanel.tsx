@@ -26,6 +26,16 @@ import { fmtDate, fmtRelative, showsMask } from '../lib/format';
  * 与「免费模型」「平台额度」同属平台底座能力，因此从设置页迁出、并入平台页，
  * 三者用同一组平台数据：Key 决定能载入哪些模型、也决定额度页能看到什么。
  */
+/** baseUrl → 主机名（解析失败返回 null）；用于多节点平台的节点徽标 */
+function hostOf(url: string | null | undefined): string | null {
+  if (!url) return null;
+  try {
+    return new URL(url).host;
+  } catch {
+    return null;
+  }
+}
+
 export default function PlatformKeysPanel({ active = true }: { active?: boolean }) {
   const toast = useToast();
   const confirm = useConfirm();
@@ -128,9 +138,11 @@ export default function PlatformKeysPanel({ active = true }: { active?: boolean 
   const testKey = async (k: KeyInfo) => {
     setTestingId(k.id);
     try {
-      const r = await post<{ ok: boolean; error?: string }>(`/api/keys/${k.id}/test`);
-      if (r.ok) toast('ok', `「${k.label}」有效`);
-      else toast('err', `「${k.label}」无效或已撤销${r.error ? `（${r.error}）` : ''}`);
+      const r = await post<{ ok: boolean; error?: string; baseUrl?: string | null }>(`/api/keys/${k.id}/test`);
+      if (r.ok) {
+        const node = hostOf(r.baseUrl) ? `（生效节点：${hostOf(r.baseUrl)}）` : '';
+        toast('ok', `「${k.label}」有效${node}`);
+      } else toast('err', `「${k.label}」无效或已撤销${r.error ? `（${r.error}）` : ''}`);
       loadKeys();
     } catch (e: any) {
       toast('err', e?.message || '测试失败');
@@ -199,6 +211,18 @@ export default function PlatformKeysPanel({ active = true }: { active?: boolean 
                           <div className="flex items-center gap-2">
                             <span className="text-sm text-zinc-800 font-medium truncate max-w-48">{k.label}</span>
                             {k.id === activeKeys[k.platform] ? <Badge color="green">活跃</Badge> : k.lastStatus === 'invalid' ? <Badge color="red">无效</Badge> : null}
+                            {/* 多节点平台（如 Agnes 双站）：key 绑定的节点与平台默认不同时亮出来 */}
+                            {(() => {
+                              const node = hostOf(k.baseUrl);
+                              const def = hostOf(p.baseUrl);
+                              return node && node !== def ? (
+                                <span title={`该 Key 鉴权通过的 API 节点：${k.baseUrl}`}>
+                                  <Badge color="blue" className="font-mono">
+                                    {node}
+                                  </Badge>
+                                </span>
+                              ) : null;
+                            })()}
                           </div>
                           <div className="text-xs text-zinc-400 font-mono">
                             {showsMask(k.label, k.masked) && <span className="mr-1">{k.masked} ·</span>}

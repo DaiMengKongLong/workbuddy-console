@@ -125,7 +125,7 @@ app.get(
     const provider = platformFromReq(req);
     const refresh = req.query.refresh === '1' || req.query.refresh === 'true';
     const key = activeKeyFor(loadConfig(), provider.id);
-    const data = await provider.getModels({ refresh, apiKey: key?.key || undefined });
+    const data = await provider.getModels({ refresh, apiKey: key?.key || undefined, baseUrl: key?.baseUrl || undefined });
     res.json({ ...data, platform: provider.id, platformName: provider.name, note: provider.note, tutorialUrl: provider.tutorialUrl || null });
   })
 );
@@ -203,6 +203,7 @@ app.get('/api/keys', (req, res) => {
       masked: maskKey(k.key),
       addedAt: k.addedAt,
       lastStatus: k.lastStatus || null,
+      baseUrl: k.baseUrl || null,
     })),
     configFile: CONFIG_FILE,
   });
@@ -248,6 +249,9 @@ app.post(
       label: label || t.label || `${provider.name} ${maskKey(key)}`,
       addedAt: Date.now(),
       lastStatus: 'ok',
+      // 多节点平台（如 Agnes 双站）：记录该 key 实际鉴权通过的节点，
+      // 之后拉模型、载入 WorkBuddy 都走这个节点（key 与签发站点绑定，跨站必 401）
+      baseUrl: t.baseUrl || null,
     };
     cfg.keys.push(item);
     cfg.activeKeys = { ...(cfg.activeKeys || {}) };
@@ -290,8 +294,10 @@ app.post(
     try {
       const t = await getProvider(k.platform).testKey(k.key);
       k.lastStatus = t.ok ? 'ok' : 'invalid';
+      // 多节点平台：key 可能被删后换站点重建，重测时同步纠正生效节点
+      k.baseUrl = t.baseUrl || null;
       saveConfig(cfg);
-      res.json(t.ok ? { ok: true, isFreeTier: t.isFreeTier } : { ok: false, error: t.error || 'Key 无效' });
+      res.json(t.ok ? { ok: true, isFreeTier: t.isFreeTier, baseUrl: t.baseUrl || null } : { ok: false, error: t.error || 'Key 无效' });
     } catch (err) {
       res.status(502).json({ ok: false, error: err?.message || '测试失败' });
     }
@@ -362,7 +368,7 @@ app.post(
         skipped.push({ id, reason: '该模型协议不兼容，不支持载入 WorkBuddy' });
         continue;
       }
-      entries.push(provider.buildEntry(m, target.key));
+      entries.push(provider.buildEntry(m, target.key, target.baseUrl));
     }
     if (!entries.length) {
       return res.status(400).json({ error: '没有可载入的模型', skipped });
@@ -409,7 +415,7 @@ app.post(
         skipped.push({ id, reason: '模型列表中未找到' });
         continue;
       }
-      const entry = provider.buildEntry(m, target.key);
+      const entry = provider.buildEntry(m, target.key, target.baseUrl);
       entries.push({
         ...entry,
         // 未点「显示」时不带明文，避免 Key 被无意复制到剪贴板

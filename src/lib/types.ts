@@ -134,6 +134,8 @@ export interface KeyInfo {
   masked: string;
   addedAt: number;
   lastStatus?: string | null;
+  /** 多节点平台（如 Agnes 双站）：该 key 鉴权通过的实际 API 节点；null = 平台默认节点 */
+  baseUrl?: string | null;
 }
 
 export interface KeysResponse {

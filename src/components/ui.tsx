@@ -147,7 +147,7 @@ export function Badge({
 }) {
   return (
     <span
-      className={`inline-flex items-center gap-1 rounded-lg border px-1.5 py-0.5 text-[11px] leading-none font-medium ${badgeColors[color] || badgeColors.gray} ${className}`}
+      className={`inline-flex items-center gap-1 whitespace-nowrap rounded-lg border px-1.5 py-0.5 text-[11px] leading-none font-medium ${badgeColors[color] || badgeColors.gray} ${className}`}
     >
       {dot && <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${dotColors[color] || dotColors.gray}`} />}
       {children}

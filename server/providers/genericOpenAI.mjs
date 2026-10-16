@@ -132,6 +132,19 @@ const KNOWN_HINTS = [
   ],
   [/quota|rate.?limit|throttl/i,
     '该平台返回了限额类错误：Key 鉴权可能已通过，但当前处于限速状态，稍后重试'],
+  [
+    // Agnes 的 503：官方文档 503 原因含"模型名称不正确/发送到错误的模型/服务暂时不可用"。
+    // 探测请求到达模型路由层才会 503（鉴权失败一律 401/403），所以多数情况是探测模型
+    // 与站点不匹配或上游繁忙——重试通常可过；持续出现说明该站点确实没有探测模型。
+    /\b503\b|service unavailable/i,
+    'Agnes 返回 503 表示请求已通过鉴权、但模型路由失败或服务暂时繁忙：请稍等重试；持续出现请更新本工具（探测模型按站点区分）',
+  ],
+  [
+    // Agnes AI 的 401 文案（国内节点中文、国际节点英文）。Key 与签发站点绑定，
+    // 本工具已自动探测全部节点；三个节点都 401 只能说明 Key 本身无效。
+    /^(无效的令牌|Invalid token)/i,
+    '若这是 Agnes AI 的 Key：工具已自动尝试其全部 API 节点（中国站/国际站账号体系独立），仍报此错说明 Key 在所有节点均无效——请到官网重新生成 Key，并确认创建 Key 的站点账号处于正常状态',
+  ],
 ];
 
 /** 读取上游错误正文摘录（401/403 时给用户看真实拒绝原因，如魔搭"未绑定阿里云账号"） */
@@ -202,8 +215,13 @@ export async function testKeyByChatProbe({ baseUrl, apiKey, probeModel, extraHea
 /**
  * 平台工厂：把一个 OpenAI 兼容平台的配置变成注册表条目。
  * - isFree / loadable / outputKind 可以是布尔值或 (rawModel) => boolean|string 函数
- * - entryUrl(model) 自定义写入 WorkBuddy 的 url（默认 baseUrl，即由客户端拼 /chat/completions）
+ * - entryUrl(model, baseUrl) 自定义写入 WorkBuddy 的 url；第二参数是「该 Key 实际
+ *   生效的节点」（见 alternateBaseUrls 的探测机制），硬编码完整端点的平台必须
+ *   基于它拼接，否则探测选对了节点、载入条目却仍指向默认节点（跨站 401）。
  * - modelsPublic=true 时模型列表无需鉴权，key 校验走 chat 探测（probeModel）
+ * - alternateBaseUrls：同平台的多 API 节点。**key 与签发站点绑定**的平台（如 Agnes
+ *   的中国站 agnes-ai.cn / 国际站 agnes-ai.com，账号体系互不相通）需要它：
+ *   校验 key 时按候选顺序探测，命中哪个节点就把 baseUrl 随 key 保存、后续全程使用。
  */
 export function defineOpenAIPlatform(cfg) {
   const {
@@ -227,6 +245,7 @@ export function defineOpenAIPlatform(cfg) {
     note = null,
     tutorialUrl = null,
     extraHeaders = {},
+    alternateBaseUrls = [],
   } = cfg;
 
   const normalize = (m) => {
@@ -238,6 +257,8 @@ export function defineOpenAIPlatform(cfg) {
     id,
     name,
     baseUrl,
+    /** baseUrl + 全部备用节点：URL 识别（matchPlatformUrl）用——备用节点上的已载入条目也要能归属到本平台 */
+    allBaseUrls: [baseUrl, ...alternateBaseUrls],
     site: site || null,
     keyUrl: keyUrl || null,
     modelsPublic,
@@ -245,7 +266,8 @@ export function defineOpenAIPlatform(cfg) {
     keyPlaceholder: keyPlaceholder || null,
     note,
     tutorialUrl,
-    getModels: async ({ refresh = false, apiKey } = {}) => {
+    getModels: async ({ refresh = false, apiKey, baseUrl: baseUrlOverride } = {}) => {
+      const base = baseUrlOverride || baseUrl;
       try {
         if (!modelsPublic && !apiKey) {
           throw new Error(`${name} 需要配置 API Key 才能获取模型列表，请先到「设置」添加并设为当前使用`);
@@ -254,7 +276,7 @@ export function defineOpenAIPlatform(cfg) {
           platform: id,
           refresh,
           fetcher: async () => {
-            const list = await fetchModelsOpenAI({ platform: name, baseUrl, apiKey, extraHeaders });
+            const list = await fetchModelsOpenAI({ platform: name, baseUrl: base, apiKey, extraHeaders });
             return list.map(normalize);
           },
         });
@@ -269,31 +291,60 @@ export function defineOpenAIPlatform(cfg) {
     peek: () => peekModelsCacheFor(id),
     fetchQuotaForKey,
     testKey: async (apiKey) => {
-      if (modelsPublic) {
-        let model = probeModel;
-        if (!model) {
+      /**
+       * 按候选节点顺序探测；key 与签发站点绑定的平台，第一个鉴权通过的节点即该 key 的归属节点。
+       *
+       * ⚠️ 多节点平台必须用 chat 探测而不是 /models 校验：实测（2026-10，Agnes）各节点的
+       * /models 鉴权行为不一致——国际主节点 apihub.agnes-ai.com 的 /models 公开，**假 key 也
+       * 返回 200**，用 /models 校验会把垃圾 key「假通过」并绑定到错误节点；而三个节点的
+       * /chat/completions 鉴权行为完全一致（无效 key 一律 401）。
+       * 探测模型从任意能拉到列表的节点获取（列表内容同平台一致）。
+       */
+      const candidates = [baseUrl, ...alternateBaseUrls];
+      const useChatProbe = modelsPublic || candidates.length > 1;
+      let model = probeModel;
+      if (useChatProbe && !model) {
+        for (const b of candidates) {
           try {
-            const list = await fetchModelsOpenAI({ platform: name, baseUrl, apiKey, extraHeaders });
+            const list = await fetchModelsOpenAI({ platform: name, baseUrl: b, apiKey, extraHeaders });
             model = list[0]?.id;
+            if (model) break;
           } catch {
-            model = null;
+            /* 该节点拉不到列表（需鉴权/故障），换下一个 */
           }
         }
-        if (!model) return { ok: false, error: '无法确定探测模型' };
-        return testKeyByChatProbe({ baseUrl, apiKey, probeModel: model, extraHeaders });
       }
-      return testKeyOpenAI({ baseUrl, apiKey, extraHeaders });
+      const attempt = async (base) => {
+        if (useChatProbe) {
+          if (!model) return { ok: false, error: '无法确定探测模型' };
+          return testKeyByChatProbe({ baseUrl: base, apiKey, probeModel: model, extraHeaders });
+        }
+        return testKeyOpenAI({ baseUrl: base, apiKey, extraHeaders });
+      };
+
+      let firstFailure = null;
+      for (const base of candidates) {
+        const r = await attempt(base);
+        if (r.ok) return { ...r, baseUrl: base };
+        // 网络错误也换下一节点（某节点被墙/宕机时其余节点可能可达）；
+        // 只保留第一个失败原因用于最终报错——它来自默认节点，最有代表性
+        if (!firstFailure) firstFailure = r;
+      }
+      return firstFailure || { ok: false, error: '所有节点探测失败' };
     },
-    buildEntry: (model, apiKey) => ({
-      id: model.id,
-      name: model.name || model.id,
-      vendor: 'Custom',
-      url: entryUrl ? entryUrl(model) : baseUrl,
-      apiKey,
-      supportsToolCall: !!model.supportsTools,
-      supportsImages: !!model.supportsImageInput,
-      supportsReasoning: !!model.supportsReasoning,
-      useCustomProtocol: false,
-    }),
+    buildEntry: (model, apiKey, baseUrlOverride) => {
+      const base = baseUrlOverride || baseUrl;
+      return {
+        id: model.id,
+        name: model.name || model.id,
+        vendor: 'Custom',
+        url: entryUrl ? entryUrl(model, base) : base,
+        apiKey,
+        supportsToolCall: !!model.supportsTools,
+        supportsImages: !!model.supportsImageInput,
+        supportsReasoning: !!model.supportsReasoning,
+        useCustomProtocol: false,
+      };
+    },
   };
 }
