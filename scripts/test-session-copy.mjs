@@ -539,7 +539,7 @@ ok(
   '报告带出 contentSynced 记录'
 );
 ok(
-  syncReport.contentSynced?.[0]?.originId === CID.other && syncReport.contentSynced?.[0]?.appendedLines === 2,
+  syncReport.contentSynced?.[0]?.targetId === CID.other && syncReport.contentSynced?.[0]?.appendedLines === 2,
   'contentSynced 指向原会话且追加 2 行增量'
 );
 {
@@ -570,6 +570,114 @@ ok(
 ok(
   fs.readFileSync(bodyPath.other, 'utf8').split('\n').filter((l) => l.trim()).length === 5,
   '原会话正文仍为 5 行（没有被二次追加）'
+);
+
+/* ---------- 10. 两侧都新增过内容时，重复往返不得重复追加 ---------- */
+out('\n== 10. 分叉后的幂等：两侧都聊过，重复往返不重复追加 ==');
+// 第 7 节为了验证回滚装了 BEFORE INSERT 触发器，后面的场景要真的插入副本，先摘掉
+{
+  const d = new DatabaseSync(dbPath);
+  d.exec('DROP TRIGGER IF EXISTS block_target_insert');
+  d.close();
+}
+// 第 9 节结束时两侧已收敛（都是 5 行）。现在制造"分叉"：原会话与副本各自又新增了内容。
+// 这时 LCP 只能停在复制时刻的快照边界，副本"新增的部分"每次都会被重算成同一段——
+// 没有幂等护栏的话，同一段内容会被一遍遍追加进原会话。
+{
+  const d = new DatabaseSync(dbPath);
+  d.prepare('UPDATE sessions SET updated_at = ? WHERE id = ?').run(1700000188000, CID.plain);
+  d.close();
+}
+const originOnlyLine = JSON.stringify({
+  id: 'msg-5',
+  timestamp: 6,
+  type: 'message',
+  role: 'user',
+  content: [{ type: 'input_text', text: '原会话这边自己新增的一句' }],
+  sessionId: CID.other,
+});
+const copyOnlyLine = JSON.stringify({
+  id: 'msg-6',
+  timestamp: 7,
+  type: 'message',
+  role: 'assistant',
+  content: [{ type: 'output_text', text: '副本这边新聊的一句' }],
+  sessionId: CID.plain,
+});
+fs.appendFileSync(bodyPath.other, originOnlyLine + '\n', 'utf8');
+fs.appendFileSync(bodyPath.plain, copyOnlyLine + '\n', 'utf8');
+const readOriginLines = () => fs.readFileSync(bodyPath.other, 'utf8').split('\n').filter((l) => l.trim());
+
+const forkReport = await copySessions({ targetAccountId: TARGET_ACCOUNT_ID, ids: [CID.plain] });
+ok(
+  forkReport.contentSynced?.[0]?.appendedLines === 1,
+  `分叉后只追加副本那一行增量（实际 ${forkReport.contentSynced?.[0]?.appendedLines} 行）`
+);
+ok(readOriginLines().length === 7, '原会话变为 7 行（原3 + 双向各1 + 合并1）');
+ok(readOriginLines().some((l) => l.includes('msg-5')) && readOriginLines().some((l) => l.includes('msg-6')), '两侧新增内容都在：没有丢内容');
+
+const forkRerun = await copySessions({ targetAccountId: TARGET_ACCOUNT_ID, ids: [CID.plain] });
+ok((forkRerun.contentSynced || []).length === 0, '同一操作重复执行不再追加（幂等护栏生效）');
+ok(readOriginLines().length === 7, `重复执行后原会话仍是 7 行（实际 ${readOriginLines().length} 行，旧实现会变成 8 行）`);
+
+/* ---------- 11. 账本记着的副本已被删除 → 不能"跳过" ---------- */
+out('\n== 11. 陈旧账本：目标账号里的副本已被删除 ==');
+const nestedCopyId = sessionCopyLedger('cn', SOURCE_UID, TARGET_UID)[CID.nested];
+ok(!!nestedCopyId, `账本里有 CID.nested 的副本记录（${String(nestedCopyId).slice(0, 8)}…）`);
+{
+  const d = new DatabaseSync(dbPath);
+  d.prepare('UPDATE sessions SET deleted_at = ? WHERE id = ? AND user_id = ?').run(1700000200000, nestedCopyId, TARGET_UID);
+  d.close();
+}
+const beforeStaleRows = countRows(TARGET_UID);
+// 列表也要跟着变：副本没了就不能再标「已复制」，否则界面上它会被隐藏且不可勾选，
+// 用户根本点不到它去重新复制（后端修好了也够不着）。
+{
+  const relisted2 = await listSessionsForSwitch({ targetAccountId: TARGET_ACCOUNT_ID });
+  const nestedEntry = relisted2.sessions.find((s) => s.id === CID.nested);
+  const plainEntry = relisted2.sessions.find((s) => s.id === CID.plain);
+  ok(nestedEntry?.copied === false, '副本被删除后列表不再标「已复制」');
+  ok(plainEntry?.copied === true, '副本仍在的会话照旧标「已复制」（正向用例没被误伤）');
+}
+const staleReport = await copySessions({ targetAccountId: TARGET_ACCOUNT_ID, ids: [CID.nested] });
+const staleDetail = staleReport.errors.length ? `（报错：${JSON.stringify(staleReport.errors)}）` : '';
+ok(staleReport.skipped.length === 0, '副本已被删除时不再跳过（旧实现会误判为「已复制过」）');
+ok(staleReport.copied.length === 1, `重新复制了一份${staleDetail}`);
+ok(
+  staleReport.copied[0]?.newId && staleReport.copied[0].newId !== nestedCopyId,
+  '新副本是一个全新 id（不会复活那条已删除的行）'
+);
+ok(countRows(TARGET_UID) === beforeStaleRows + 1, '目标账号多了一条副本行');
+ok(
+  sessionCopyLedger('cn', SOURCE_UID, TARGET_UID)[CID.nested] === staleReport.copied[0].newId,
+  '账本已覆盖为新副本 id（下次不会再重复复制）'
+);
+
+/* ---------- 12. 往返副本的"原会话"已被删除 → 改为普通复制 ---------- */
+out('\n== 12. 往返副本的原会话已被删除 ==');
+// 摘掉正向账本里 CID.plain 的记录，隔离出"原会话被删"这一个变量
+{
+  const f = JSON.parse(fs.readFileSync(SESSION_COPIES_FILE, 'utf8'));
+  const fwdKey = `cn|${SOURCE_UID}|${TARGET_UID}`;
+  if (f.pairs[fwdKey]) {
+    delete f.pairs[fwdKey][CID.plain];
+    fs.writeFileSync(SESSION_COPIES_FILE, JSON.stringify(f), 'utf8');
+  }
+}
+{
+  const d = new DatabaseSync(dbPath);
+  // 原会话（目标账号侧）被用户删掉了：这时"原位合并"没有落点
+  d.prepare('UPDATE sessions SET deleted_at = ? WHERE id = ? AND user_id = ?').run(1700000300000, CID.other, TARGET_UID);
+  d.close();
+}
+const beforeOrphanRows = countRows(TARGET_UID);
+const orphanReport = await copySessions({ targetAccountId: TARGET_ACCOUNT_ID, ids: [CID.plain] });
+ok(orphanReport.skipped.length === 0, '原会话没了就不再报「已同步」（旧实现会把内容闷在副本里）');
+ok(orphanReport.copied.length === 1, '改为普通复制把内容带过去');
+ok(countRows(TARGET_UID) === beforeOrphanRows + 1, '目标账号多了一条新会话');
+ok(
+  fs.readFileSync(bodyPath.other, 'utf8').split('\n').filter((l) => l.trim()).length === 7,
+  '已删除的原会话正文没有被改写'
 );
 
 /* ---------- 汇总 ---------- */

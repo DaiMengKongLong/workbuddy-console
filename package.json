@@ -1,7 +1,7 @@
 {
   "name": "workbuddy-console",
   "private": true,
-  "version": "0.2.7",
+  "version": "0.2.8",
   "description": "workbuddy控制台：账号切换、多平台免费模型广场、Token 与积分用量统计",
   "author": "walter-io",
   "license": "MIT",
@@ -21,6 +21,7 @@
     "test:proxy-protocols": "node scripts/test-proxy-protocols.mjs",
     "test:proxy-pool": "node scripts/test-proxy-pool.mjs",
     "test:sessions": "node scripts/test-session-copy.mjs",
+    "test:roundtrip": "node scripts/test-roundtrip-flow.mjs",
     "test:stop": "node scripts/test-stop-process.mjs",
     "test:refresh": "node scripts/test-token-refresh.mjs",
     "test:growth": "node scripts/test-growth.mjs",

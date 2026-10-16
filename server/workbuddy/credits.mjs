@@ -412,10 +412,19 @@ function creditPackageName(raw) {
 }
 
 /**
- * 拉取付费 / 免费两类积分包明细，返回「商品码 → 该码下最早的未过期到期时刻」。
+ * 拉取付费 / 免费两类积分包明细，返回「商品码 → 该码下最早的有效到期时刻」。
  *
  * 明细接口一次返回全部历史成交记录（含已用完、已到期的），同一 PackageCode 会有
- * 很多条；对汇总里的一个包来说，真正该提醒的是**最早那个还没过的到期日**。
+ * 很多条。对汇总里的一个包来说，「到期时间」应当是**还有额度的那批里最早会过期的一笔**：
+ *
+ * - 只取「未过期」是不够的——实测（2026-10-16，code_007 平台奖励积分）63 笔
+ *   未过期记录**全部已用完**，真正还有额度的只有 1 笔（2027/4/9，剩余 321）。
+ *   旧逻辑取到最早那笔「已用完的 10/17」，卡片于是显示 10/17 到期，而那时用户
+ *   手里其实还有 321 积分可用——正是用户反馈的误导点（官方客户端也有同样问题）。
+ * - 因此这里分两档：主档只认「未过期 **且 还有剩余**」的记录；若该包所有记录都已
+ *   用完（如 0/500 的套餐基础积分），兜底回落到「最早一笔未过期」，
+ *   保证卡片仍能显示一个可参考的周期刷新时间，而不是变成"长期有效"。
+ *
  * 明细查询失败不影响汇总结果——只是各包到期时间显示为「长期有效」。
  */
 async function fetchPackageExpiryMap(account, origin) {
@@ -443,15 +452,25 @@ async function fetchPackageExpiryMap(account, origin) {
   ]);
 
   const now = Date.now();
-  /** 商品码 → 最早的未过期到期时刻（毫秒） */
+  /** 商品码 → 最早一笔「未过期且还有额度」的到期时刻（主口径） */
   const map = new Map();
+  /** 商品码 → 最早一笔「未过期」的到期时刻（该包全部用完后兜底） */
+  const fallback = new Map();
   const consider = (raw) => {
     const code = firstValue(raw, ['PackageCode', 'packageCode']);
     if (!code) return;
     const expireAt = resolveExpireAt(raw, now);
     if (expireAt == null || expireAt <= now) return; // 已过期/长期有效不参与
-    const prev = map.get(code);
-    if (prev == null || expireAt < prev) map.set(code, expireAt);
+    const prevFallback = fallback.get(code);
+    if (prevFallback == null || expireAt < prevFallback) fallback.set(code, expireAt);
+    // 剩余额度：周期口径优先，单笔口径兜底（两者都缺时 num() 回落为 0）
+    const remain = num(
+      firstValue(raw, ['CycleCapacityRemain', 'cycleCapacityRemain', 'CapacityRemain', 'capacityRemain'])
+    );
+    if (remain > 0) {
+      const prev = map.get(code);
+      if (prev == null || expireAt < prev) map.set(code, expireAt);
+    }
   };
 
   for (const settled of [paidRes, freeRes]) {
@@ -464,6 +483,9 @@ async function fetchPackageExpiryMap(account, origin) {
     }
     const list = data?.Accounts ?? data?.accounts ?? (Array.isArray(data) ? data : []);
     if (Array.isArray(list)) list.forEach(consider);
+  }
+  for (const [code, expireAt] of fallback) {
+    if (!map.has(code)) map.set(code, expireAt);
   }
   return map;
 }

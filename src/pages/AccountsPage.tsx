@@ -955,20 +955,29 @@ function PackagesDialog({ account, balance, onClose }: { account: AccountInfo | 
           <div className="max-h-[55vh] min-w-0 space-y-3 overflow-y-auto pr-1">
             {shown.map((r, i) => {
               const ratio = r.total > 0 ? Math.min(100, Math.max(0, (r.used / r.total) * 100)) : 0;
+              // 已用完的记录仍列在「有效期内」（客户端同口径），但加标记说明它不再提供额度
+              const usedUp = !r.expired && r.remaining <= 0;
               return (
                 <div key={`${r.packageCode || 'rec'}-${i}`} className="min-w-0">
-                  <div className="truncate text-sm font-medium text-zinc-800">{r.name}</div>
+                  <div className="flex min-w-0 items-center gap-2">
+                    <span className="truncate text-sm font-medium text-zinc-800">{r.name}</span>
+                    {usedUp && (
+                      <span className="shrink-0 rounded-md bg-zinc-100 px-1.5 py-0.5 text-[10px] font-medium text-zinc-500">
+                        已用完
+                      </span>
+                    )}
+                  </div>
                   <div className="mt-0.5 flex min-w-0 items-baseline justify-between gap-3 text-xs">
                     <span className="shrink-0 text-zinc-500">
                       {r.expireAt ? `到期时间 ${fmtFullDateTime(r.expireAt)}` : '长期有效'}
                     </span>
-                    <span className={`shrink-0 tabular-nums ${r.expired ? 'text-zinc-400' : 'text-zinc-700'}`}>
+                    <span className={`shrink-0 tabular-nums ${r.expired || usedUp ? 'text-zinc-400' : 'text-zinc-700'}`}>
                       已使用 {fmtCredits(r.used)}/{fmtCredits(r.total)}
                     </span>
                   </div>
                   <div className="mt-1.5 h-1.5 overflow-hidden rounded-full bg-zinc-100">
                     <div
-                      className={`h-full rounded-full ${r.expired ? 'bg-zinc-300' : 'bg-emerald-500'}`}
+                      className={`h-full rounded-full ${r.expired || usedUp ? 'bg-zinc-300' : 'bg-emerald-500'}`}
                       style={{ width: `${ratio}%` }}
                     />
                   </div>
@@ -1206,7 +1215,7 @@ function SessionCopyDialog({
   }, [sessions, query, hideCopied]);
 
   const visible = filtered.slice(0, SESSION_RENDER_LIMIT);
-  const selectableIds = useMemo(() => filtered.filter((s) => s.hasBody && !s.copied).map((s) => s.id), [filtered]);
+  const selectableIds = useMemo(() => filtered.filter((s) => s.hasBody).map((s) => s.id), [filtered]);
   const selectedBytes = useMemo(
     () => sessions.reduce((sum, s) => (selected.has(s.id) ? sum + s.bytes : sum), 0),
     [sessions, selected]
@@ -1408,7 +1417,9 @@ function SessionCopyDialog({
                 </div>
               )}
               {visible.map((s) => {
-                const disabled = !s.hasBody || s.copied;
+                // 「已复制过」的会话依然可以勾选：目标账号里那份可能已经落后了（本账号又聊了新内容），
+                // 再选一次不是重复复制，而是把新增内容与改名同步过去（后端按血缘原位合并）。
+                const disabled = !s.hasBody;
                 const checked = selected.has(s.id);
                 return (
                   <label
@@ -1435,7 +1446,11 @@ function SessionCopyDialog({
                           {s.title}
                         </span>
                         {s.isPlayground && <Badge color="violet">任务</Badge>}
-                        {s.copied && <Badge color="green">已复制</Badge>}
+                        {s.copied && (
+                          <span title="目标账号里已经有同一份会话；再勾选复制不会产生重复会话，只会把新增内容与改名同步过去">
+                            <Badge color="green">已复制</Badge>
+                          </span>
+                        )}
                         {!s.hasBody && <Badge color="amber">无正文</Badge>}
                       </div>
                       <div className="mt-0.5 flex min-w-0 items-center gap-x-2.5 text-[11px] text-zinc-400">
@@ -1468,15 +1483,15 @@ function SessionCopyDialog({
             {!!report.titleSynced?.length && (
               <div className="text-[11px] text-emerald-700">
                 改名同步：<b className="tabular-nums">{report.titleSynced.length}</b>{' '}
-                个会话的新名字已回写到本账号的原会话（客户端会给导入的副本重新生成自动标题，原会话带上固定名后不再被覆盖）。
+                个会话的新名字已写到目标账号里同一份会话上（客户端会给导入的副本重新生成自动标题，会话带上固定名后不再被覆盖）。
               </div>
             )}
             {!!report.contentSynced?.length && (
               <div className="text-[11px] text-emerald-700">
                 内容同步：<b className="tabular-nums">{report.contentSynced.length}</b>{' '}
-                个往返副本里新聊的内容（共{' '}
+                个会话新聊的内容（共{' '}
                 <b className="tabular-nums">{report.contentSynced.reduce((s, c) => s + c.appendedLines, 0)}</b> 行）已
-                合并回本账号的原会话，不会再重复复制出新会话。
+                合并进目标账号里同一份会话，不会再重复复制出新会话。
               </div>
             )}
             {report.errors.length > 0 && (
@@ -1490,7 +1505,7 @@ function SessionCopyDialog({
             )}
             {report.skipped.length > 0 && report.copied.length === 0 && report.errors.length === 0 && (
               <div className="text-[11px] text-zinc-500">
-                选中的会话此前已经复制过，本次全部跳过（不会在目标账号里堆出重复会话）。
+                选中的会话在目标账号里已经有同一份了，本次不再重复复制，只把新增的内容与改名同步过去。
               </div>
             )}
           </div>

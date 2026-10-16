@@ -363,10 +363,14 @@ export interface SessionCopyReport {
   copied: SessionCopyItem[];
   skipped: { id: string; reason: string; newId?: string }[];
   errors: { id: string; error: string }[];
-  /** 往返复制时回写到原会话的改名（源会话是本账号某会话的副本时触发） */
-  titleSynced?: { sourceId: string; originId: string; title: string }[];
-  /** 往返复制时追加回原会话正文的增量内容（副本里新聊的消息原位合并） */
-  contentSynced?: { sourceId: string; originId: string; appendedLines: number; bytes: number }[];
+  /**
+   * 原位同步到目标账号里那一份的改名。
+   * 两个方向都会触发：往返（本账号会话是目标账号某会话的副本）与正向（目标账号里已有旧副本）。
+   * `sourceId` = 本次选中的会话，`targetId` = 目标账号里被改名的会话。
+   */
+  titleSynced?: { sourceId: string; targetId: string; title: string }[];
+  /** 原位同步到目标账号里那一份的增量内容（只补对方没有的行，天然幂等） */
+  contentSynced?: { sourceId: string; targetId: string; appendedLines: number; bytes: number }[];
   totalBytes: number;
   backupPath: string;
   appStop: AppStopResult | null;
