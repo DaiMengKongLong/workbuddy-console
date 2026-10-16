@@ -13,7 +13,15 @@ files:
 # 统一产物命名（避免 productName 中的空格影响 Release 附件上传）
 artifactName: WorkBuddy-Console-${version}-${os}-${arch}.${ext}
 asar: true
-compression: normal
+# maximum：安装包明显更小（实测 ~5-8MB），代价是打包时间从 ~1 分钟增至 3-5 分钟
+compression: maximum
+# 只保留中英文语言包：Electron 默认带 55 个语言的 locales（实测 48.3MB），
+# 本工具面向中文用户，其余 53 个 .pak 纯属浪费（约占安装包 6-8MB）
+electronLanguages:
+  - zh-CN
+  - en-US
+# 打包后删除 Chromium 的许可证 HTML（19.5MB 纯文档，不影响运行）
+afterPack: scripts/afterPack.cjs
 
 win:
   target:
@@ -32,11 +40,10 @@ nsis:
   uninstallerIcon: build/icon.ico
 
 mac:
+  # 只出 dmg：dmg 与 zip 内容几乎相同（各 ~127MB），而本工具没有内置自动更新
+  # （升级走「跳浏览器下载」），zip 无人使用——双架构下白占 257MB Release 体积
   target:
     - target: dmg
-      arch: [arm64, x64]
-    # zip 便于不走 App Store 的直接分发，也是日后自动更新的载体
-    - target: zip
       arch: [arm64, x64]
   icon: build/icon.icns
   category: public.app-category.developer-tools

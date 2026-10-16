@@ -1,7 +1,7 @@
 {
   "name": "workbuddy-console",
   "private": true,
-  "version": "0.2.6",
+  "version": "0.2.7",
   "description": "workbuddy控制台：账号切换、多平台免费模型广场、Token 与积分用量统计",
   "author": "walter-io",
   "license": "MIT",
@@ -31,9 +31,6 @@
   },
   "dependencies": {
     "express": "^4.21.0",
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1",
-    "recharts": "^2.13.0",
     "undici": "^6.29.0"
   },
   "devDependencies": {
@@ -45,6 +42,9 @@
     "electron": "^44.5.1",
     "electron-builder": "^26.15.3",
     "qrcode": "^1.5.4",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "recharts": "^2.13.0",
     "sharp": "^0.35.5",
     "tailwindcss": "^4.0.0",
     "typescript": "^5.7.2",
