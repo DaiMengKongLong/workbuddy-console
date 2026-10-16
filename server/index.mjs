@@ -982,13 +982,14 @@ const CHECKIN_PATROL_MS = 60 * 60 * 1000;
 let checkinPatrolBusy = false;
 let checkinPatrolTimer = null;
 
-async function runCheckinPatrol() {
+async function runCheckinPatrol({ ignoreQuietHours = false } = {}) {
   if (checkinPatrolBusy) return;
   const cfg = loadConfig();
   if (!cfg.settings.autoCheckin) return;
-  // 只在 06:00–23:00 之间巡检，避免深夜反复打扰官方接口
+  // 小时级巡检只在 06:00–23:00 之间进行，避免深夜反复打扰官方接口；
+  // 启动触发的那一次（ignoreQuietHours）不受此限——用户要求启动即领，而不是等到固定时间
   const hour = new Date().getHours();
-  if (hour < 6 || hour >= 23) return;
+  if (!ignoreQuietHours && (hour < 6 || hour >= 23)) return;
   checkinPatrolBusy = true;
   try {
     // 两道门禁：签到 + 成长中心（签到早满了也不影响成长中心的旅行/任务/补登/兑换/盲盒）
@@ -1007,10 +1008,17 @@ async function runCheckinPatrol() {
   }
 }
 
-/** 启动巡检：先延迟 30 秒（等界面加载完），之后每小时一次 */
+/**
+ * 启动巡检：先延迟 30 秒（等界面加载完），之后每小时一次。
+ *
+ * **每次启动必领一次**且不受夜间窗口限制（用户要求 2026-10-17）：
+ * 早先那次启动巡检走 06:00–23:00 时间窗，深夜/凌晨启动会被直接跳过，
+ * 积分要等到早上 6 点后的某次整点巡检才领到——变成"固定等时间"而不是"启动即领"。
+ * 幂等门禁（今天已签到且成长任务已完成就直接返回）保证重复启动不会重复请求。
+ */
 function startCheckinPatrol() {
   if (checkinPatrolTimer) clearInterval(checkinPatrolTimer);
-  setTimeout(runCheckinPatrol, 30_000);
+  setTimeout(() => runCheckinPatrol({ ignoreQuietHours: true }), 30_000);
   checkinPatrolTimer = setInterval(runCheckinPatrol, CHECKIN_PATROL_MS);
 }
 
