@@ -27,7 +27,7 @@ import {
 } from './targets/workbuddy.mjs';
 import { getStats } from './stats/workbuddyStats.mjs';
 import { getProxyUrl } from './proxy.mjs';
-import { loadAccounts, accountMeta } from './workbuddy/accounts.mjs';
+import { loadAccounts, accountMeta, findAccount, accountDisplayName } from './workbuddy/accounts.mjs';
 import { oauthStart, oauthPoll } from './workbuddy/oauth.mjs';
 import {
   switchAccount,
@@ -36,7 +36,13 @@ import {
   deleteAccount,
   updateAccountDisplay,
 } from './workbuddy/auth.mjs';
-import { getCreditStatistics, getOfflineCreditProjection, getAccountBalances, getCreditDetails } from './workbuddy/credits.mjs';
+import {
+  getCreditStatistics,
+  getOfflineCreditProjection,
+  getAccountBalances,
+  getCreditDetails,
+} from './workbuddy/credits.mjs';
+import { refreshAccessToken } from './proxy/wb.mjs';
 import { VARIANT_LIST, authFilePath, dataRoot } from './workbuddy/variant.mjs';
 import { checkinAll, checkinAccount, fetchCheckinStatus, loadCheckinLogs, allCheckedInToday, allGrowthDoneToday } from './workbuddy/checkin.mjs';
 import {
@@ -44,6 +50,9 @@ import {
   refreshPlan,
   loadRefreshLogs,
   lastRefreshRun,
+  loadCredentialStatus,
+  verifyStateOf,
+  verifyAccount,
   ACCESS_MIN_HOURS,
   REFRESH_MIN_HOURS,
 } from './workbuddy/tokenRefresh.mjs';
@@ -556,8 +565,11 @@ app.get(
 app.get('/api/accounts', (req, res) => {
   const accounts = loadAccounts();
   const current = detectCurrentAccount();
+  // 附上最近一次验活结论：界面据此把「凭据有效」改成「服务端确认有效 / 已失效」，
+  // 而不是只看本地有效期（2026-10-18 反馈：显示有效、切过去却登录过期）
+  const verified = loadCredentialStatus();
   res.json({
-    accounts: accounts.map(accountMeta),
+    accounts: accounts.map((a) => ({ ...accountMeta(a), verify: verified[a.id] || null })),
     current: {
       variant: current.variant,
       uid: current.uid,
@@ -587,6 +599,53 @@ app.post(
     if (!id) return res.status(400).json({ error: '缺少账号 id' });
     const ids = Array.isArray(req.body?.copySessionIds) ? req.body.copySessionIds : [];
     const stopApp = req.body?.stopApp === true;
+
+    const target = findAccount(id);
+    if (!target) return res.status(400).json({ error: '账号不存在' });
+
+    /**
+     * 0) 凭据验活兜底：本机「未过期」不代表服务端认可。
+     *
+     * 验活本身已经由**定时巡检**负责（每 6 小时一次，结论落盘），这里只是切换前的
+     * 最后一道门：优先复用 10 分钟内的巡检结论，没有新鲜结论时才现验一次。
+     * 明确被拒（401/403）就试一次刷新，仍不行就中止切换并给出可操作提示——
+     * 而不是把死 token 写进去，让用户切过去才发现 WorkBuddy「登录已过期」。
+     * 网络异常（非鉴权失败）不拦截：不能因为断网就不让用户切号。
+     */
+    const VERIFY_REUSE_MS = 10 * 60 * 1000;
+    if (typeof target.access_token === 'string' && target.access_token) {
+      let vs = verifyStateOf(target.id);
+      if (!vs || Date.now() - Number(vs.at || 0) > VERIFY_REUSE_MS) {
+        try {
+          vs = await verifyAccount(target);
+        } catch {
+          vs = null;
+        }
+      }
+      if (vs && !vs.valid && vs.unauthorized && target.refresh_token) {
+        // 试着用 refresh_token 换一份新的（换不到就算了，失败不影响最终判定）
+        try {
+          await refreshAccessToken(target);
+        } catch {
+          /* 刷新失败按原判定处理 */
+        }
+        const fresh = findAccount(id);
+        if (fresh) {
+          try {
+            vs = await verifyAccount(fresh);
+          } catch {
+            /* 保持原判定 */
+          }
+        }
+      }
+      if (vs && !vs.valid && vs.unauthorized) {
+        return res.status(400).json({
+          error:
+            `账号「${accountDisplayName(target)}」的凭据已被服务端判定失效（本机显示未过期不代表服务端认可）。` +
+            '请在 WorkBuddy 里重新登录该账号，然后重新导入到控制台再切换',
+        });
+      }
+    }
 
     // 1) 先退出 WorkBuddy（未运行则空转）
     let appStop = null;
@@ -951,7 +1010,8 @@ async function runTokenRefreshPatrol({ silent = false } = {}) {
     // 平时（没有临期账号）完全静默：这类巡检不该在日志里刷存在感
     if (summary.refreshed || summary.failed || (!silent && summary.dead)) {
       console.log(
-        `[refresh] 凭据巡检：刷新 ${summary.refreshed}、跳过 ${summary.skipped}、失败 ${summary.failed}、需重新登录 ${summary.dead}`
+        `[refresh] 凭据巡检：验活有效 ${summary.verified ?? 0}、刷新 ${summary.refreshed}、跳过 ${summary.skipped}、失败 ${summary.failed}、需重新登录 ${summary.dead}` +
+          ((summary.invalid ?? 0) > 0 ? `（其中 ${summary.invalid} 个被服务端判定失效）` : '')
       );
       for (const r of results.filter((x) => x.action === 'failed')) {
         console.error(`[refresh] 「${r.accountName}」刷新失败：${r.message}`);
@@ -974,6 +1034,48 @@ function startTokenRefreshPatrol() {
 }
 
 startTokenRefreshPatrol();
+
+/* ---------------- 版本定时自检 ---------------- */
+
+/**
+ * 版本定时自检：每小时**主动**刷新一次远端版本信息（force，不吃 6 小时缓存）。
+ *
+ * 早先只有界面挂载时才查一次，控制台常年驻留后台的用户永远等不到升级按钮——
+ * 只有下次重启才看得见新版本（2026-10-18 用户反馈）。现在由服务端定时刷新缓存，
+ * 界面侧再定时取一次缓存结果，升级按钮不重启也能出现。
+ *
+ * 限流：GitHub 未认证接口每小时 60 次，这里每小时 1 次，余量充足；
+ * 关掉「自动检查更新」后整体不工作，也不发起任何出站请求。
+ */
+const UPDATE_PATROL_MS = 60 * 60 * 1000;
+let updatePatrolBusy = false;
+let updatePatrolTimer = null;
+
+async function runUpdatePatrol() {
+  if (updatePatrolBusy) return;
+  if (!loadConfig().settings.autoCheckUpdate) return;
+  updatePatrolBusy = true;
+  try {
+    const r = await checkForUpdate({ force: true });
+    if (r?.ok && r.hasUpdate) {
+      console.log(`[update] 发现新版本 v${r.latest}（当前 v${r.current}），升级按钮已就绪`);
+    }
+  } catch (e) {
+    // 网络抖动/限流都算常态，不打扰用户
+    console.error('[update] 定时检查出错:', e?.message || e);
+  } finally {
+    updatePatrolBusy = false;
+  }
+}
+
+function startUpdatePatrol() {
+  if (updatePatrolTimer) clearInterval(updatePatrolTimer);
+  // 启动 1 分钟后先查一次（首屏自己也会查，这里让缓存尽快就位），之后每小时一次
+  setTimeout(runUpdatePatrol, 60_000);
+  updatePatrolTimer = setInterval(runUpdatePatrol, UPDATE_PATROL_MS);
+}
+
+startUpdatePatrol();
 
 /* ---------------- 自动签到巡检 ---------------- */
 

@@ -71,9 +71,42 @@ async function authenticatedPost(account, url, body) {
   try {
     json = JSON.parse(text);
   } catch {
-    throw new Error(`接口返回非 JSON（HTTP ${res.status}）`);
+    const err = new Error(`接口返回非 JSON（HTTP ${res.status}）`);
+    // 401/403 且响应不是 JSON 时，同样要能识别成"凭据失效"
+    if (res.status === 401 || res.status === 403) err.unauthorized = true;
+    throw err;
+  }
+  if (!res.ok && (res.status === 401 || res.status === 403)) {
+    const err = new Error(json?.msg || json?.message || json?.Message || `HTTP ${res.status}`);
+    err.unauthorized = true;
+    throw err;
   }
   return json;
+}
+
+/**
+ * 校验一个账号的凭据**服务端是否认可**（本机未过期 ≠ 真的有效）。
+ *
+ * 2026-10-18 用户反馈：面板显示「凭据有效」，切过去 WorkBuddy 却说登录已过期。
+ * 原因是面板的判断只看本地 expiresAt——token 可能早已被轮换/吊销，只有真的打一次
+ * 官方接口才知道。这里复用余额汇总接口（最轻、所有账号都有权限）。
+ *
+ * 返回 `{ valid, unauthorized, message }`：
+ * - `unauthorized: true` → 服务端明确拒绝（凭据失效，只能重新登录/重新导入）；
+ * - `valid: false` 但 `unauthorized: false` → 网络/接口异常，**不能**据此判定凭据失效。
+ */
+export async function verifyAccountCredential(account) {
+  const variant = variantOf(account);
+  try {
+    await authenticatedPost(account, variant.resourceUrl, {});
+    return { valid: true, unauthorized: false, message: '' };
+  } catch (err) {
+    return {
+      valid: false,
+      unauthorized: !!err?.unauthorized,
+      message: err?.message || '凭据校验失败',
+    };
+  }
 }
 
 /** 官方统一响应包：{ code, data, msg }。code 非 0 视为业务失败 */
@@ -639,9 +672,17 @@ export async function getAccountBalances({ refresh = false } = {}) {
     try {
       const b = await fetchBalance(account);
       recordSnapshot(account, b.total, b.remaining);
-      rows.push({ ...base, balance: { ...b, updatedAt: now }, balanceError: null, error: null });
+      rows.push({ ...base, balance: { ...b, updatedAt: now }, balanceError: null, error: null, authInvalid: false });
     } catch (err) {
-      rows.push({ ...base, balance: null, balanceError: err?.message || '余额查询失败', error: err?.message || '查询失败' });
+      // unauthorized = 官方明确拒绝这个 token（过期/被轮换/吊销）。界面据此把
+      // 「凭据有效」改判为「凭据已失效」，不再拿本地有效期糊弄用户（2026-10-18 反馈）。
+      rows.push({
+        ...base,
+        balance: null,
+        balanceError: err?.message || '余额查询失败',
+        error: err?.message || '查询失败',
+        authInvalid: !!err?.unauthorized,
+      });
       errors.push({ ...base, error: err?.message || '查询失败' });
     }
   }

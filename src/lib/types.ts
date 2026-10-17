@@ -264,6 +264,20 @@ export interface AccountInfo {
   hasEnvelope: boolean;
   /** token 尾号，完整值永不返回前端 */
   masked: string;
+  /**
+   * 最近一次**服务端验活**结论（由定时巡检写入）。
+   * 本地 expiresAt 只说明"没到时间"，不代表服务端还认——界面以这个为准。
+   */
+  verify?: CredentialVerifyState | null;
+}
+
+/** 服务端验活结论（不含任何 token） */
+export interface CredentialVerifyState {
+  at: number;
+  valid: boolean;
+  /** 官方明确拒绝（401/403）：token 已被轮换/吊销，只能重新登录 */
+  unauthorized: boolean;
+  message: string;
 }
 
 export interface VariantInfo {
@@ -510,6 +524,8 @@ export interface AccountBalanceRow {
   balance: CreditBalance | null;
   balanceError: string | null;
   error: string | null;
+  /** 官方接口明确拒绝了这个 token（401/403）：凭据已失效，需重新登录，本地有效期不算数 */
+  authInvalid?: boolean;
 }
 
 export interface AccountBalancesResponse {
@@ -605,7 +621,19 @@ export interface AccountRefreshPlan {
   /** refresh_token 已过期或无机密凭据：只能重新扫码 */
   dead: boolean;
   due: boolean;
-  reason: 'ok' | 'access-expiring' | 'refresh-expiring' | 'dead' | 'unknown-expiry' | 'no-refresh-token' | 'manual';
+  /** 是否就是 WorkBuddy 当前登录账号（由官方客户端自行维护，不自动刷新） */
+  current?: boolean;
+  reason:
+    | 'ok'
+    | 'access-expiring'
+    | 'refresh-expiring'
+    | 'dead'
+    | 'unknown-expiry'
+    | 'no-refresh-token'
+    | 'manual'
+    | 'current';
+  /** 最近一次服务端验活结论（定时巡检写入） */
+  verify?: CredentialVerifyState | null;
 }
 
 export interface AccountRefreshRunResult {

@@ -29,7 +29,7 @@ const ACCOUNTS_FILE = path.join(process.env.WB_SWITCH_HOME, 'accounts.json');
 const REFRESH_LOGS_FILE = path.join(process.env.WB_SWITCH_HOME, 'token_refresh_logs.json');
 
 const { compareVersions, parseVersion, pickAsset, LOCAL_VERSION } = await import('../server/update.mjs');
-const { refreshPlanFor, refreshAccounts, ACCESS_MIN_HOURS, REFRESH_MIN_HOURS, loadRefreshLogs } = await import(
+const { refreshPlanFor, refreshAccounts, decideCredentialAction, ACCESS_MIN_HOURS, REFRESH_MIN_HOURS, loadRefreshLogs } = await import(
   '../server/workbuddy/tokenRefresh.mjs'
 );
 const { loadAccounts } = await import('../server/workbuddy/accounts.mjs');
@@ -204,7 +204,7 @@ section('4. refreshAccounts：真的刷、真的写回、真的记账');
       acct('noRefresh', { accessHours: 5, refresh: false }),
     ]);
 
-    const { results, summary } = await refreshAccounts({ delayMs: 0 });
+    const { results, summary } = await refreshAccounts({ delayMs: 0, skipVerify: true });
     const byId = Object.fromEntries(results.map((r) => [r.accountId, r]));
 
     check('临期账号被刷新', byId.due?.action === 'refreshed', byId.due);
@@ -234,28 +234,108 @@ section('4. refreshAccounts：真的刷、真的写回、真的记账');
     check('未临期的账号内容一字未动', untouched?.access_token === 'access-fresh');
 
     const logs = loadRefreshLogs();
-    check('刷新动作写入了日志', logs.length >= 1 && logs[0].action === 'refreshed', logs[0]);
+    check('刷新动作写入了日志', logs.length >= 1 && logs.some((l) => l.action === 'refreshed'), logs[0]);
     check('日志里不含任何 token', !JSON.stringify(logs).includes('brand-new-access'));
 
     // 按账号 + force：用户明确点在某一个账号上时不看临期
-    const one = await refreshAccounts({ accountIds: ['fresh'], force: true, delayMs: 0 });
+    const one = await refreshAccounts({ accountIds: ['fresh'], force: true, delayMs: 0, skipVerify: true });
     check('force + 指定账号 → 即使充裕也刷', one.results[0]?.action === 'refreshed', one.results[0]);
 
     // 反向验证：force=false 时不会因为"指定了账号"就刷
     writeAccounts([acct('fresh2', { accessHours: 400, refreshHours: 800 })]);
-    const quiet = await refreshAccounts({ accountIds: ['fresh2'], delayMs: 0 });
+    const quiet = await refreshAccounts({ accountIds: ['fresh2'], delayMs: 0, skipVerify: true });
     check('指定账号但未临期 → 仍然跳过', quiet.results[0]?.action === 'skipped', quiet.results[0]);
     check('跳过时不发任何网络请求', called.length === 2, called.length);
 
     // 官方报错时不得抛，而是逐账号记失败原因
     writeAccounts([acct('boom', { accessHours: 1, refreshHours: 100 })]);
     globalThis.fetch = async () => new Response('{"code":400,"message":"refresh_token 无效"}', { status: 400 });
-    const failed = await refreshAccounts({ delayMs: 0 });
+    const failed = await refreshAccounts({ delayMs: 0, skipVerify: true });
     check('官方拒绝时不抛错，回报为 failed', failed.results[0]?.action === 'failed', failed.results[0]);
     check('失败原因带上官方返回内容', /HTTP 400/.test(failed.results[0]?.message || ''), failed.results[0]?.message);
   } finally {
     globalThis.fetch = realFetch;
   }
+}
+
+section('6. 当前登录账号不参与自动刷新（2026-10-18「登录莫名失效」修复）');
+{
+  /**
+   * 官方刷新是轮换式的：谁刷新谁拿到新 refresh_token，另一份立刻作废。
+   * 当前登录账号的登录态文件由 WorkBuddy 自己维护，我们再去刷它等于把它手里那份顶掉——
+   * 它下次自己刷新就失败，用户看到的就是「莫名其妙登出」。所以自动巡检必须绕开它，
+   * 只有用户手动点（force）才允许刷（那条路径会把新凭据同步写回登录态文件）。
+   */
+  const a = acct('cur', { accessHours: 1, refreshHours: 10 }); // 临期
+  const normal = refreshPlanFor(a, {});
+  check('临期账号本身应判为 due', normal.due === true, normal);
+
+  const asCurrent = refreshPlanFor(a, { currentUid: a.uid });
+  check('当前登录账号 → 不自动刷新', asCurrent.due === false && asCurrent.reason === 'current', asCurrent);
+  check('结果里带 current 标记（界面据此解释）', asCurrent.current === true, asCurrent);
+
+  const forced = refreshPlanFor(a, { currentUid: a.uid, force: true });
+  check('手动指定（force）仍然允许刷新', forced.due === true, forced);
+
+  const other = refreshPlanFor(a, { currentUid: 'uid-somebody-else' });
+  check('当前账号是别人时不影响这个账号', other.due === true && other.reason !== 'current', other);
+}
+
+section('7. 验活决策表：先验活、再决定是否刷新（2026-10-18「显示有效却已失效」修复）');
+{
+  /**
+   * ① 本地"未过期"不算数：验活有效才算有效；
+   * ② 服务端拒绝时才刷新（而不是到点就轮换），减少与官方客户端互踩；
+   * ③ 网络异常不得判定为失效；当前登录账号不自动刷新。
+   */
+  const plan = (o = {}) => ({
+    id: 'a',
+    uid: 'uid-a',
+    name: 'a',
+    variant: 'cn',
+    accessHours: 100,
+    refreshHours: 300,
+    hasRefreshToken: true,
+    hasPlainAccess: true,
+    current: false,
+    dead: false,
+    due: false,
+    reason: 'ok',
+    ...o,
+  });
+  const ok = { valid: true, unauthorized: false, message: '' };
+  const denied = { valid: false, unauthorized: true, message: 'unauthorized' };
+  const netFail = { valid: false, unauthorized: false, message: 'ECONNRESET' };
+
+  let d = decideCredentialAction({ plan: plan(), verify: ok });
+  check('有效 + 不临期 → 跳过，不刷新', d.action === 'skipped' && d.reason === 'verified-valid' && !d.needRefresh, d);
+
+  d = decideCredentialAction({ plan: plan({ due: true, reason: 'access-expiring' }), verify: ok });
+  check('有效 + 临期 → 刷新', d.needRefresh === true && d.action === 'refresh', d);
+
+  d = decideCredentialAction({ plan: plan(), verify: denied });
+  check('被拒 + 有 refresh_token → 先刷新', d.needRefresh === true, d);
+
+  d = decideCredentialAction({ plan: plan({ hasRefreshToken: false }), verify: denied });
+  check('被拒 + 无 refresh_token → 判定失效（dead）', d.action === 'dead' && d.reason === 'invalid-no-refresh', d);
+
+  d = decideCredentialAction({ plan: plan({ current: true }), verify: denied });
+  check('被拒 + 当前登录账号（自动）→ 判定失效并提示重新登录', d.action === 'dead' && d.reason === 'current-invalid', d);
+
+  d = decideCredentialAction({ plan: plan({ current: true }), verify: denied, force: true });
+  check('被拒 + 当前登录账号（手动 force）→ 允许刷新', d.needRefresh === true, d);
+
+  d = decideCredentialAction({ plan: plan({ current: true, due: true }), verify: ok });
+  check('有效 + 当前登录账号临期（自动）→ 仍不刷新', d.action === 'skipped' && d.reason === 'current', d);
+
+  d = decideCredentialAction({ plan: plan({ due: true }), verify: netFail });
+  check('网络异常 → 跳过且不刷新（不得误判失效）', d.action === 'skipped' && d.reason === 'verify-failed' && !d.needRefresh, d);
+
+  d = decideCredentialAction({ plan: plan({ due: true, reason: 'access-expiring' }), verify: null });
+  check('未验活 + 临期 → 退回旧逻辑刷新', d.needRefresh === true, d);
+
+  d = decideCredentialAction({ plan: plan({ dead: true, reason: 'dead' }), verify: null });
+  check('未验活 + 本地已死 → dead', d.action === 'dead', d);
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);

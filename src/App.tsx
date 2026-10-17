@@ -17,6 +17,7 @@ import {
   ToastProvider,
 } from './components/ui';
 import { get } from './lib/api';
+import { onUpdateChecked } from './lib/appUpdate';
 import type { AccountsResponse, AppUpdateInfo, LoadedInfo } from './lib/types';
 import StatsPage from './pages/StatsPage';
 import SettingsPage from './pages/SettingsPage';
@@ -65,15 +66,28 @@ function VersionFooter() {
 
   useEffect(() => {
     let alive = true;
-    get<AppUpdateInfo>('/api/app/update')
-      .then((r) => {
-        if (alive) setInfo(r);
-      })
-      .catch(() => {
-        /* 检查失败只影响按钮显示，不该在界面上报错 */
-      });
+    const load = () =>
+      get<AppUpdateInfo>('/api/app/update')
+        .then((r) => {
+          if (alive) setInfo(r);
+        })
+        .catch(() => {
+          /* 检查失败只影响按钮显示，不该在界面上报错 */
+        });
+    load();
+    // 定时复查：服务端每小时主动刷新一次远端版本（见 server/index.mjs 的版本自检巡检），
+    // 这里每 10 分钟取一次缓存结果即可——让升级按钮**不重启也能出现**。
+    // 原先只在挂载时查一次，常年不关的控制台永远看不到新版本（2026-10-18 用户反馈）。
+    const timer = setInterval(load, 10 * 60_000);
+    // 设置页点「检查更新」会强制打一次接口，结果通过事件立刻同步过来——
+    // 不然用户刚在设置页看到「发现新版本」，左下角却要等最多 10 分钟才长出按钮。
+    const off = onUpdateChecked((r) => {
+      if (alive) setInfo(r);
+    });
     return () => {
       alive = false;
+      clearInterval(timer);
+      off();
     };
   }, []);
 

@@ -208,6 +208,7 @@ function AccountCard({
   busy,
   balance,
   balanceLoading,
+  authInvalid,
   onSwitch,
   onSyncSessions,
   onRefreshToken,
@@ -220,6 +221,8 @@ function AccountCard({
   busy: boolean;
   balance: CreditBalance | null;
   balanceLoading: boolean;
+  /** 官方接口已明确拒绝该账号的凭据（401/403）——本地未过期也不算数 */
+  authInvalid: boolean;
   onSwitch: () => void;
   onSyncSessions: () => void;
   onRefreshToken: () => void;
@@ -227,14 +230,33 @@ function AccountCard({
   onDelete: () => void;
   onShowPackages: () => void;
 }) {
-  // 凭据状态三态：可切换 / 已过期 / 加密信封（无法作为可切换凭据）
+  /**
+   * 凭据状态：以**服务端验活结论**为准（定时巡检每 6 小时刷新一次，结果落盘）。
+   * 本地 expiresAt 只说明"没到时间"，不代表官方还认这个 token——早先只看本地时间，
+   * 于是出现「面板显示凭据有效、切过去 WorkBuddy 却说登录过期」（2026-10-18 反馈）。
+   */
+  const vs = account.verify || null;
   const credState = !account.hasPlainToken
     ? account.hasEnvelope
       ? { color: 'amber', text: '加密凭据' }
       : { color: 'red', text: '无可用凭据' }
-    : account.expired
-      ? { color: 'red', text: '凭据已过期' }
-      : { color: 'green', text: '凭据有效' };
+    : vs?.unauthorized || authInvalid
+      ? { color: 'red', text: '凭据已失效' }
+      : account.expired
+        ? { color: 'red', text: '凭据已过期' }
+        : vs?.valid
+          ? { color: 'green', text: '凭据有效' }
+          : { color: 'gray', text: '待验活' };
+
+  const credTitle = vs?.unauthorized
+    ? `服务端于 ${fmtClock(vs.at)} 明确拒绝该凭据（token 已被轮换或吊销）。请重新登录该账号后重新导入`
+    : vs?.valid
+      ? `服务端于 ${fmtClock(vs.at)} 确认凭据有效`
+      : authInvalid
+        ? '官方接口已拒绝这个账号的凭据，本地「未过期」不算数。请重新登录该账号后重新导入'
+        : !account.hasPlainToken
+          ? undefined
+          : '尚未验活：凭据巡检每 6 小时自动验一次，也可以点「刷新凭据」立即验证';
 
   const pkgs = usablePackages(balance).slice(0, 2);
   const pkgTotal = usablePackages(balance).length;
@@ -283,7 +305,9 @@ function AccountCard({
             )}
             <div className="mt-1.5 flex min-w-0 flex-wrap items-center gap-1.5">
               <Badge color="gray">{account.variantLabel}</Badge>
-              <Badge color={credState.color}>{credState.text}</Badge>
+              <span title={credTitle}>
+                <Badge color={credState.color}>{credState.text}</Badge>
+              </span>
             </div>
           </div>
         </div>
@@ -1696,7 +1720,9 @@ export default function AccountsPage() {
       if (row?.ok && row.action === 'refreshed') {
         toast('ok', `「${account.name}」凭据已刷新，有效期已顺延`);
       } else if (row?.ok) {
-        toast('info', `「${account.name}」未做刷新（${row.reason}）`);
+        // 跳过类结果优先用服务端给出的人话（如当前登录账号不参与自动刷新、失败冷却），
+        // 没有 message 时才退回原因码，避免界面上出现 current / failed-cooldown 这种裸标识
+        toast('info', row?.message || `「${account.name}」未做刷新（${row.reason}）`);
       } else {
         toast('err', row?.message || '刷新失败');
       }
@@ -1785,6 +1811,12 @@ export default function AccountsPage() {
     [balances]
   );
 
+  /** 官方已拒绝凭据的账号 id 集合（余额查询结果是目前最可靠的验活信号） */
+  const authInvalidIds = useMemo(
+    () => new Set((balances?.accounts || []).filter((r) => r.authInvalid).map((r) => r.accountId)),
+    [balances]
+  );
+
   const visibleAccounts = useMemo(
     () => (data?.accounts || []).filter((a) => a.variant === variant),
     [data, variant]
@@ -1795,10 +1827,11 @@ export default function AccountsPage() {
     const list = data?.accounts || [];
     return {
       total: list.length,
-      usable: list.filter((a) => a.hasPlainToken && !a.expired).length,
-      needsAuth: list.filter((a) => !a.hasPlainToken || a.expired).length,
+      // 可用 = 有明文凭据、本地未过期、且服务端**没有**拒绝它
+      usable: list.filter((a) => a.hasPlainToken && !a.expired && !authInvalidIds.has(a.id)).length,
+      needsAuth: list.filter((a) => !a.hasPlainToken || a.expired || authInvalidIds.has(a.id)).length,
     };
-  }, [data]);
+  }, [data, authInvalidIds]);
 
   if (loading) {
     return (
@@ -1998,6 +2031,7 @@ export default function AccountsPage() {
                 busy={busyId === a.id}
                 balance={balanceOf(a.id)}
                 balanceLoading={balanceLoading && !balanceOf(a.id)}
+                authInvalid={authInvalidIds.has(a.id)}
                 onSwitch={() => doSwitch(a)}
                 onSyncSessions={() => {
                   setSessionMode('copy');

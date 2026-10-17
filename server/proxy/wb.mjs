@@ -12,6 +12,7 @@
 import crypto from 'node:crypto';
 import { loadAccounts, saveAccounts, secretValue } from '../workbuddy/accounts.mjs';
 import { variantOf } from '../workbuddy/variant.mjs';
+import { syncTokensToAuthFile } from '../workbuddy/auth.mjs';
 
 /** 出站客户端版本段（对齐官方桌面端分发包，可调） */
 const CLIENT_VERSION = '5.5.4';
@@ -158,7 +159,21 @@ export async function refreshAccessToken(account, { timeoutMs = 30_000 } = {}) {
   } catch {
     /* 非 JSON：按状态码处理 */
   }
-  if (!res.ok) throw new Error(`刷新失败：HTTP ${res.status} ${text.slice(0, 120)}`);
+  if (!res.ok) {
+    /**
+     * 「refresh token is invalid」是官方最常见的凭据失效态：官方刷新是**轮换式**的，
+     * 一次刷新成功后旧 refresh_token 立即作废。账号无论被官方客户端还是本工具刷新过，
+     * 另一份副本里的旧值再拿来刷就是这个错。直接把原文抛给用户没有可操作性，这里翻成
+     * 「怎么回事 + 怎么办」（2026-10-18 用户反馈：登录莫名失效后点刷新凭据只见这句英文）。
+     */
+    if (/invalid[_\s-]*(refresh|token)|refresh[_\s-]*token[_\s-]*is[_\s-]*invalid|invalid_grant/i.test(text)) {
+      throw new Error(
+        'refresh_token 已失效：官方刷新会轮换 token，账号被刷新过一次后旧值就作废了。' +
+          '请在 WorkBuddy 里重新登录该账号（或先切到别的账号再切回，让客户端自行续期），然后重新导入到控制台'
+      );
+    }
+    throw new Error(`刷新失败：HTTP ${res.status} ${text.slice(0, 120)}`);
+  }
   const data = payload?.data && typeof payload.data === 'object' ? payload.data : payload;
   const access = data?.accessToken || data?.access_token;
   if (!access) throw new Error('刷新失败：响应里没有 accessToken，需重新扫码登录');
@@ -176,6 +191,15 @@ export async function refreshAccessToken(account, { timeoutMs = 30_000 } = {}) {
     const refreshExpiresIn = Number(data?.refreshExpiresIn ?? data?.refresh_expires_in);
     if (Number.isFinite(refreshExpiresIn) && refreshExpiresIn > 0) target.refreshExpiresAt = now + refreshExpiresIn * 1000;
     saveAccounts(accounts);
+    // 官方刷新是轮换式的：旧 refresh_token 已在服务端作废。如果刷新的正是**当前登录账号**，
+    // 必须把新凭据写回登录态文件，否则 WorkBuddy 还攥着作废的旧 token，
+    // 它下一次自己刷新就会失败 → 用户看到「登录状态莫名失效」（2026-10-18 用户反馈）。
+    // 不是当前账号时该函数自己返回 synced:false，什么也不做；同步失败不影响刷新结果。
+    try {
+      syncTokensToAuthFile(target);
+    } catch {
+      /* 同步是尽力而为：账号库已更新，登录态文件下次切号时会重写 */
+    }
   }
   return access;
 }

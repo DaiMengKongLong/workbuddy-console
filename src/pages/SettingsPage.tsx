@@ -20,6 +20,7 @@ import {
   useToast,
 } from '../components/ui';
 import { del, get, post, put } from '../lib/api';
+import { emitUpdateChecked } from '../lib/appUpdate';
 import type {
   AccountRefreshResponse,
   AccountRefreshRunResponse,
@@ -93,6 +94,12 @@ const REFRESH_REASON_TEXT: Record<string, string> = {
   'unknown-expiry': '未记录有效期，暂不处理',
   'no-refresh-token': '无 refresh_token，需重新扫码',
   manual: '手动刷新',
+  current: '当前登录账号（由 WorkBuddy 自行续期，不自动刷新）',
+  'failed-cooldown': '上次刷新失败，已暂停自动重试',
+  'verified-valid': '服务端确认有效',
+  'verify-failed': '验活请求失败（网络）',
+  'invalid-no-refresh': '服务端已拒绝，且无 refresh_token 可续期',
+  'current-invalid': '当前登录账号已被服务端拒绝',
 };
 
 export default function SettingsPage() {
@@ -179,9 +186,13 @@ export default function SettingsPage() {
     async (force = false) => {
       setCheckingUpdate(true);
       try {
-        setUpdateInfo(
-          force ? await post<AppUpdateInfo>('/api/app/update/check') : await get<AppUpdateInfo>('/api/app/update')
-        );
+        const info = force
+          ? await post<AppUpdateInfo>('/api/app/update/check')
+          : await get<AppUpdateInfo>('/api/app/update');
+        setUpdateInfo(info);
+        // 常驻的左下角版本区是另一个组件：把结果广播过去，否则「这里已显示发现新版本、
+        // 左下角却没按钮」（用户 2026-10-18 反馈）
+        emitUpdateChecked(info);
       } catch (e: any) {
         if (force) toast('err', e?.message || '检查更新失败');
       } finally {
@@ -741,6 +752,28 @@ export default function SettingsPage() {
                   <Badge color={a.dead ? 'red' : a.due ? 'amber' : 'gray'}>
                     {REFRESH_REASON_TEXT[a.reason] || a.reason}
                   </Badge>
+                  {/* 服务端验活结论：本地有效期不算数，这里才是官方真实态度 */}
+                  <span
+                    title={
+                      a.verify
+                        ? a.verify.valid
+                          ? `服务端于 ${fmtDateTime(a.verify.at)} 确认凭据有效`
+                          : `服务端于 ${fmtDateTime(a.verify.at)} 拒绝该凭据${a.verify.message ? `：${a.verify.message}` : ''}`
+                        : '尚未验活：每 6 小时自动巡检一次'
+                    }
+                  >
+                    <Badge
+                      color={a.verify ? (a.verify.valid ? 'green' : a.verify.unauthorized ? 'red' : 'amber') : 'gray'}
+                    >
+                      {a.verify
+                        ? a.verify.valid
+                          ? '已验活·有效'
+                          : a.verify.unauthorized
+                            ? '已验活·失效'
+                            : '验活失败'
+                        : '未验活'}
+                    </Badge>
+                  </span>
                   <span className="ml-auto tabular-nums text-zinc-400">
                     access {fmtHours(a.accessHours)} · refresh {fmtHours(a.refreshHours)}
                   </span>

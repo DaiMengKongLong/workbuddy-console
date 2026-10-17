@@ -108,6 +108,96 @@ export function buildAuthObject(account) {
 }
 
 /**
+ * 把账号库里的**最新凭据**回写到登录态文件（仅当该账号就是当前登录账号时）。
+ *
+ * ## 为什么必须有这一步（2026-10-18 用户反馈「登录状态莫名失效」）
+ *
+ * 官方刷新是**轮换式**的：一次刷新成功，旧 refresh_token 立即作废。而同一账号的凭据
+ * 同时存在两处——账号库（本工具刷新后更新）与登录态文件（WorkBuddy 自己维护）。
+ * 只更新账号库时，WorkBuddy 手里还攥着已经作废的旧 refresh_token，它下一次自己刷新
+ * 就会失败 → 用户看到「登录状态莫名其妙失效」。
+ *
+ * 所以本工具刷新成功后，只要刷新的就是**当前登录账号**，就顺手把新凭据写回登录态文件，
+ * 让两边保持一致。写入方式与 `switchAccount` 相同：备份 → 原子写 → 回读校验 → 失败回滚。
+ * token 用明文写入（官方客户端接受明文并在自己下次刷新时重新加密），
+ * **其余字段（scope/sessionState/notBeforePolicy 等）原样保留**。
+ *
+ * 非当前账号（或登录态文件不存在/uid 对不上）时不做任何事，返回 `{ synced: false }`。
+ */
+export function syncTokensToAuthFile(account, { authPath: overridePath = null } = {}) {
+  const variant = variantOf(account);
+  const authPath = overridePath || authFilePath(variant);
+  let doc;
+  try {
+    if (!fs.existsSync(authPath)) return { synced: false, reason: 'no-auth-file' };
+    doc = JSON.parse(fs.readFileSync(authPath, 'utf8'));
+  } catch {
+    return { synced: false, reason: 'auth-file-unreadable' };
+  }
+  const liveUid = doc?.account?.uid;
+  if (!liveUid || !account?.uid || String(liveUid) !== String(account.uid)) {
+    return { synced: false, reason: 'not-current-account' };
+  }
+  const access = secretValue(account, 'access_token');
+  const refresh = secretValue(account, 'refresh_token');
+  if (typeof access !== 'string' || !access) return { synced: false, reason: 'no-plain-access-token' };
+
+  const auth = doc.auth && typeof doc.auth === 'object' ? doc.auth : {};
+  const now = Date.now();
+  const before = { accessToken: auth.accessToken, refreshToken: auth.refreshToken };
+  auth.accessToken = access;
+  if (typeof refresh === 'string' && refresh) auth.refreshToken = refresh;
+  auth.lastRefreshTime = now;
+  const expiresAt = Number(account?.expiresAt);
+  if (Number.isFinite(expiresAt) && expiresAt > 0) {
+    auth.expiresAt = expiresAt;
+    auth.expiresIn = Math.max(0, Math.floor((expiresAt - now) / 1000));
+  }
+  const refreshExpiresAt = Number(account?.refreshExpiresAt);
+  if (Number.isFinite(refreshExpiresAt) && refreshExpiresAt > 0) {
+    auth.refreshExpiresAt = refreshExpiresAt;
+    auth.refreshExpiresIn = Math.max(0, Math.floor((refreshExpiresAt - now) / 1000));
+  }
+  doc.auth = auth;
+
+  const backup = backupAuthFile(authPath, `authsync-${variant.id}`);
+  const tmp = `${authPath}.tmp-${process.pid}`;
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(doc, null, 2), 'utf8');
+    fs.renameSync(tmp, authPath);
+  } catch (err) {
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      /* 临时文件可能未生成 */
+    }
+    return { synced: false, reason: `write-failed: ${err?.message || err}` };
+  }
+  // 回读校验：写坏了立刻回滚，绝不留下半成品登录态（按 authPath 读，测试可注入临时文件）
+  let verify = null;
+  try {
+    verify = JSON.parse(fs.readFileSync(authPath, 'utf8'));
+  } catch {
+    verify = null;
+  }
+  if (!verify || verify?.auth?.accessToken !== access) {
+    if (backup && fs.existsSync(backup)) fs.copyFileSync(backup, authPath);
+    else {
+      // 没有备份（理论上不会发生）时至少把内存里的旧值写回
+      try {
+        doc.auth.accessToken = before.accessToken;
+        doc.auth.refreshToken = before.refreshToken;
+        fs.writeFileSync(authPath, JSON.stringify(doc, null, 2), 'utf8');
+      } catch {
+        /* 只能放弃 */
+      }
+    }
+    return { synced: false, reason: 'verify-failed' };
+  }
+  return { synced: true, authFilePath: authPath, backupPath: backup };
+}
+
+/**
  * 切换账号：把目标账号写入登录态文件。
  *
  * 流程：校验 → 备份 → 原子写 → 回读校验 → 失败回滚。
