@@ -18,6 +18,8 @@ import {
 } from './components/ui';
 import { get } from './lib/api';
 import { onUpdateChecked } from './lib/appUpdate';
+import PageGuide from './components/PageGuide';
+import { GUIDES, type GuideKey } from './lib/guides';
 import type { AccountsResponse, AppUpdateInfo, LoadedInfo } from './lib/types';
 import StatsPage from './pages/StatsPage';
 import SettingsPage from './pages/SettingsPage';
@@ -291,6 +293,12 @@ export default function App() {
 
   const meta = TABS.find((t) => t.id === tab)!;
 
+  /**
+   * 当前该显示哪份使用指南。
+   * 「免费模型」是一个入口三个子页签，所以平台页要按 platformTab 细分，其余页面按 tab 一一对应。
+   */
+  const currentGuide: GuideKey = tab === 'platform' ? platformTab : tab;
+
   return (
     <ToastProvider>
       <ConfirmProvider>
@@ -362,6 +370,8 @@ export default function App() {
               </div>
 
               <div className="ml-auto flex items-center gap-2.5 shrink-0">
+                {/* 每个功能右上角都有使用指南：内容按当前页（含免费模型的三个子页签）切换 */}
+                <PageGuide guide={GUIDES[currentGuide]} />
                 <div className="max-md:hidden">
                   <CurrentAccountChip onClick={() => go('accounts')} />
                 </div>

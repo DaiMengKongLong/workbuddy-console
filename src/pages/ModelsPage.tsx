@@ -51,20 +51,17 @@ function kindBadge(m: ORModel) {
 }
 
 /** 平台切换 pills：默认停在 OpenRouter；圆点表示该平台是否已配置 Key。
- * 置灰平台不可浏览（region = 地区受限；platform = 平台限制外部使用），点击提示原因。
- * actions：渲染在页签行末尾（右上角）的操作位，如「使用指南」。 */
+ * 置灰平台不可浏览（region = 地区受限；platform = 平台限制外部使用），点击提示原因。 */
 function PlatformTabs({
   platforms,
   active,
   onChange,
   onDisabledClick,
-  actions,
 }: {
   platforms: PlatformInfo[];
   active: string;
   onChange: (id: string) => void;
   onDisabledClick: (p: PlatformInfo) => void;
-  actions?: React.ReactNode;
 }) {
   return (
     <div className="flex flex-wrap items-center gap-2 pb-3.5 mb-3.5 border-b border-zinc-100">
@@ -96,7 +93,6 @@ function PlatformTabs({
           </button>
         );
       })}
-      {actions && <div className="ml-auto flex items-center gap-2">{actions}</div>}
     </div>
   );
 }
@@ -161,7 +157,6 @@ export default function ModelsPage({ active = true, onGoKeys }: { active?: boole
   const [loadLoading, setLoadLoading] = useState(false);
   const [showLoadedPanel, setShowLoadedPanel] = useState(false);
   const [restartPrompt, setRestartPrompt] = useState(false);
-  const [guideOpen, setGuideOpen] = useState(false);
   const [bannerDismissedAt, setBannerDismissedAt] = useState<number | null>(null);
 
   // 导出配置（拷给其他 agent：只算不写，不改动任何文件）
@@ -465,12 +460,6 @@ export default function ModelsPage({ active = true, onGoKeys }: { active?: boole
         active={platform}
         onChange={switchPlatform}
         onDisabledClick={handleDisabledClick}
-        actions={
-          <Button size="sm" variant="ghost" onClick={() => setGuideOpen(true)} title="查看免费模型功能的完整使用流程">
-            <IconInfo className="w-3.5 h-3.5" />
-            使用指南
-          </Button>
-        }
       />
 
       {/* 设置里开放了「显示全部平台」时，受限平台也能选——这里常驻风险提示，别让用户以为接不上是工具的问题 */}
@@ -1127,52 +1116,6 @@ export default function ModelsPage({ active = true, onGoKeys }: { active?: boole
         )}
       </Modal>
 
-      {/* 使用指南弹窗 */}
-      <Modal
-        open={guideOpen}
-        onClose={() => setGuideOpen(false)}
-        title="免费模型使用指南"
-        subtitle="四步把免费模型接入 WorkBuddy"
-        footer={
-          <Button variant="primary" onClick={() => setGuideOpen(false)}>
-            我知道了
-          </Button>
-        }
-      >
-        <div className="space-y-3 text-sm">
-          {[
-            {
-              title: '添加 API Key',
-              desc: '在上方「API Keys」区域选择平台，粘贴从平台官网获取的 Key 并点击「验证并添加」。Key 只保存在本机，不会上传。',
-            },
-            {
-              title: '浏览免费模型',
-              desc: '配置好 Key 的平台会自动列出其免费模型，可按价格、上下文、发布时间排序或搜索筛选。',
-            },
-            {
-              title: '勾选并载入',
-              desc: '勾选想用的模型后点击「载入到 WorkBuddy」，工具会写入 WorkBuddy 的 models.json（写入前自动备份原文件）。',
-            },
-            {
-              title: '重启 WorkBuddy 生效',
-              desc: 'WorkBuddy 运行期间载入的模型需重启后才会出现在自定义模型列表中；未运行时下次启动自动生效。对话请求由 WorkBuddy 直连平台，本工具只在配置阶段介入。',
-            },
-          ].map((s, i) => (
-            <div key={i} className="flex gap-3">
-              <div className="shrink-0 w-6 h-6 rounded-full bg-indigo-50 border border-indigo-100 text-indigo-600 text-xs font-semibold flex items-center justify-center">
-                {i + 1}
-              </div>
-              <div className="min-w-0">
-                <div className="font-medium text-zinc-800">{s.title}</div>
-                <div className="text-xs text-zinc-500 leading-relaxed mt-0.5">{s.desc}</div>
-              </div>
-            </div>
-          ))}
-          <div className="bg-amber-50 border border-amber-100 rounded-xl px-3.5 py-2.5 text-xs text-amber-700 leading-relaxed">
-            提示：免费模型的名额、速率与可用性由平台决定，可能随时调整；地区受限的平台（页签置灰）需要全局代理才能访问。后续可在「已载入」面板查看或移除已载入的模型。
-          </div>
-        </div>
-      </Modal>
     </div>
   );
 }

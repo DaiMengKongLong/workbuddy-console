@@ -1,4 +1,5 @@
 import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { pushNotification } from '../lib/notify';
 
 /* ---------------- Icons（内联 SVG，避免额外依赖） ---------------- */
@@ -383,10 +384,15 @@ export function Modal({ open, onClose, title, subtitle, children, footer, width 
   }, [open, onClose]);
 
   if (!open) return null;
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+  // 一律走 portal 挂到 body：
+  // - 祖先若有 backdrop-filter / transform（页头就是），fixed 会被困在那个层叠上下文里，
+  //   弹窗既裁切又压不到正文之上（2026-10-19 实测：指南弹窗只剩一条白带）
+  // - items-start + 整层 overflow-y-auto：内容比视口高时整层滚动，而不是把弹窗顶出屏幕
+  return createPortal(
+    (
+    <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto p-4">
       <div className="absolute inset-0 bg-zinc-900/45 backdrop-blur-[2px] animate-fade-in" onClick={onClose} />
-      <div className={`relative bg-white rounded-2xl shadow-2xl ring-1 ring-zinc-900/5 w-full ${width} max-h-[85vh] flex flex-col animate-pop-in`}>
+      <div className={`relative my-auto bg-white rounded-2xl shadow-2xl ring-1 ring-zinc-900/5 w-full ${width} max-h-[min(85vh,680px)] flex flex-col animate-pop-in`}>
         <div className="flex items-start justify-between gap-4 px-5 py-4 border-b border-zinc-100 shrink-0">
           <div className="min-w-0">
             <div className="font-semibold text-zinc-900">{title}</div>
@@ -400,10 +406,12 @@ export function Modal({ open, onClose, title, subtitle, children, footer, width 
             <IconX />
           </button>
         </div>
-        <div className="px-5 py-4 overflow-y-auto">{children}</div>
+        <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">{children}</div>
         {footer && <div className="px-5 py-3.5 border-t border-zinc-100 bg-zinc-50/70 rounded-b-2xl flex flex-wrap justify-end gap-2 shrink-0">{footer}</div>}
       </div>
     </div>
+    ),
+    document.body
   );
 }
 
