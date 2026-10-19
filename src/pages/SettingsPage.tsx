@@ -8,6 +8,7 @@ import {
   IconCopy,
   IconDatabase,
   IconDownload,
+  IconLayers,
   IconPower,
   IconRefresh,
   IconShield,
@@ -21,6 +22,7 @@ import {
 } from '../components/ui';
 import { del, get, post, put } from '../lib/api';
 import { emitUpdateChecked } from '../lib/appUpdate';
+import { emitSettingsChanged } from '../lib/appSettings';
 import type {
   AccountRefreshResponse,
   AccountRefreshRunResponse,
@@ -34,6 +36,7 @@ import type {
   LoadedInfo,
   PermissionCheck,
   PermissionResponse,
+  PlatformInfo,
   SettingsInfo,
 } from '../lib/types';
 import { fmtDate, fmtDateTime, fmtRelative } from '../lib/format';
@@ -128,6 +131,10 @@ export default function SettingsPage() {
   const [refreshInfo, setRefreshInfo] = useState<AccountRefreshResponse | null>(null);
   const [refreshingTokens, setRefreshingTokens] = useState(false);
 
+  /* ---------------- 免费模型平台可见性 ---------------- */
+  /** 受平台自身限制、默认收起的平台（仅用于在设置里说明"开了会放出哪几个"） */
+  const [restrictedPlatforms, setRestrictedPlatforms] = useState<PlatformInfo[]>([]);
+
   /* ---------------- 版本自检 ---------------- */
   const [updateInfo, setUpdateInfo] = useState<AppUpdateInfo | null>(null);
   const [checkingUpdate, setCheckingUpdate] = useState(false);
@@ -152,6 +159,12 @@ export default function SettingsPage() {
         setProxyInput(r.proxyUrl || '');
       })
       .catch((e) => toast('err', e.message));
+    // 平台限制清单：与开关无关，始终取真实原因（restriction），用来告诉用户「打开后会放出哪几个」
+    get<{ platforms: PlatformInfo[] }>('/api/platforms')
+      .then((r) => setRestrictedPlatforms((r.platforms || []).filter((p) => !!p.restriction)))
+      .catch(() => {
+        /* 读不到就只是少一句说明，不影响开关本身 */
+      });
   }, [toast]);
 
   const loadStatus = useCallback(() => {
@@ -340,7 +353,7 @@ export default function SettingsPage() {
 
   /** 其余布尔设置项的统一开关：与自动签到同一套「乐观更新 + 失败回滚」交互 */
   const toggleBoolSetting = async (
-    key: 'autoRefreshToken' | 'autoCheckUpdate',
+    key: 'autoRefreshToken' | 'autoCheckUpdate' | 'unlockAllPlatforms',
     next: boolean,
     hint: { on: string; off: string }
   ) => {
@@ -350,6 +363,8 @@ export default function SettingsPage() {
     try {
       const r = await put<Partial<SettingsInfo>>('/api/settings', { [key]: next });
       setSettings((p) => (p ? { ...p, [key]: !!r[key] } : p));
+      // 常驻挂载的其它页面不会因为"切回来"重新取数：把变更广播出去（如免费模型页的平台列表）
+      emitSettingsChanged({ [key]: !!r[key] });
       toast('ok', next ? hint.on : hint.off);
     } catch (e: any) {
       setSettings((p) => (p ? { ...p, [key]: prev } : p));
@@ -957,6 +972,57 @@ export default function SettingsPage() {
               ))}
             </div>
           )}
+        </Card>
+      </PageSection>
+
+      {/* 免费模型平台可见性 */}
+      <PageSection
+        icon={<IconLayers />}
+        title="免费模型平台"
+        desc="默认只列出能正常接入的平台"
+        count={restrictedPlatforms.length ? `默认收起 ${restrictedPlatforms.length} 个` : undefined}
+      >
+        <Card className="p-5">
+          <Row
+            label="显示全部平台"
+            desc="开启后，免费模型页会把因地区限制、或平台自身禁止外部接入而默认收起的平台一并列出，可自行尝试接入"
+          >
+            <label className="flex cursor-pointer select-none items-center gap-2 text-sm text-zinc-500">
+              <input
+                type="checkbox"
+                checked={!!settings?.unlockAllPlatforms}
+                onChange={(e) =>
+                  toggleBoolSetting('unlockAllPlatforms', e.target.checked, {
+                    on: '已开放全部平台：这些平台大概率仍会被限制，接不上属于预期结果',
+                    off: '已恢复默认：只显示可正常接入的平台',
+                  })
+                }
+                className="rounded accent-indigo-600"
+              />
+              {settings?.unlockAllPlatforms ? '已开启' : '已关闭'}
+            </label>
+          </Row>
+
+          {restrictedPlatforms.length > 0 && (
+            <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1.5 border-t border-zinc-100 px-4 pt-3 text-xs text-zinc-400">
+              <span>受限制的平台：</span>
+              {restrictedPlatforms.map((p) => (
+                <span key={p.id} className="inline-flex items-center gap-1">
+                  <Badge color="gray">{p.name}</Badge>
+                  <span className="text-[11px] text-zinc-300">
+                    {p.restriction === 'region' ? '地区受限' : '平台禁止外部接入'}
+                  </span>
+                </span>
+              ))}
+            </div>
+          )}
+
+          <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2.5 text-xs leading-relaxed text-amber-700">
+            <span className="font-medium">风险提示：</span>
+            上面这些平台按地区或自身策略限制了外部调用。即使 key 能创建成功，从这里接入后也可能出现
+            <b>请求被拒、频繁限流，甚至账号被风控或封禁</b>
+            。默认收起正是因为「接进去大概率也用不了」；是否接入请自行判断并承担风险，也请先确认你了解该平台的服务条款。
+          </div>
         </Card>
       </PageSection>
 

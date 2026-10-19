@@ -13,6 +13,7 @@ import {
   IconRefresh,
   IconSearch,
   IconTrash,
+  IconWarning,
   Modal,
   PlatformNote,
   Segmented,
@@ -22,6 +23,7 @@ import {
   useToast,
 } from '../components/ui';
 import { get, post, TIMEOUT } from '../lib/api';
+import { onSettingsChanged } from '../lib/appSettings';
 import type {
   ExportResponse,
   KeyInfo,
@@ -73,7 +75,7 @@ function PlatformTabs({
         const disabled = !!p.uiDisabled;
         const title = disabled
           ? `${p.name}（${p.uiDisabled === 'region' ? '地区受限暂无法使用' : '平台限制无法在外部使用'}）`
-          : `${p.name}（${p.keyCount ? '已配置 Key' : '未配置 Key'}）${p.note ? ` — ${p.note}` : ''}`;
+          : `${p.name}（${p.keyCount ? '已配置 Key' : '未配置 Key'}）${p.restriction ? ` — ⚠ ${p.restriction === 'region' ? '地区受限，可能无法调用' : '平台禁止外部接入，接入后可能被拒'}` : ''}${!p.restriction && p.note ? ` — ${p.note}` : ''}`;
         return (
           <button
             key={p.id}
@@ -211,7 +213,14 @@ export default function ModelsPage({ active = true, onGoKeys }: { active?: boole
 
   const loadSideData = useCallback(async () => {
     get<{ platforms: PlatformInfo[] }>('/api/platforms')
-      .then((r) => setPlatforms(r.platforms || []))
+      .then((r) => {
+        const list = r.platforms || [];
+        setPlatforms(list);
+        // 关掉「显示全部平台」后，当前停留的受限平台会重新置灰：退回默认平台，
+        // 否则用户会停在一个已不可用的平台上看到空列表
+        const cur = list.find((p) => p.id === platformRef.current);
+        if (cur?.uiDisabled) showPlatform('openrouter');
+      })
       .catch(() => {});
     get<KeysResponse>('/api/keys')
       .then((r) => {
@@ -229,7 +238,7 @@ export default function ModelsPage({ active = true, onGoKeys }: { active?: boole
         }
       })
       .catch(() => {});
-  }, []);
+  }, [showPlatform]);
 
   useEffect(() => {
     showPlatform('openrouter');
@@ -240,6 +249,16 @@ export default function ModelsPage({ active = true, onGoKeys }: { active?: boole
   useEffect(() => {
     if (active) loadSideData();
   }, [active, loadSideData]);
+
+  // 设置里改了「显示全部平台」：就地重取平台列表，不必手动刷新页面
+  // （页面是常驻挂载的，外层切页不会触发上面的 active 变化，这正是之前要按 F5 的原因）
+  useEffect(
+    () =>
+      onSettingsChanged((patch) => {
+        if (patch.unlockAllPlatforms !== undefined) loadSideData();
+      }),
+    [loadSideData]
+  );
 
   // 定期刷新：每分钟检查一次，数据超过 5 分钟就在后台静默更新（不挡界面）
   useEffect(() => {
@@ -453,6 +472,18 @@ export default function ModelsPage({ active = true, onGoKeys }: { active?: boole
           </Button>
         }
       />
+
+      {/* 设置里开放了「显示全部平台」时，受限平台也能选——这里常驻风险提示，别让用户以为接不上是工具的问题 */}
+      {platformMeta?.restriction && (
+        <div className="mb-3 flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2.5 text-xs leading-relaxed text-amber-700">
+          <IconWarning className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          <div>
+            <span className="font-medium">{platformName} 对调用来源有限制（{platformMeta.restriction === 'region' ? '地区受限' : '平台禁止外部接入'}）</span>
+            ，你在设置里开启了「显示全部平台」所以这里可以选。接入后可能<b>请求被拒、频繁限流，甚至账号被风控</b>
+            ——这是平台侧的限制，不是控制台配置有误。如需关闭，去「设置 → 免费模型平台」取消勾选。
+          </div>
+        </div>
+      )}
 
       <div className="flex flex-wrap items-center gap-2.5">
         <div className="relative">

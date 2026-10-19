@@ -231,6 +231,50 @@ export function copyAncestorMap() {
   return map;
 }
 
+/**
+ * 全账本「家族表」：把每条 `副本 → 来源` 边做并查集，得到 `会话id → 家族根`。
+ *
+ * 和 copyAncestorMap（只往祖先方向查）互补：这里把**整段对话的所有副本**归成一个家族，
+ * 于是「目标账号里已经有这段对话了吗」可以一次问清——不管是本账号直接复制给它的、
+ * 还是它从第三个账号那儿拿到的。
+ *
+ * 现实意义（2026-10-19 用户反馈）：多账号轮转（A→B→C→D→A）时，A 与 D 之间从来没有
+ * 直接复制记录，列表只按「这一对账号的账本」判定就会把整段对话当成没复制过，用户看到
+ * 一长串"待复制"，只能再复制一遍。按家族判定后，这段对话只要在 D 的家族里已有成员落在 A，
+ * 就算已同步，不再出现在待复制列表里。
+ */
+export function copyFamilyMap() {
+  const parent = new Map();
+  const find = (x) => {
+    let p = parent.get(x);
+    if (p === undefined) {
+      parent.set(x, x);
+      return x;
+    }
+    if (p === x) return x;
+    const root = find(p);
+    parent.set(x, root);
+    return root;
+  };
+  const union = (a, b) => {
+    const ra = find(a);
+    const rb = find(b);
+    if (ra !== rb) parent.set(ra, rb);
+  };
+  for (const table of Object.values(loadCopies().pairs)) {
+    for (const [sourceId, copyId] of Object.entries(table)) {
+      if (!sourceId || !copyId) continue;
+      union(String(copyId), String(sourceId));
+    }
+  }
+  const rootOf = (id) => {
+    const key = String(id || '');
+    if (!key) return '';
+    return parent.has(key) ? find(key) : key;
+  };
+  return { rootOf, size: parent.size };
+}
+
 function recordCopies(variantId, sourceUid, targetUid, pairs) {
   if (!pairs.length) return;
   const ledger = loadCopies();
@@ -321,9 +365,13 @@ export async function listSessionsForSwitch({ targetAccountId }) {
 
   const index = indexProjectBodies(variantId);
   const ledger = sessionCopyLedger(variantId, sourceUid, targetUid);
+  // 家族表：用于判定「这段对话在目标账号里已经有了吗」——跨全部账号对，而不是只看这一对
+  const family = copyFamilyMap();
   const db = await openSessionDb(variantId, { readOnly: true });
   let rows = [];
   let targetAlive = new Set();
+  /** 家族根 → 目标账号里对应的那份会话 id（同一家族有多份时取最近活动的） */
+  const targetFamily = new Map();
   try {
     rows = db
       .prepare(
@@ -336,12 +384,17 @@ export async function listSessionsForSwitch({ targetAccountId }) {
     // 账本只是「曾经复制过」的记录，目标账号里那份副本可能早就被用户删了。
     // 副本已不在时不能再算「已复制」——界面上会被标记成已复制（默认还会被隐藏、
     // 不可勾选），用户就再也找不到入口把它重新复制过去。
-    targetAlive = new Set(
-      db
-        .prepare('SELECT id FROM sessions WHERE user_id = ? AND deleted_at IS NULL')
-        .all(targetUid)
-        .map((r) => String(r.id))
-    );
+    const targetRows = db
+      .prepare('SELECT id, updated_at FROM sessions WHERE user_id = ? AND deleted_at IS NULL')
+      .all(targetUid);
+    targetAlive = new Set(targetRows.map((r) => String(r.id)));
+    for (const r of targetRows) {
+      const root = family.rootOf(String(r.id));
+      const prev = targetFamily.get(root);
+      if (!prev || (Number(r.updated_at) || 0) > (Number(prev.updatedAt) || 0)) {
+        targetFamily.set(root, { id: String(r.id), updatedAt: Number(r.updated_at) || 0 });
+      }
+    }
   } finally {
     db.close();
   }
@@ -357,6 +410,11 @@ export async function listSessionsForSwitch({ targetAccountId }) {
     const body = index.get(id) || null;
     const size = body ? bodySize(body) : 0;
     if (body) bytes += size;
+    // 直接复制记录优先（这一对账号自己的账本），没有再看整段对话的家族
+    const directId = Object.prototype.hasOwnProperty.call(ledger, id) ? String(ledger[id] || '') : '';
+    const directAlive = directId && targetAlive.has(directId) ? directId : '';
+    const familyHit = directAlive ? '' : targetFamily.get(family.rootOf(id))?.id || '';
+    const copiedTo = directAlive || familyHit || null;
     sessions.push({
       id,
       title: displayTitle(r.title, r.custom_title),
@@ -367,8 +425,10 @@ export async function listSessionsForSwitch({ targetAccountId }) {
       isPlayground: Number(r.is_playground) === 1,
       hasBody: !!body,
       bytes: size,
-      copied: Object.prototype.hasOwnProperty.call(ledger, id) && targetAlive.has(String(ledger[id] || '')),
-      copiedTo: ledger[id] || null,
+      copied: !!copiedTo,
+      copiedTo,
+      /** direct=这一对账号直接复制过；family=经由其它账号间接同步过去的 */
+      copiedScope: directAlive ? 'direct' : familyHit ? 'family' : null,
     });
   }
   return {

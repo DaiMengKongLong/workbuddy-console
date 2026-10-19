@@ -120,12 +120,17 @@ app.get('/api/health', (req, res) => {
 
 app.get('/api/platforms', (req, res) => {
   const cfg = loadConfig();
+  // 置灰只是"默认不建议"，不是"不允许"：设置里勾了「显示全部平台」就照常可选，
+  // 但把原始限制原因单独作为 restriction 传下去，让界面能常驻风险提示。
+  const unlockAll = !!cfg.settings.unlockAllPlatforms;
   const platforms = listPlatforms().map((p) => ({
     ...p,
+    restriction: p.uiDisabled || null,
+    uiDisabled: unlockAll ? null : p.uiDisabled || null,
     keyCount: cfg.keys.filter((k) => k.platform === p.id).length,
     modelCount: providers[p.id].peek?.()?.count ?? null,
   }));
-  res.json({ platforms });
+  res.json({ platforms, unlockAll });
 });
 
 app.get(
@@ -865,6 +870,7 @@ app.get(
       autoCheckin: !!cfg.settings.autoCheckin,
       autoRefreshToken: !!cfg.settings.autoRefreshToken,
       autoCheckUpdate: !!cfg.settings.autoCheckUpdate,
+      unlockAllPlatforms: !!cfg.settings.unlockAllPlatforms,
       effectiveProxy: await getProxyUrl(),
       detected: detectWorkbuddyDir(),
       cacheDir: cachePath(''),
@@ -892,6 +898,9 @@ app.put(
     if (typeof req.body?.autoCheckUpdate === 'boolean') {
       cfg.settings.autoCheckUpdate = req.body.autoCheckUpdate;
     }
+    if (typeof req.body?.unlockAllPlatforms === 'boolean') {
+      cfg.settings.unlockAllPlatforms = req.body.unlockAllPlatforms;
+    }
     saveConfig(cfg);
     res.json({
       ok: true,
@@ -900,6 +909,7 @@ app.put(
       autoCheckin: !!cfg.settings.autoCheckin,
       autoRefreshToken: !!cfg.settings.autoRefreshToken,
       autoCheckUpdate: !!cfg.settings.autoCheckUpdate,
+      unlockAllPlatforms: !!cfg.settings.unlockAllPlatforms,
       effectiveProxy: await getProxyUrl(),
       detected: detectWorkbuddyDir(),
     });

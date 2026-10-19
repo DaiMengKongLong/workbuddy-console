@@ -1471,7 +1471,13 @@ function SessionCopyDialog({
                         </span>
                         {s.isPlayground && <Badge color="violet">任务</Badge>}
                         {s.copied && (
-                          <span title="目标账号里已经有同一份会话；再勾选复制不会产生重复会话，只会把新增内容与改名同步过去">
+                          <span
+                            title={
+                              s.copiedScope === 'family'
+                                ? '这段对话已经通过其它账号同步到目标账号了（不是这一对账号直接复制的）；勾选也不会产生重复会话，只会把新增内容与改名同步过去'
+                                : '目标账号里已经有同一份会话；再勾选复制不会产生重复会话，只会把新增内容与改名同步过去'
+                            }
+                          >
                             <Badge color="green">已复制</Badge>
                           </span>
                         )}

@@ -51,6 +51,12 @@ export interface PlatformInfo {
   modelCount?: number | null;
   /** 置灰原因：region = 地区受限；platform = 平台限制外部使用；null = 正常可用 */
   uiDisabled?: 'region' | 'platform' | null;
+  /**
+   * 平台本身的限制原因（不受设置影响，恒为真实原因）。
+   * 设置里勾了「显示全部平台」时 uiDisabled 会被清空，但 restriction 仍保留——
+   * 界面据此常驻「可能被限制」的风险提示。
+   */
+  restriction?: 'region' | 'platform' | null;
 }
 
 /** 导出给其他 agent 的单条模型配置（即 OpenAI 兼容的"自定义模型"条目） */
@@ -338,9 +344,11 @@ export interface SessionRow {
   /** 有无正文文件；没有正文的会话不能复制 */
   hasBody: boolean;
   bytes: number;
-  /** 是否已经复制给目标账号（本工具账本记录） */
+  /** 目标账号里是否已有这段对话（直接复制或经由其它账号同步过去都算） */
   copied: boolean;
   copiedTo: string | null;
+  /** direct=这一对账号直接复制过；family=经其它账号间接同步；null=没有 */
+  copiedScope?: 'direct' | 'family' | null;
 }
 
 export interface SessionListResponse {
@@ -574,6 +582,8 @@ export interface SettingsInfo {
   autoRefreshToken: boolean;
   /** 启动时检查新版本（唯一一处访问非官方服务的出站请求） */
   autoCheckUpdate: boolean;
+  /** 免费模型页是否列出全部平台（含地区受限 / 平台禁止外部接入的）；默认只列可用的 */
+  unlockAllPlatforms: boolean;
   effectiveProxy: string | null;
   detected: WorkbuddyDetection;
   cacheDir: string;

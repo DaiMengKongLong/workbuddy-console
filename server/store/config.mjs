@@ -19,6 +19,12 @@ const DEFAULT_SETTINGS = {
   autoRefreshToken: true,
   // 启动时检查有没有新版本（只读 GitHub Release 元数据，是唯一一处访问非官方服务的出站请求）
   autoCheckUpdate: true,
+  /**
+   * 免费模型页是否列出**全部平台**（含默认收起的地区受限 / 平台禁止外部接入的那几个）。
+   * 默认关闭：这些平台的 key 在外部环境调用大概率被拒，列出来只会让人白折腾。
+   * 打开后照常可选，但界面上会常驻风险提示——是否接入由用户自己承担。
+   */
+  unlockAllPlatforms: false,
 };
 
 /**
