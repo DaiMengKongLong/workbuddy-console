@@ -53,6 +53,31 @@ export function variantOf(account) {
   return VARIANTS.cn;
 }
 
+/**
+ * 官方接口连不上时的排障提示（配给 proxyFetch 的 netHint）。
+ *
+ * 为什么必须按档位写：官方接口和模型平台是两回事。国际版接口 www.workbuddy.ai
+ * 在境内直连基本不通，提示必须说"这是登录/账号接口、需要能访问国际域名、没有境外
+ * 网络就换国内版"；国内版接口被公司/校园网拦时，提示要说查防火墙。否则用户会看到
+ * 模型平台那条"Google/Groq 需要 VPN"文案，完全对不上号（2026-10-19 用户反馈）。
+ */
+export function officialNetHint(variantId) {
+  const v = getVariant(variantId);
+  const host = v.apiEndpoint.replace(/^https?:\/\//, '');
+  if (v.id === 'ai') {
+    return (
+      `这是国际版官方接口（${host}），境内直连通常连不上：` +
+      `请先开启代理，并到「设置 → 网络代理」填写代理地址（如 http://127.0.0.1:7890）后重试；` +
+      `没有可用的境外网络时，请改用「国内版」添加或操作账号`
+    );
+  }
+  return (
+    `这是国内版官方接口（${host}），请确认这台机器能正常打开该网址——` +
+    `公司/校园网、部分路由器的家长控制常会拦截；` +
+    `若你在用代理软件，请确认它是「系统代理」模式，或到「设置 → 网络代理」手动填写地址`
+  );
+}
+
 /** 账号所属档位的数据根目录（会话日志所在处） */
 export function dataRoot(variant) {
   return path.join(os.homedir(), getVariant(variant).dataRootName);

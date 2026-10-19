@@ -97,6 +97,24 @@ try {
   errMsg = e.message;
 }
 ok(errMsg.includes('网络请求失败') && errMsg.includes('设置 → 网络代理'), `代理不可达时报错可读：${errMsg.slice(0, 46)}…`);
+ok(errMsg.includes('目标') && errMsg.includes('127.0.0.1'), '报错里带目标域名/主机，便于定位是哪个站点连不上');
+
+// 场景 3b：netHint 覆盖默认文案（扫码登录/官方接口不许再出现模型平台的 VPN 文案）
+let errMsg2 = '';
+try {
+  await proxyFetch(targetUrl, { ...OPTS, netHint: '这是国际版官方接口（www.workbuddy.ai）' });
+} catch (e) {
+  errMsg2 = e.message;
+}
+ok(errMsg2.includes('www.workbuddy.ai') && !/Google \/ Groq/.test(errMsg2), `netHint 覆盖生效：${errMsg2.slice(-40)}`);
+
+// 场景 3c：官方接口排障文案按档位区分（国际版说要代理/可换国内版，国内版说查网络）
+const { officialNetHint } = await import('../server/workbuddy/variant.mjs');
+const hintCn = officialNetHint('cn');
+const hintAi = officialNetHint('ai');
+ok(hintCn.includes('codebuddy.cn') && !hintCn.includes('workbuddy.ai'), '国内版提示指向 codebuddy.cn');
+ok(hintAi.includes('workbuddy.ai') && hintAi.includes('国内版'), '国际版提示指向 workbuddy.ai 且给出"改用国内版"出路');
+ok(!/Google \/ Groq/.test(hintCn + hintAi), '官方接口文案不再复用模型平台 VPN 提示');
 
 // 场景 4（最后）：全部清空 → 直连。部分沙箱会拦截直连并 SIGTERM，故单独收尾。
 delete process.env.HTTP_PROXY;

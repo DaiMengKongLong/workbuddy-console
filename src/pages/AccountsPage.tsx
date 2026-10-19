@@ -772,8 +772,14 @@ function ScanAddDialog({
               <div className="flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3.5 py-2.5 text-xs text-amber-800 leading-relaxed">
                 <IconWarning className="w-3.5 h-3.5 shrink-0 mt-px text-amber-500" />
                 <span>
-                  若浏览器已登录 workbuddy.ai，授权页会直接跳到「登录成功」而不会绑定新账号。
-                  请复制链接到<strong>无痕（隐私）窗口</strong>打开并完成登录。
+                  <span className="block">
+                    国际版登录要访问 <b>workbuddy.ai</b>，境内直连通常不通——请先开启代理，并到「设置 → 网络代理」填写代理地址；
+                    没有可用的境外网络请改用「国内版」。
+                  </span>
+                  <span className="mt-1 block">
+                    若浏览器已登录 workbuddy.ai，授权页会直接跳到「登录成功」而不会绑定新账号。
+                    请复制链接到<strong>无痕（隐私）窗口</strong>打开并完成登录。
+                  </span>
                 </span>
               </div>
             )}

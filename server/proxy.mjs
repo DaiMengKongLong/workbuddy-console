@@ -82,21 +82,38 @@ function agentFor(proxyUrl) {
   return agent;
 }
 
-function friendlyNetError(err, proxyUrl) {
+/**
+ * 默认排障提示：面向**模型平台**的出站请求（OpenRouter / SiliconFlow 等）。
+ * 其它场景（扫码登录、官方计费接口、GitHub 更新检查）必须自带 netHint——
+ * 曾经把这条平台文案套在扫码登录上，用户看到"Google/Groq 需要 VPN"根本对不上号。
+ */
+const DEFAULT_NET_HINT =
+  `需要 VPN 的平台（Google / Groq / NVIDIA / OpenRouter 等）请确认代理软件已开启；` +
+  `若代理不是系统级模式，请到「设置 → 网络代理」手动填写代理地址（如 http://127.0.0.1:7890）`;
+
+function hostOf(url) {
+  try {
+    return new URL(String(url)).host;
+  } catch {
+    return '';
+  }
+}
+
+function friendlyNetError(err, proxyUrl, url, hint) {
   const cause = err?.cause || err;
   const code = cause?.code || cause?.message || err?.message || '未知网络错误';
   const via = proxyUrl ? `（经代理 ${proxyUrl}）` : '（直连）';
-  return (
-    `网络请求失败 ${via}：${code}。` +
-    `需要 VPN 的平台（Google / Groq / NVIDIA / OpenRouter 等）请确认代理软件已开启；` +
-    `若代理不是系统级模式，请到「设置 → 网络代理」手动填写代理地址（如 http://127.0.0.1:7890）`
-  );
+  const host = hostOf(url);
+  // 报错里带上目标域名：用户/我们才能一眼看出是"哪个站点连不上"，而不是只看到 undici 的错误码
+  const target = host ? `（目标 ${host}）` : '';
+  return `网络请求失败${via}${target}：${code}。${String(hint || '').trim() || DEFAULT_NET_HINT}`;
 }
 
 /** 统一出站请求入口：自动带代理；网络层失败时给出可排障的错误信息。
- * opts 透传给 fetch；内部解析代理时同样支持 { systemProxy } 透传（测试用）。 */
+ * opts 透传给 fetch；内部解析代理时同样支持 { systemProxy } 透传（测试用）。
+ * opts.netHint 覆盖排障提示文案（会被剥离，不会传给 fetch）。 */
 export async function proxyFetch(url, opts = {}) {
-  const { systemProxy, ...fetchOpts } = opts;
+  const { systemProxy, netHint, ...fetchOpts } = opts;
   const proxyUrl = await getProxyUrl({ systemProxy });
   try {
     if (proxyUrl) {
@@ -104,6 +121,6 @@ export async function proxyFetch(url, opts = {}) {
     }
     return await fetch(url, fetchOpts);
   } catch (err) {
-    throw new Error(friendlyNetError(err, proxyUrl));
+    throw new Error(friendlyNetError(err, proxyUrl, url, netHint));
   }
 }

@@ -39,7 +39,7 @@
  */
 import crypto from 'node:crypto';
 import { proxyFetch } from '../proxy.mjs';
-import { variantOf } from './variant.mjs';
+import { variantOf, officialNetHint } from './variant.mjs';
 import { authHeaders } from './credits.mjs';
 import { hasPlainToken, isEnvelope } from './accounts.mjs';
 
@@ -174,6 +174,8 @@ async function request(account, method, url, body, netOpts = {}) {
       method,
       headers: authHeaders(account, url),
       ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+      // 成长中心同样是官方接口，网络失败的提示要按档位说人话
+      netHint: officialNetHint(variantOf(account).id),
       ...netOpts,
     });
     const text = await res.text();

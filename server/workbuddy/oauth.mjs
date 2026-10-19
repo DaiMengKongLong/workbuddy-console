@@ -18,7 +18,7 @@
  */
 import { randomUUID } from 'node:crypto';
 import { proxyFetch } from '../proxy.mjs';
-import { getVariant } from './variant.mjs';
+import { getVariant, officialNetHint } from './variant.mjs';
 import { loadAccounts, saveAccounts, accountMeta } from './accounts.mjs';
 
 /** 单次扫码登录的有效期（秒），与官方 state 有效期对齐 */
@@ -63,12 +63,15 @@ function oauthAccountUrl(variant, state) {
 
 const JSON_HEADERS = { 'Content-Type': 'application/json', Accept: 'application/json' };
 
-/** 官方 JSON 请求；网络层失败抛错（由路由层转成错误响应），HTTP 错误状态返回解析后的 body */
-async function officialJson(url, { method = 'GET', body, headers } = {}) {
+/** 官方 JSON 请求；网络层失败抛错（由路由层转成错误响应），HTTP 错误状态返回解析后的 body。
+ * 必须带 variant：连不上时要按档位给出「国际版需要代理 / 国内版查网络」的提示，
+ * 而不是模型平台那条笼统的 VPN 文案。 */
+async function officialJson(url, { method = 'GET', body, headers, variant } = {}) {
   const res = await proxyFetch(url, {
     method,
     headers: { ...JSON_HEADERS, ...headers },
     body: body === undefined ? undefined : JSON.stringify(body),
+    netHint: variant ? officialNetHint(variant.id) : undefined,
   });
   const text = await res.text();
   try {
@@ -110,7 +113,7 @@ export async function oauthStart(variantId = 'cn') {
   const variant = getVariant(variantId);
   const loginId = `wb_${randomUUID().replace(/-/g, '')}`;
 
-  const resp = await officialJson(oauthStateUrl(variant), { method: 'POST', body: {} });
+  const resp = await officialJson(oauthStateUrl(variant), { method: 'POST', body: {}, variant });
   const data = resp?.data && typeof resp.data === 'object' ? resp.data : {};
   const state = str(data.state);
   if (!state) {
@@ -172,7 +175,7 @@ async function pollOnce(loginId) {
 
   // 用发起档位拼域名与 platform，不跟随当前列表档位
   const { variant, state } = info;
-  const resp = await officialJson(oauthTokenUrl(variant, state));
+  const resp = await officialJson(oauthTokenUrl(variant, state), { variant });
   const code = typeof resp?.code === 'number' ? resp.code : -1;
   info.lastCode = code;
   info.lastMessage = str(resp?.msg) || str(resp?.message) || '';
@@ -198,7 +201,7 @@ async function pollOnce(loginId) {
   // 拉账号信息
   const accHeaders = { Authorization: `Bearer ${accessToken}` };
   if (domain) accHeaders['X-Domain'] = domain;
-  const accResp = await officialJson(oauthAccountUrl(variant, state), { headers: accHeaders });
+  const accResp = await officialJson(oauthAccountUrl(variant, state), { headers: accHeaders, variant });
   const accData = accResp?.data && typeof accResp.data === 'object' ? accResp.data : {};
 
   const profileMismatch = domainMismatchError(variant, str(accData.domain));

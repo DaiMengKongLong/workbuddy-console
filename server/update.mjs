@@ -131,6 +131,10 @@ async function fetchLatest() {
         'User-Agent': `workbuddy-console/${LOCAL_VERSION}`,
       },
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      // 检查更新走的是 GitHub，连不上只影响"能不能发现新版本"，别让用户以为工具坏了
+      netHint:
+        '检查更新需要访问 GitHub（api.github.com），境内网络经常连不上：' +
+        '可开启代理并在「设置 → 网络代理」填写地址后重试；这项失败不影响其它功能',
     });
   } catch (e) {
     return { ...base, error: `无法访问版本服务：${e?.message || e}` };

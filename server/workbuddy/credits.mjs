@@ -12,7 +12,7 @@
  * 增强：快照在每次成功查询后自动落盘（供离线兜底与"余额曲线"使用）。
  */
 import { proxyFetch } from '../proxy.mjs';
-import { variantOf, getVariant } from './variant.mjs';
+import { variantOf, getVariant, officialNetHint } from './variant.mjs';
 import {
   loadAccounts,
   accountDisplayName,
@@ -65,6 +65,8 @@ async function authenticatedPost(account, url, body) {
     method: 'POST',
     headers: authHeaders(account, url),
     body: JSON.stringify(body),
+    // 计费/用量也是官方接口，提示按档位给（国际版要代理，国内版查网络）
+    netHint: officialNetHint(variantOf(account).id),
   });
   const text = await res.text();
   let json;

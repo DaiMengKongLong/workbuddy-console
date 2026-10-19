@@ -11,7 +11,7 @@
  * 「查状态 + 单个/全部签到 + 自动签到开关（服务端每小时巡检一次）」。
  */
 import { proxyFetch } from '../proxy.mjs';
-import { variantOf } from './variant.mjs';
+import { variantOf, officialNetHint } from './variant.mjs';
 import { authHeaders } from './credits.mjs';
 import { runGrowthForAccount } from './growth.mjs';
 import {
@@ -73,6 +73,8 @@ async function postOfficial(account, url, body = {}) {
     method: 'POST',
     headers: authHeaders(account, url),
     body: JSON.stringify(body),
+    // 签到打的是官方接口，连不上时别报"模型平台需要 VPN"
+    netHint: officialNetHint(variantOf(account).id),
   });
   const text = await res.text();
   let json = null;
