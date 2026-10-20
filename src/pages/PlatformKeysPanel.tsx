@@ -85,12 +85,15 @@ export default function PlatformKeysPanel({ active = true }: { active?: boolean 
     if (!key) return;
     setAdding(true);
     try {
-      const r = await post<{ id: string; label: string; platform: string }>('/api/keys', {
+      const r = await post<{ id: string; label: string; platform: string; warn?: string | null }>('/api/keys', {
         platform: newPlatform,
         key,
         label: newLabel.trim() || undefined,
       });
-      toast('ok', `${platformMeta?.name || r.platform} 的 Key「${r.label}」已添加`);
+      // warn：鉴权已通过、但平台的探测模型不接受试探请求（如魔搭首项模型不支持 chat）。
+      // 这时 Key 是有效的，只是没能"完整"验证，如实告诉用户而不是报错拦下。
+      if (r.warn) toast('info', `${platformMeta?.name || r.platform} 的 Key「${r.label}」已添加。${r.warn}`);
+      else toast('ok', `${platformMeta?.name || r.platform} 的 Key「${r.label}」已添加`);
       setNewKey('');
       setNewLabel('');
       loadKeys();
@@ -138,10 +141,11 @@ export default function PlatformKeysPanel({ active = true }: { active?: boolean 
   const testKey = async (k: KeyInfo) => {
     setTestingId(k.id);
     try {
-      const r = await post<{ ok: boolean; error?: string; baseUrl?: string | null }>(`/api/keys/${k.id}/test`);
+      const r = await post<{ ok: boolean; error?: string; baseUrl?: string | null; warn?: string | null }>(`/api/keys/${k.id}/test`);
       if (r.ok) {
         const node = hostOf(r.baseUrl) ? `（生效节点：${hostOf(r.baseUrl)}）` : '';
-        toast('ok', `「${k.label}」有效${node}`);
+        if (r.warn) toast('info', `「${k.label}」鉴权有效${node}。${r.warn}`);
+        else toast('ok', `「${k.label}」有效${node}`);
       } else toast('err', `「${k.label}」无效或已撤销${r.error ? `（${r.error}）` : ''}`);
       loadKeys();
     } catch (e: any) {
@@ -327,8 +331,15 @@ export default function PlatformKeysPanel({ active = true }: { active?: boolean 
               </div>
             )}
             {platformMeta?.modelsPublic && (
-              <div className="text-[11px] text-amber-600 leading-relaxed">
-                该平台模型列表无需 Key 即可浏览；Key 仅在载入模型到 WorkBuddy 与实际对话时使用。点击「测试」会消耗一次极小的调用（1 token）。
+              <div className="space-y-1 text-[11px] leading-relaxed text-amber-600">
+                <div>
+                  该平台模型列表无需 Key 即可浏览；Key 仅在载入模型到 WorkBuddy 与实际对话时使用。点击「测试」会消耗一次极小的调用（1 token）。
+                </div>
+                <div>
+                  若提示「HTTP 400」或「Key 无效：400」，<b>不代表 Key 有问题</b>：这表示 Key 已通过鉴权、只是这次探测请求被平台拒了
+                  （探测模型暂不可用，或平台对参数挑剔）。工具会自动换几个模型重试；仍被拒也会照常保存并说明。
+                  真正失效的 Key 平台一律返回 401/403，界面上会明确写「平台拒绝访问」。
+                </div>
               </div>
             )}
           </div>

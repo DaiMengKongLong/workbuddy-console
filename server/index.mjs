@@ -272,7 +272,7 @@ app.post(
     if (!cfg.activeKeys[provider.id]) cfg.activeKeys[provider.id] = item.id;
     if (provider.id === 'openrouter') cfg.activeKeyId = item.id;
     saveConfig(cfg);
-    res.json({ id: item.id, platform: provider.id, label: item.label, masked: maskKey(key), isFreeTier: t.isFreeTier });
+    res.json({ id: item.id, platform: provider.id, label: item.label, masked: maskKey(key), isFreeTier: t.isFreeTier, warn: t.warn || null });
   })
 );
 
@@ -311,7 +311,11 @@ app.post(
       // 多节点平台：key 可能被删后换站点重建，重测时同步纠正生效节点
       k.baseUrl = t.baseUrl || null;
       saveConfig(cfg);
-      res.json(t.ok ? { ok: true, isFreeTier: t.isFreeTier, baseUrl: t.baseUrl || null } : { ok: false, error: t.error || 'Key 无效' });
+      res.json(
+        t.ok
+          ? { ok: true, isFreeTier: t.isFreeTier, baseUrl: t.baseUrl || null, warn: t.warn || null }
+          : { ok: false, error: t.error || 'Key 无效' },
+      );
     } catch (err) {
       res.status(502).json({ ok: false, error: err?.message || '测试失败' });
     }

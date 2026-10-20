@@ -88,7 +88,7 @@ export const GUIDES: Record<GuideKey, Guide> = {
       },
       {
         title: '验证是否可用',
-        desc: '保存后会自动校验一次；部分平台的 /models 接口不可靠，工具会用一次最小对话来探活，能通过才算可用。',
+        desc: '保存后会自动校验一次；部分平台的 /models 接口不可靠，工具会用一次最小对话来探活，能通过才算可用。遇到 400 别慌：那是探测请求被平台拒，不是 Key 无效，工具会自动换几个模型重试。',
       },
       {
         title: '多把 Key 轮换',
@@ -102,6 +102,7 @@ export const GUIDES: Record<GuideKey, Guide> = {
     tips: [
       'Key 以明文保存在 ~/.free-token/config.json，仅本机可读；请不要把该文件发到聊天或仓库里。',
       '不同平台的 Key 互不通用，把 A 平台的 Key 填到 B 平台会直接验证失败。',
+      '看状态码就能分辨：401/403 = Key 真的无效或未授权；429 = 只是限流，Key 有效；400 = 鉴权已过、探测请求被平台拒，不代表 Key 有问题。',
     ],
   },
 

@@ -35,10 +35,11 @@ export function normalizeGeneric(m, { platform, isFree, outputKind = 'text', sup
 
 const UPSTREAM_TIMEOUT_MS = 15_000;
 
-export async function fetchModelsOpenAI({ platform, baseUrl, apiKey, extraHeaders = {} }) {
+/** netOpts 透传给 proxyFetch（测试里传 { systemProxy: false } 跳过系统代理探测） */
+export async function fetchModelsOpenAI({ platform, baseUrl, apiKey, extraHeaders = {}, netOpts = {} }) {
   const headers = { Accept: 'application/json', ...extraHeaders };
   if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
-  const res = await proxyFetch(`${baseUrl}/models`, { headers, signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS) });
+  const res = await proxyFetch(`${baseUrl}/models`, { headers, signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS), ...netOpts });
   if (!res.ok) throw new Error(`${platform} /models 返回 HTTP ${res.status}`);
   let json;
   try {
@@ -147,32 +148,39 @@ const KNOWN_HINTS = [
   ],
 ];
 
+/** 把上游错误正文格式化成给人看的摘录（带已知错误的可操作提示） */
+function snippetFromText(rawText) {
+  const text = String(rawText || '').trim();
+  if (!text) return '';
+  let msg = text;
+  try {
+    const j = JSON.parse(text);
+    msg = j?.error?.message || j?.message || j?.error || text;
+  } catch {
+    /* 非 JSON，直接用原文 */
+  }
+  msg = String(msg).replace(/\s+/g, ' ').slice(0, 160);
+  const hint = KNOWN_HINTS.find(([re]) => re.test(msg) || re.test(text))?.[1];
+  return msg ? `（平台返回：${msg}${hint ? `。${hint}` : ''}）` : '';
+}
+
 /** 读取上游错误正文摘录（401/403 时给用户看真实拒绝原因，如魔搭"未绑定阿里云账号"） */
 async function errBodySnippet(res) {
   try {
-    const text = (await res.text()).trim();
-    if (!text) return '';
-    let msg = text;
-    try {
-      const j = JSON.parse(text);
-      msg = j?.error?.message || j?.message || j?.error || text;
-    } catch {
-      /* 非 JSON，直接用原文 */
-    }
-    msg = String(msg).replace(/\s+/g, ' ').slice(0, 160);
-    const hint = KNOWN_HINTS.find(([re]) => re.test(msg) || re.test(text))?.[1];
-    return msg ? `（平台返回：${msg}${hint ? `。${hint}` : ''}）` : '';
+    return snippetFromText(await res.text());
   } catch {
     return '';
   }
 }
 
-/** 用 /models 可达性做 key 有效性校验（模型列表需要鉴权的平台用） */
-export async function testKeyOpenAI({ baseUrl, apiKey, extraHeaders = {} }) {
+/** 用 /models 可达性做 key 有效性校验（模型列表需要鉴权的平台用）。
+ * netOpts 透传给 proxyFetch（测试里传 { systemProxy: false } 跳过系统代理探测）。 */
+export async function testKeyOpenAI({ baseUrl, apiKey, extraHeaders = {}, netOpts = {} }) {
   try {
     const res = await proxyFetch(`${baseUrl}/models`, {
       headers: { Accept: 'application/json', ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}), ...extraHeaders },
       signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+      ...netOpts,
     });
     if (res.status === 401 || res.status === 403) {
       return { ok: false, invalid: true, error: `平台拒绝访问（HTTP ${res.status}）${await errBodySnippet(res)}` };
@@ -187,24 +195,42 @@ export async function testKeyOpenAI({ baseUrl, apiKey, extraHeaders = {} }) {
 /**
  * 模型列表公开（无鉴权）平台的 key 校验：列表接口无法验证 key，
  * 改用一次 1-token 的 /chat/completions 探测（仅在用户点击「测试」时触发）。
- * 401/403 = key 无效；200/429/400（如模型参数问题）都认为鉴权通过。
+ *
+ * 状态码语义（2026-10-19 魔搭实测 + 用户反馈后定稿）：
+ * - 401/403 = key 无效（**决定性**，该平台鉴权失败一律 401）
+ * - 200/429 = 鉴权通过（429 是限速，不是 key 问题）
+ * - 404 + "model" = 鉴权通过、只是探测模型不存在
+ * - 400 = **鉴权已通过、请求被上游拒绝**（探测模型已下线/不支持 chat、参数被挑剔等）。
+ *   绝不能再据此判定 key 无效：魔搭公开列表首项不一定能跑 chat 探测，返回 400 后
+ *   旧逻辑直接报「Key 无效」，用户连点同一条 Key 六次才碰巧成功。
+ *   只有正文明显是鉴权错误（invalid api key / unauthorized token）才按无效处理。
  */
-export async function testKeyByChatProbe({ baseUrl, apiKey, probeModel, extraHeaders = {} }) {
+export async function testKeyByChatProbe({ baseUrl, apiKey, probeModel, extraHeaders = {}, netOpts = {} }) {
   try {
     const res = await proxyFetch(`${baseUrl}/chat/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}`, ...extraHeaders },
       body: JSON.stringify({ model: probeModel, messages: [{ role: 'user', content: 'ping' }], max_tokens: 1, stream: false }),
       signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+      ...netOpts,
     });
     if (res.status === 401 || res.status === 403) {
       return { ok: false, invalid: true, error: `平台拒绝访问（HTTP ${res.status}）${await errBodySnippet(res)}` };
     }
     if (res.status === 429) return { ok: true };
+    if (res.status === 400) {
+      const text = await res.text().catch(() => '');
+      const snippet = snippetFromText(text);
+      // 少数网关把鉴权失败也包成 400：只有正文明确指向 key/token 时才继续判无效
+      if (/api[\s_-]?key|unauthor|invalid[\s._-]*(api[\s_-]?)?(key|token)|token[\s._-]*invalid/i.test(text)) {
+        return { ok: false, invalid: true, error: `平台拒绝访问（HTTP 400）${snippet}` };
+      }
+      return { ok: false, modelRejected: true, error: `HTTP 400${snippet}` };
+    }
     if (!res.ok) {
       const text = await res.text().catch(() => '');
       if (/model/i.test(text) && res.status === 404) return { ok: true }; // 鉴权已过，仅探测模型不存在
-      return { ok: false, error: `HTTP ${res.status}${await errBodySnippet(res)}` };
+      return { ok: false, error: `HTTP ${res.status}${snippetFromText(text)}` };
     }
     return { ok: true };
   } catch (err) {
@@ -290,7 +316,8 @@ export function defineOpenAIPlatform(cfg) {
     },
     peek: () => peekModelsCacheFor(id),
     fetchQuotaForKey,
-    testKey: async (apiKey) => {
+    /** netOpts 仅供测试透传（{ systemProxy: false } 跳过系统代理探测），生产调用不传 */
+    testKey: async (apiKey, netOpts = {}) => {
       /**
        * 按候选节点顺序探测；key 与签发站点绑定的平台，第一个鉴权通过的节点即该 key 的归属节点。
        *
@@ -298,37 +325,63 @@ export function defineOpenAIPlatform(cfg) {
        * /models 鉴权行为不一致——国际主节点 apihub.agnes-ai.com 的 /models 公开，**假 key 也
        * 返回 200**，用 /models 校验会把垃圾 key「假通过」并绑定到错误节点；而三个节点的
        * /chat/completions 鉴权行为完全一致（无效 key 一律 401）。
-       * 探测模型从任意能拉到列表的节点获取（列表内容同平台一致）。
+       *
+       * 探测模型：优先用平台显式配置的 probeModel；没配就从公开列表取前 3 个依次试探。
+       * 为什么不再只用列表首项：魔搭首项（如 deepseek-ai/DeepSeek-V4-Flash-0731）不一定
+       * 能跑 chat 探测，上游回 400 被旧逻辑当成「Key 无效」，用户连点六次才碰巧成功
+       * （2026-10-19 用户反馈）。
        */
       const candidates = [baseUrl, ...alternateBaseUrls];
       const useChatProbe = modelsPublic || candidates.length > 1;
-      let model = probeModel;
-      if (useChatProbe && !model) {
-        for (const b of candidates) {
-          try {
-            const list = await fetchModelsOpenAI({ platform: name, baseUrl: b, apiKey, extraHeaders });
-            model = list[0]?.id;
-            if (model) break;
-          } catch {
-            /* 该节点拉不到列表（需鉴权/故障），换下一个 */
+      let probeModels = [];
+      if (useChatProbe) {
+        if (probeModel) probeModels = [probeModel];
+        else {
+          for (const b of candidates) {
+            try {
+              const list = await fetchModelsOpenAI({ platform: name, baseUrl: b, apiKey, extraHeaders, netOpts });
+              probeModels = list.map((m) => m.id).filter(Boolean).slice(0, 3);
+              if (probeModels.length) break;
+            } catch {
+              /* 该节点拉不到列表（需鉴权/故障），换下一个 */
+            }
           }
         }
       }
-      const attempt = async (base) => {
+      const attempt = async (base, model) => {
         if (useChatProbe) {
-          if (!model) return { ok: false, error: '无法确定探测模型' };
-          return testKeyByChatProbe({ baseUrl: base, apiKey, probeModel: model, extraHeaders });
+          if (!model) return { ok: false, error: '无法确定探测模型（平台模型列表为空）' };
+          return testKeyByChatProbe({ baseUrl: base, apiKey, probeModel: model, extraHeaders, netOpts });
         }
-        return testKeyOpenAI({ baseUrl: base, apiKey, extraHeaders });
+        return testKeyOpenAI({ baseUrl: base, apiKey, extraHeaders, netOpts });
       };
 
+      const tries = probeModels.length ? probeModels : [undefined];
       let firstFailure = null;
+      let rejectedByModel = null;
       for (const base of candidates) {
-        const r = await attempt(base);
-        if (r.ok) return { ...r, baseUrl: base };
-        // 网络错误也换下一节点（某节点被墙/宕机时其余节点可能可达）；
-        // 只保留第一个失败原因用于最终报错——它来自默认节点，最有代表性
-        if (!firstFailure) firstFailure = r;
+        for (const model of tries) {
+          const r = await attempt(base, model);
+          if (r.ok) return { ...r, baseUrl: base };
+          // 401/403 是决定性结论：换模型、换节点都不会变好，立刻返回
+          if (r.invalid) return r;
+          // 400（探测模型/参数被拒）：鉴权层已过，换个探测模型继续试
+          if (r.modelRejected) {
+            if (!rejectedByModel) rejectedByModel = r;
+            continue;
+          }
+          // 网络错误等：换下一节点（某节点被墙/宕机时其余节点可能可达），
+          // 只保留第一个失败原因——它来自默认节点，最有代表性
+          if (!firstFailure) firstFailure = r;
+        }
+      }
+      // 所有探测模型都被 400 拒：key 大概率是好的，只是探测不被支持。
+      // 别把用户挡在门外——放行并说明，后续真调不通他会看到上游原文。
+      if (rejectedByModel) {
+        return {
+          ok: true,
+          warn: `已通过鉴权，但探测模型被上游拒绝（${rejectedByModel.error}）；这不代表 Key 无效，若之后调用报错请到平台确认该模型是否可用`,
+        };
       }
       return firstFailure || { ok: false, error: '所有节点探测失败' };
     },
