@@ -680,6 +680,45 @@ ok(
   '已删除的原会话正文没有被改写'
 );
 
+/* ---------- 13. 名称同步：副本要把名字钉进 custom_title ---------- */
+out('\n== 13. 名称同步（客户端会给副本重新生成自动标题） ==');
+const TITLE_A = 'dddddddd-0000-4000-8000-00000000000a';
+const TITLE_B = 'dddddddd-0000-4000-8000-00000000000b';
+const TITLE_C = 'dddddddd-0000-4000-8000-00000000000c';
+for (const id of [TITLE_A, TITLE_B, TITLE_C]) {
+  fs.writeFileSync(path.join(slugDir, `${id}.jsonl`), bodyText(id), 'utf8');
+}
+{
+  const d = new DatabaseSync(dbPath);
+  const stmt = d.prepare(
+    'INSERT INTO sessions (id, cwd, user_id, title, custom_title, status, created_at, updated_at, transport, unread) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+  );
+  // A：只有自动标题（真实场景最常见）——名字必须被钉住，否则客户端会重写成别的
+  stmt.run(TITLE_A, 'E:\\demo\\workspace', SOURCE_UID, '自动标题-A', null, 'completed', 1700000000000, 1700000001000, 'local', 0);
+  // B：用户改过名——原样搬过去
+  stmt.run(TITLE_B, 'E:\\demo\\workspace', SOURCE_UID, '自动标题-B', '用户改名-B', 'completed', 1700000000000, 1700000001000, 'local', 0);
+  // C：连自动标题都还没生成——不要凭空造一个
+  stmt.run(TITLE_C, 'E:\\demo\\workspace', SOURCE_UID, null, null, 'completed', 1700000000000, 1700000001000, 'local', 0);
+  d.close();
+}
+const titleReport = await copySessions({ targetAccountId: TARGET_ACCOUNT_ID, ids: [TITLE_A, TITLE_B, TITLE_C] });
+ok(titleReport.copied.length === 3, `三个标题用例都复制成功${titleReport.errors.length ? `（错误：${JSON.stringify(titleReport.errors)}）` : ''}`);
+{
+  const d = readDb();
+  const rowOf = (srcId) => {
+    const newId = titleReport.copied.find((c) => c.id === srcId)?.newId;
+    return newId ? d.prepare('SELECT title, custom_title FROM sessions WHERE id = ?').get(newId) : null;
+  };
+  const a = rowOf(TITLE_A);
+  ok(a?.title === '自动标题-A', '自动标题原样复制到 title');
+  ok(a?.custom_title === '自动标题-A', '自动标题同时钉进 custom_title（客户端不会再重命名）');
+  const b = rowOf(TITLE_B);
+  ok(b?.title === '自动标题-B' && b?.custom_title === '用户改名-B', '用户改名优先，原样保留');
+  const c = rowOf(TITLE_C);
+  ok(c && c.title === null && c.custom_title === null, '源会话没有标题时不凭空造名字');
+  d.close();
+}
+
 /* ---------- 汇总 ---------- */
 out(`\n${pass}/${total} 断言通过`);
 fs.rmSync(tmpRoot, { recursive: true, force: true });

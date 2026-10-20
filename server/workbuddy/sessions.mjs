@@ -453,6 +453,24 @@ function displayTitle(title, customTitle) {
   return t || '(无标题)';
 }
 
+/**
+ * 副本要"钉住"的标题（写进 custom_title）。
+ *
+ * 为什么必须钉：WorkBuddy 会给**导入的副本重新生成自动标题**，把我们复制过去的
+ * `title` 覆盖掉（v0.2.6 之前已实测，见 8acce29 的提交说明）；而 `custom_title`
+ * 一旦有值就不会再被自动命名改写。
+ *
+ * 所以复制时不能只搬 title——那等于把名字交给客户端重写。有用户改名就用改名，
+ * 否则把自动标题本身钉成 custom_title（2026-10-20 用户反馈：内容同步过去了、名字没跟过去）。
+ * 没有标题（连自动标题都没生成）时返回 null，让它按原样交给客户端。
+ */
+function pinnedTitle(title, customTitle) {
+  const custom = String(customTitle || '').trim();
+  if (custom) return custom;
+  const t = String(title || '').trim();
+  return t || null;
+}
+
 /** 会话所属工作区名（取 cwd 最后一段）；没有 cwd 的归入「(无工作区)」 */
 function workspaceName(cwd) {
   const s = String(cwd || '').replace(/[/\\]+$/, '');
@@ -598,6 +616,9 @@ function buildCopyRow(sourceRow, { newId, targetUid, now }) {
   // 源会话可能正处于 working：副本是「已完成的快照」，留着 working 会让客户端
   // 以为还有未结束的回合而尝试续跑，与源账号抢同一段对话内容。
   if (row.status === 'working') row.status = 'completed';
+  // 名字要跟过去：title 会被客户端重新生成，必须同时钉进 custom_title（见 pinnedTitle）
+  row.custom_title = pinnedTitle(sourceRow.title, sourceRow.custom_title);
+  if (!row.title && row.custom_title) row.title = row.custom_title;
   return row;
 }
 
@@ -683,19 +704,19 @@ export async function copySessions({ targetAccountId, ids, stopApp = false }) {
    * 只动这两个列，内容一字不碰；字段没变化时不写。返回同步结果或 null（无需同步）。
    */
   const syncTitleBack = (originId, sourceTitle, sourceCustomTitle) => {
+    const nextCustom = pinnedTitle(sourceTitle, sourceCustomTitle);
     const cur = db.prepare('SELECT title, custom_title FROM sessions WHERE id = ? AND user_id = ?').get(originId, targetUid);
     if (!cur) return null;
     const same =
-      String(cur.title ?? '') === String(sourceTitle ?? '') &&
-      String(cur.custom_title ?? '') === String(sourceCustomTitle ?? '');
+      String(cur.title ?? '') === String(sourceTitle ?? '') && String(cur.custom_title ?? '') === String(nextCustom ?? '');
     if (same) return null;
     db.prepare('UPDATE sessions SET title = ?, custom_title = ? WHERE id = ? AND user_id = ?').run(
       sourceTitle ?? null,
-      sourceCustomTitle ?? null,
+      nextCustom,
       originId,
       targetUid
     );
-    return { originId, title: displayTitle(sourceTitle, sourceCustomTitle) };
+    return { originId, title: displayTitle(sourceTitle, nextCustom) };
   };
 
   /**

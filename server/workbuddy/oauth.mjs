@@ -20,6 +20,7 @@ import { randomUUID } from 'node:crypto';
 import { proxyFetch } from '../proxy.mjs';
 import { getVariant, officialNetHint } from './variant.mjs';
 import { loadAccounts, saveAccounts, accountMeta } from './accounts.mjs';
+import { verifyNewAccount } from './tokenRefresh.mjs';
 
 /** 单次扫码登录的有效期（秒），与官方 state 有效期对齐 */
 const OAUTH_TIMEOUT_SECONDS = 600;
@@ -235,6 +236,16 @@ async function pollOnce(loginId) {
   info.result = result;
   info.error = null;
   console.log(`[oauth] 已采集账号：${result?.name || result?.uid || '(未命名)'}（档位 ${variant.id}）`);
+
+  /**
+   * 入库即验活：徽章只认服务端验活结论，不验就要等 6 小时巡检，新账号会一直挂着
+   * 「待验活」（2026-10-20 反馈）。这里是扫码后唯一能拿到新鲜 token 的地方，
+   * 收尾顺手验一次，前端随后 reload 列表就能看到真实状态。
+   * 失败/超时都不影响入库结果——只在有结论时补进返回值。
+   */
+  const verify = await verifyNewAccount(result?.uid || result?.id);
+  // info.result 与 result 是同一个对象，补上 verify 后后续轮询也能读到
+  if (verify) result.verify = verify;
   return { done: true, result };
 }
 

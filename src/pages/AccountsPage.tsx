@@ -48,9 +48,25 @@ import type {
   OAuthStartResult,
   SessionCopyReport,
   SessionListResponse,
+  RelaunchResult,
   SwitchAccountResult,
   VariantInfo,
 } from '../lib/types';
+
+/**
+ * 把「重开 WorkBuddy」的结果翻成一句人话，三种状态必须分开：
+ * - 成功发起且确认进程在 → 已自动重新打开
+ * - 发起成功但没能确认（安全软件拦截/启动慢）→ 明确说"未能确认"，别谎报成功
+ * - 压根没发起成功 → 报失败并带上原因（老版本只说"重新打开失败"，用户看不出为什么）
+ */
+function relaunchTail(relaunch: RelaunchResult | null | undefined, stopped: boolean) {
+  if (!relaunch) return stopped ? '请重新打开 WorkBuddy' : '';
+  if (relaunch.launched === false) {
+    return `WorkBuddy 已退出但重新打开失败，请手动打开${relaunch.error ? `（${relaunch.error}）` : ''}`;
+  }
+  if (relaunch.warning) return `已发起启动 WorkBuddy，但未能确认：${relaunch.warning}`;
+  return 'WorkBuddy 已自动重新打开';
+}
 
 /** 按 uid 生成稳定的头像色，同一账号每次渲染颜色一致 */
 function avatarTone(seed: string) {
@@ -256,7 +272,7 @@ function AccountCard({
         ? '官方接口已拒绝这个账号的凭据，本地「未过期」不算数。请重新登录该账号后重新导入'
         : !account.hasPlainToken
           ? undefined
-          : '尚未验活：凭据巡检每 6 小时自动验一次，也可以点「刷新凭据」立即验证';
+          : '尚未验活：添加账号时会自动验一次，之后每 6 小时巡检一次，也可以点「刷新凭据」立即验证';
 
   const pkgs = usablePackages(balance).slice(0, 2);
   const pkgTotal = usablePackages(balance).length;
@@ -1278,7 +1294,7 @@ function SessionCopyDialog({
         const rep = r?.sessionCopy || null;
         const failed = rep?.errors?.length || 0;
         const reopenFailed = r?.relaunch ? r.relaunch.launched === false : false;
-        const tail = reopenFailed ? 'WorkBuddy 已退出但重新打开失败，请手动打开' : 'WorkBuddy 已自动重新打开';
+        const tail = relaunchTail(r?.relaunch, !!r?.appStop?.wasRunning);
         toast(
           failed || reopenFailed ? 'err' : 'ok',
           `已复制 ${rep?.copied.length || 0} 个会话并切换到「${target.name}」` +
@@ -1304,9 +1320,7 @@ function SessionCopyDialog({
       setReport(rep);
       const reopenFailed = rep.relaunch ? rep.relaunch.launched === false : false;
       const procNote = rep.appStop?.wasRunning
-        ? reopenFailed
-          ? '；WorkBuddy 已退出，但重新打开失败，请手动打开'
-          : '；WorkBuddy 已自动重新打开'
+        ? `；${relaunchTail(rep.relaunch, true)}`
         : '';
       if (rep.ok && !reopenFailed) toast('ok', `已复制 ${rep.copied.length} 个会话到「${target.name}」${procNote}`);
       else
@@ -1663,11 +1677,7 @@ export default function AccountsPage() {
       const copied = r?.sessionCopy?.copied.length || 0;
       const wasStopped = !!r?.appStop?.wasRunning;
       const reopenFailed = r?.relaunch ? r.relaunch.launched === false : false;
-      const tail = reopenFailed
-        ? 'WorkBuddy 已退出但重新打开失败，请手动打开'
-        : wasStopped
-          ? 'WorkBuddy 已自动重新打开'
-          : '请重新打开 WorkBuddy';
+      const tail = relaunchTail(r?.relaunch, wasStopped || !!r?.appStop?.wasRunning);
       toast(
         reopenFailed ? 'err' : 'ok',
         `已切换到「${account.name}」${copied ? `，并复制了 ${copied} 个会话` : ''}，${tail}`

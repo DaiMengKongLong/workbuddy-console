@@ -234,6 +234,53 @@ export function verifyStateOf(accountId) {
   return loadCredentialStatus()[accountId] || null;
 }
 
+/** 新账号入库时那一拍的验活上限：别让一次慢请求拖住「添加账号」的响应 */
+export const NEW_ACCOUNT_VERIFY_TIMEOUT_MS = 5000;
+
+/**
+ * 账号**刚入库**时立刻验一次活（扫码添加 / 导入本机账号的收尾动作）。
+ *
+ * ## 为什么需要
+ *
+ * 卡片上的凭据徽章只认**服务端验活结论**（`credential_status.json`），而定时巡检
+ * 每 6 小时才跑一轮（且是启动 60 秒后才起跑）。入库时不验，新账号就会一直挂在灰色的
+ * 「待验活」，用户得自己点「刷新凭据」才看得到真实状态（2026-10-20 反馈）。
+ *
+ * ## 取舍
+ *
+ * - 复用 `verifyAccount()`：打的是余额汇总这个**只读**接口，不轮换 token，对当前登录
+ *   账号也安全（巡检的注释里已经论证过）。
+ * - 加密信封账号（没有明文 token）直接跳过——发不出带鉴权的请求，硬验只会把徽章染红，
+ *   巡检同样跳过这类账号。
+ * - **超时兜底**：扫码结果轮询是前端 1.5 秒一轮的请求，不能被一次慢验活拖住；超时就先
+ *   返回 null（徽章暂时仍是「待验活」），后台那次请求会自己跑完并落盘，下次刷新列表就准了。
+ *   给竞速用的 promise 挂了 `catch`，避免超时之后才失败的 rejection 变成 unhandled。
+ *
+ * `verify` 可注入，纯粹为了离线回归能断言"验了谁 / 没验谁"。
+ */
+export async function verifyNewAccount(
+  idOrUid,
+  { timeoutMs = NEW_ACCOUNT_VERIFY_TIMEOUT_MS, verify = verifyAccount } = {}
+) {
+  const key = String(idOrUid || '');
+  if (!key) return null;
+  const account = loadAccounts().find((a) => a?.id === key || a?.uid === key);
+  if (!account || !plain(account, 'access_token')) return null;
+
+  let timer = null;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(null), Math.max(0, Number(timeoutMs) || 0));
+  });
+  try {
+    const work = Promise.resolve()
+      .then(() => verify(account))
+      .catch(() => null);
+    return await Promise.race([work, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 /**
  * 巡检决策（纯函数，便于离线回归）：把「验活结论 + 本地有效期 + 是否当前账号」翻译成一个动作。
  *

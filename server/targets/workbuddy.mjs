@@ -505,22 +505,128 @@ export async function detectWorkbuddyProcess({ names = WORKBUDDY_PROCESS_NAMES }
   };
 }
 
-/** 定位 WorkBuddy 可执行文件：优先检测到的真实路径，再按常见安装位置兜底 */
-function findWorkbuddyExe(detectedPath) {
-  const candidates = [
-    detectedPath,
+/**
+ * WorkBuddy 可执行文件的文件名（不同发行版命名不一致，实测见过 WorkBuddy.app 与 WorkBuddy AI）
+ * 与安装目录特征（目录名以这些开头）。
+ */
+const WORKBUDDY_EXE_NAMES = ['WorkBuddy.exe', 'WorkBuddy AI.exe', 'WorkBuddyAI.exe', 'CodeBuddy.exe', 'CodeBuddy AI.exe'];
+const WORKBUDDY_DIR_RE = /^(workbuddy|codebuddy)/i;
+const EXE_NAME_RE = /^(workbuddy|codebuddy)[^/\\]*\.exe$/i;
+
+function existsQuiet(p) {
+  try {
+    return !!p && fs.existsSync(p);
+  } catch {
+    return false;
+  }
+}
+
+function listDirQuiet(dir) {
+  try {
+    return fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+}
+
+/** 在**一个安装目录**里找 exe：先按已知文件名，再按前缀通配，最后看一层版本子目录（app-1.2.3/） */
+export function findExeInDir(dir, io = { exists: existsQuiet, listDir: listDirQuiet }) {
+  if (!dir) return null;
+  for (const name of WORKBUDDY_EXE_NAMES) {
+    const p = path.join(dir, name);
+    if (io.exists(p)) return p;
+  }
+  const entries = io.listDir(dir);
+  const hit = entries.find((e) => !e.isDirectory() && EXE_NAME_RE.test(e.name));
+  if (hit) return path.join(dir, hit.name);
+  // 再下一层：Electron 的版本目录（app-1.2.3/、bin/）不一定带 workbuddy 前缀，
+  // 所以这里不按名字过滤，只限制「只下钻一层」以免无限扫描
+  for (const e of entries) {
+    if (!e.isDirectory()) continue;
+    const deeper = path.join(dir, e.name);
+    for (const name of WORKBUDDY_EXE_NAMES) {
+      const p = path.join(deeper, name);
+      if (io.exists(p)) return p;
+    }
+    const inner = io.listDir(deeper).find((x) => !x.isDirectory() && EXE_NAME_RE.test(x.name));
+    if (inner) return path.join(deeper, inner.name);
+  }
+  return null;
+}
+
+/**
+ * 在若干「安装根目录」（Program Files / Program Files (x86) / LocalAppData\Programs 等）下
+ * 找 WorkBuddy 的安装目录并取 exe。
+ *
+ * 为什么必须扫根目录而不是只列几个写死的完整路径：用户把 WorkBuddy 装在自定义位置很常见
+ * （本机就有 `E:\Program Files\WorkBuddyAI`），而 `exePath` 依赖 PowerShell 读进程 Path——
+ * PowerShell 被安全软件/组策略拦掉时拿不到，切号后"重新打开"就会报「未能定位可执行文件」，
+ * 但用户手动双击又能打开（2026-10-20 用户反馈）。
+ */
+export function findExeUnderRoots(roots, io = { exists: existsQuiet, listDir: listDirQuiet }) {
+  const matches = [];
+  for (const root of roots) {
+    if (!root || !io.exists(root)) continue;
+    for (const e of io.listDir(root)) {
+      if (!e.isDirectory() || !WORKBUDDY_DIR_RE.test(e.name)) continue;
+      const found = findExeInDir(path.join(root, e.name), io);
+      if (found) matches.push(found);
+    }
+  }
+  if (matches.length <= 1) return matches[0] || null;
+  // 装了多份时（常见于"新版装到别的盘、旧版没卸"）：取 exe 修改时间最新的那份，
+  // 它才是用户真正在用的安装；路径顺序只作为同等条件下的兜底
+  let best = matches[0];
+  let bestTime = -1;
+  for (const p of matches) {
+    let t = 0;
+    try {
+      t = fs.statSync(p).mtimeMs || 0;
+    } catch {
+      t = 0;
+    }
+    if (t > bestTime) {
+      bestTime = t;
+      best = p;
+    }
+  }
+  return best;
+}
+
+/** Windows 上值得一查的安装根目录：环境变量给的 + 所有盘符的 Program Files */
+export function installRoots(env = process.env) {
+  const roots = [];
+  const push = (p) => {
+    if (p && !roots.includes(p)) roots.push(p);
+  };
+  push(env.ProgramFiles);
+  push(env['ProgramFiles(x86)']);
+  push(env.ProgramW6432);
+  for (const drive of ['C', 'D', 'E', 'F', 'G', 'H']) {
+    push(`${drive}:\\Program Files`);
+    push(`${drive}:\\Program Files (x86)`);
+  }
+  if (env.LOCALAPPDATA) {
+    push(path.join(env.LOCALAPPDATA, 'Programs'));
+    push(env.LOCALAPPDATA);
+  }
+  if (env.APPDATA) push(path.join(env.APPDATA, 'Programs'));
+  return roots;
+}
+
+/** 定位 WorkBuddy 可执行文件：优先检测到的真实路径，再按常见安装位置兜底，最后扫安装根目录 */
+export function findWorkbuddyExe(detectedPath) {
+  if (existsQuiet(detectedPath)) return detectedPath;
+  const home = os.homedir();
+  const quick = [
     path.join(process.env.LOCALAPPDATA || '', 'Programs', 'WorkBuddy', 'WorkBuddy.exe'),
     'C:\\Program Files\\WorkBuddy\\WorkBuddy.exe',
     'C:\\Program Files (x86)\\WorkBuddy\\WorkBuddy.exe',
-    path.join(os.homedir(), 'AppData', 'Local', 'Programs', 'WorkBuddy', 'WorkBuddy.exe'),
-  ].filter(Boolean);
-  return candidates.find((p) => {
-    try {
-      return fs.existsSync(p);
-    } catch {
-      return false;
-    }
-  });
+    path.join(home, 'AppData', 'Local', 'Programs', 'WorkBuddy', 'WorkBuddy.exe'),
+  ];
+  const direct = quick.find((p) => existsQuiet(p));
+  if (direct) return direct;
+  return findExeUnderRoots(installRoots());
 }
 
 /**
@@ -668,13 +774,14 @@ export async function stopWorkbuddy({
  * 重新打开 WorkBuddy（切换账号后调用，让用户拿到一个已登录新账号的客户端）。
  * Windows 用 exe 直接拉起；macOS 从检测到的可执行文件路径反推 .app 包后用 `open`。
  */
-export function launchWorkbuddy(exePath) {
+export async function launchWorkbuddy(exePath) {
   if (process.platform === 'darwin') {
     const bundle = findWorkbuddyAppBundle(exePath);
     if (!bundle) {
       throw new Error('未能定位 WorkBuddy 的 .app 包（/Applications 下未找到），请手动重新打开 WorkBuddy');
     }
     const child = spawn('open', [bundle], { detached: true, stdio: 'ignore' });
+    child.on('error', () => {}); // 不让异步 error 把控制台进程带崩
     child.unref();
     return { launched: true, exePath: bundle };
   }
@@ -684,12 +791,52 @@ export function launchWorkbuddy(exePath) {
   const exe = findWorkbuddyExe(exePath);
   if (!exe) {
     throw new Error(
-      '未能定位 WorkBuddy 可执行文件，请手动重新打开 WorkBuddy。' + (exePath ? `（检测到的路径：${exePath}）` : '')
+      '未能定位 WorkBuddy 可执行文件（已检查 Program Files、其它盘符与 LocalAppData\\Programs），请手动重新打开 WorkBuddy。' +
+        (exePath ? `（检测到的进程路径：${exePath}）` : '（未能从进程读到路径，通常是 PowerShell 被安全软件拦截）') +
+        '；也可以把「设置 → WorkBuddy 目录」指到安装目录所在盘，我们会重新扫描'
     );
   }
+  return spawnAndVerify(exe);
+}
+/**
+ * 拉起进程并确认它**真的起来了**。
+ *
+ * 为什么不能 spawn 完就报成功：`spawn` 的 ENOENT/EACCES 是**异步**事件（还会把没监听的
+ * 进程直接带崩），而"起来了但立刻被安全软件拦掉"更是完全静默。用户看到"已自动重新打开"
+ * 却发现客户端没开，比直接说失败更糟。这里等 spawn 事件 + 最多 4 秒的进程复检，
+ * 把"发起成功但没活下来"如实降级成 warning。
+ */
+async function spawnAndVerify(exe) {
+  let spawnError = null;
+  console.log(`[launch] 重新打开 WorkBuddy：${exe}`);
   const child = spawn(exe, [], { detached: true, stdio: 'ignore' });
+  child.on('error', (err) => {
+    spawnError = err;
+  });
   child.unref();
-  return { launched: true, exePath: exe };
+
+  await sleep(600);
+  if (spawnError) {
+    throw new Error(`启动 ${path.basename(exe)} 失败：${spawnError.message}（路径：${exe}），请手动打开`);
+  }
+  for (let i = 0; i < 8; i++) {
+    let probe = null;
+    try {
+      probe = await detectWorkbuddyProcess();
+    } catch {
+      probe = null;
+    }
+    if (probe?.running) return { launched: true, exePath: exe, verified: true };
+    // 探测本身不可用（PowerShell 被拦、tasklist 也失败）时不能断言失败，按已发起来处理
+    if (probe?.error) return { launched: true, exePath: exe, verified: false, warning: `已发起启动，但无法确认进程状态：${probe.error}` };
+    await sleep(500);
+  }
+  return {
+    launched: true,
+    exePath: exe,
+    verified: false,
+    warning: '已发起启动，但 4 秒内没检测到 WorkBuddy 进程；若窗口没出现，可能被安全软件拦截或启动较慢',
+  };
 }
 
 /** macOS：从检测到的可执行文件路径反推 .app 包路径（如 /Applications/WorkBuddy.app），失败按常见位置兜底 */
@@ -724,9 +871,8 @@ export async function restartWorkbuddy() {
           (proc.exePath ? `（检测到的路径：${proc.exePath}）` : '')
       );
     }
-    const child = spawn(exe, [], { detached: true, stdio: 'ignore' });
-    child.unref();
-    return { restarted: true, exePath: exe };
+    const child = await spawnAndVerify(exe);
+    return { restarted: true, ...child };
   }
   if (process.platform === 'darwin') {
     if (!proc.pid) throw new Error('未获取到进程 ID，无法重启');

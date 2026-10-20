@@ -271,7 +271,7 @@ export interface AccountInfo {
   /** token 尾号，完整值永不返回前端 */
   masked: string;
   /**
-   * 最近一次**服务端验活**结论（由定时巡检写入）。
+   * 最近一次**服务端验活**结论（添加账号时立刻验一次，之后由定时巡检每 6 小时刷新）。
    * 本地 expiresAt 只说明"没到时间"，不代表服务端还认——界面以这个为准。
    */
   verify?: CredentialVerifyState | null;
@@ -399,8 +399,21 @@ export interface SessionCopyReport {
   backupPath: string;
   appStop: AppStopResult | null;
   /** 由路由层补上：本次是否重新打开了被关掉的 WorkBuddy */
-  relaunch?: { launched: boolean; exePath?: string; error?: string } | null;
+  relaunch?: RelaunchResult | null;
   elapsedMs: number;
+}
+
+/**
+ * 重开 WorkBuddy 的结果。
+ * `launched` 只表示"是否成功发起启动"；`verified` 才是"进程真的起来了"——
+ * 有些环境（安全软件拦截、启动很慢）只能发起、无法确认，此时带 `warning` 说明。
+ */
+export interface RelaunchResult {
+  launched: boolean;
+  exePath?: string;
+  error?: string;
+  verified?: boolean;
+  warning?: string;
 }
 
 /** 切换账号的返回：登录态切换结果 + 可选的会话复制报告与进程退出/重开结果 */
@@ -413,7 +426,7 @@ export interface SwitchAccountResult {
   needRestart: boolean;
   sessionCopy: SessionCopyReport | null;
   appStop: AppStopResult | null;
-  relaunch: { launched: boolean; exePath?: string; error?: string } | null;
+  relaunch: RelaunchResult | null;
 }
 
 /* ---------------- 积分统计 ---------------- */

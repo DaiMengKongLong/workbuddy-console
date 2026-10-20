@@ -53,6 +53,7 @@ import {
   loadCredentialStatus,
   verifyStateOf,
   verifyAccount,
+  verifyNewAccount,
   ACCESS_MIN_HOURS,
   REFRESH_MIN_HOURS,
 } from './workbuddy/tokenRefresh.mjs';
@@ -707,7 +708,10 @@ app.post(
   '/api/accounts/import',
   wrap(async (req, res) => {
     const variant = String(req.body?.variant || 'cn');
-    res.json(importLocalAccount(variant));
+    const added = importLocalAccount(variant);
+    // 入库即验活：否则新账号要等 6 小时巡检才脱离「待验活」（2026-10-20 反馈）
+    const verify = await verifyNewAccount(added?.uid || added?.id);
+    res.json(verify ? { ...added, verify } : added);
   })
 );
 
