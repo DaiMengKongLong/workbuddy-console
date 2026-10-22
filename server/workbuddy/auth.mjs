@@ -13,6 +13,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { authFilePath, getVariant, variantOf } from './variant.mjs';
+import { safeRenameOverwrite } from '../store/config.mjs';
 import {
   findAccount,
   loadAccounts,
@@ -164,7 +165,7 @@ export function syncTokensToAuthFile(account, { authPath: overridePath = null } 
   const tmp = `${authPath}.tmp-${process.pid}`;
   try {
     fs.writeFileSync(tmp, JSON.stringify(doc, null, 2), 'utf8');
-    fs.renameSync(tmp, authPath);
+    safeRenameOverwrite(tmp, authPath);
   } catch (err) {
     try {
       fs.unlinkSync(tmp);
@@ -234,7 +235,7 @@ export function switchAccount(accountId) {
   const tmp = `${authPath}.tmp-${process.pid}`;
   try {
     fs.writeFileSync(tmp, JSON.stringify(doc, null, 2), 'utf8');
-    fs.renameSync(tmp, authPath);
+    safeRenameOverwrite(tmp, authPath);
   } catch (err) {
     try {
       fs.unlinkSync(tmp);

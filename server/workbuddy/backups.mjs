@@ -14,6 +14,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { BACKUP_DIR, backupAuthFile } from './accounts.mjs';
 import { VARIANT_LIST, getVariant, authFilePath } from './variant.mjs';
+import { safeRenameOverwrite } from '../store/config.mjs';
 
 /** 备份文件名可能来自本工具（-cn / -ai 后缀）或 workbuddy-switch（无 cn 后缀） */
 const TAG_TO_VARIANT = [
@@ -127,7 +128,7 @@ export function restoreBackup(name) {
   const tmp = `${target}.tmp-${process.pid}`;
   try {
     fs.writeFileSync(tmp, raw, 'utf8');
-    fs.renameSync(tmp, target);
+    safeRenameOverwrite(tmp, target);
   } catch (e) {
     try {
       fs.unlinkSync(tmp);

@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { execFile, spawn } from 'node:child_process';
-import { loadConfig } from '../store/config.mjs';
+import { loadConfig, safeRenameOverwrite } from '../store/config.mjs';
 import { matchPlatformUrl } from '../providers/registry.mjs';
 
 /** 检查目录是否具备 WorkBuddy 数据目录的特征文件 */
@@ -109,7 +109,7 @@ function backupModelsJson() {
 function atomicWriteJson(file, obj) {
   const tmp = `${file}.tmp-${process.pid}`;
   fs.writeFileSync(tmp, JSON.stringify(obj, null, 2), 'utf8');
-  fs.renameSync(tmp, file);
+  safeRenameOverwrite(tmp, file);
 }
 
 function verifyEntries(ids, apiKey) {

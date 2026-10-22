@@ -6,6 +6,7 @@
 //   4) 合并后校验：每个副本的每一行都在结果里、行数 == 去重后行数；不通过不落盘
 import fs from 'node:fs';
 import crypto from 'node:crypto';
+import { safeRenameOverwrite } from '../store/config.mjs';
 
 const CH = 8 * 1024 * 1024;
 
@@ -197,6 +198,6 @@ export function mergeUnion(parts, keeperId, outFile) {
   for (const fd of fds.values()) fs.closeSync(fd);
 
   const lastTs = items.length ? items[items.length - 1].ts : 0;
-  fs.renameSync(tmp, outFile);
+  safeRenameOverwrite(tmp, outFile);
   return { ok: true, lines: check.ranges.length, dup, bytes: fs.statSync(outFile).size, lastTs };
 }
