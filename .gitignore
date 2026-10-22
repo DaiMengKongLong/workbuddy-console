@@ -20,3 +20,6 @@ out-*/
 *.pem
 *.key
 *.p12
+# AI Log Plugin 推荐忽略项
+.specstory/
+.ailog/
