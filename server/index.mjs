@@ -24,10 +24,11 @@ import {
   loadModels,
   removeModels,
   restartWorkbuddy,
+  killWorkbuddy,
 } from './targets/workbuddy.mjs';
 import { getStats } from './stats/workbuddyStats.mjs';
 import { getProxyUrl } from './proxy.mjs';
-import { loadAccounts, accountMeta, findAccount, accountDisplayName } from './workbuddy/accounts.mjs';
+import { loadAccounts, accountMeta, findAccount, accountDisplayName, hasPlainToken } from './workbuddy/accounts.mjs';
 import { oauthStart, oauthPoll } from './workbuddy/oauth.mjs';
 import {
   switchAccount,
@@ -45,6 +46,7 @@ import {
 import { refreshAccessToken } from './proxy/wb.mjs';
 import { VARIANT_LIST, authFilePath, dataRoot } from './workbuddy/variant.mjs';
 import { checkinAll, checkinAccount, fetchCheckinStatus, loadCheckinLogs, allCheckedInToday, allGrowthDoneToday } from './workbuddy/checkin.mjs';
+import { fetchTravelStatus } from './workbuddy/growth.mjs';
 import {
   refreshAccounts,
   refreshPlan,
@@ -60,14 +62,15 @@ import {
 import { checkForUpdate, LOCAL_VERSION } from './update.mjs';
 import { checkPermissions } from './workbuddy/diagnostics.mjs';
 import { listBackups, restoreBackup, deleteBackup, cleanBackups, backupVariants } from './workbuddy/backups.mjs';
+import { probeAllModelLimits } from './workbuddy/modelLimits.mjs';
 import { registerProxyRoutes, refreshModelsCache } from './proxy/index.mjs';
 import { stopWorkbuddy, launchWorkbuddy } from './targets/workbuddy.mjs';
-import { listSessionsForSwitch, copySessions } from './workbuddy/sessions.mjs';
+import { listSessionsForSwitch, copySessions, moveSessionsToAccount, sessionIdsNeedingSync, syncAllAccounts, dedupeSessions, sessionDataRoot, copyVariantIntoAccount, currentUidOfVariant } from './workbuddy/sessions.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
 const DIST = path.join(ROOT, 'dist');
-const PORT = Number(process.env.PORT || 57891);
+const PORT = Number(process.env.PORT || 57911);
 
 const app = express();
 // 反向代理的对话请求体可能很长（大上下文 / 工具调用），单独放宽到 12MB；
@@ -79,8 +82,10 @@ app.use(express.json({ limit: '1mb' }));
 
 const wrap = (fn) => (req, res) => {
   Promise.resolve(fn(req, res)).catch((err) => {
-    console.error(`[api] ${req.method} ${req.path}:`, err?.message || err);
-    res.status(500).json({ error: err?.message || '服务器内部错误' });
+    const status = Number(err?.status) || 500;
+    // 4xx 是调用方参数问题，不打成服务器错误日志，避免日志噪音
+    if (status >= 500) console.error(`[api] ${req.method} ${req.path}:`, err?.message || err);
+    res.status(status).json({ error: err?.message || '服务器内部错误' });
   });
 };
 
@@ -95,6 +100,127 @@ async function relaunchIfStopped(appStop) {
   } catch (err) {
     return { launched: false, error: err?.message || String(err) };
   }
+}
+
+// 服务保命：未捕获的异步异常/Rejection 只记日志，绝不让进程整个消失——
+// 用户点「一键同步」跑到一半服务闪退（页面变「本地服务已断开」）就是这类错误杀的。
+process.on('uncaughtException', (err) => {
+  console.error('[uncaughtException]', err?.stack || err);
+});
+process.on('unhandledRejection', (err) => {
+  console.error('[unhandledRejection]', err?.stack || err);
+});
+
+/**
+ * 全自动执行：自动关闭 WorkBuddy → 执行 fn → 清掉执行期间被系统拉起的实例 →
+ * 自动打开（读到操作完成后的最新数据）。用户无需手动开关。
+ */
+/**
+ * 数据写操作门禁：WorkBuddy 在运行就拒绝并提示用户手动退出。
+ * 绝不替用户杀进程/关应用（用户明确要求：不冻结、不强杀、不自动开关应用）。
+ */
+async function assertAppClosed() {
+  let running = false;
+  try {
+    const proc = await detectWorkbuddyProcess();
+    running = !!proc?.running;
+  } catch {
+    running = false;
+  }
+  if (running) {
+    throw Object.assign(
+      new Error('WorkBuddy 正在运行：请先在系统托盘右键退出 WorkBuddy（不是最小化），再回来点执行。写完数据后你自己重新打开即可，控制台不会替你关闭或启动应用。'),
+      { status: 409 }
+    );
+  }
+}
+
+/**
+ * 会话写操作互斥：sync-all / dedupe / move 都是「关应用 → 改库 → 重启」的重操作，
+ * 并发跑会重复备份、撞 SQLite 写锁、重复重启 WorkBuddy。执行中再收到写请求直接 409
+ * （排队等一小时不如让用户稍后再点）；dryRun 只读、随时可跑，不占锁。
+ */
+let sessionOpBusy = false;
+async function withSessionOpLock(fn) {
+  if (sessionOpBusy) {
+    throw Object.assign(new Error('已有会话整理操作在执行中（同步 / 去重 / 搬家），请等它完成后再操作'), { status: 409 });
+  }
+  sessionOpBusy = true;
+  try {
+    return await fn();
+  } finally {
+    sessionOpBusy = false;
+  }
+}
+
+/**
+ * 全自动执行：关掉 WorkBuddy → 干活 → 自动重新打开。
+ * 仅在用户明确要求时使用（stopApp=true）。关闭失败直接中止，不会在应用还开着时写库。
+ * 任何情况下都会尝试把 WorkBuddy 重新拉起来，避免把用户的应用留在关闭状态。
+ */
+async function withAppRestart(fn) {
+  let stop = null;
+  try {
+    stop = await stopWorkbuddy();
+  } catch (e) {
+    throw Object.assign(new Error(`无法关闭 WorkBuddy，已中止（没有改动任何数据）：${e?.message || e}`), { status: 500 });
+  }
+  let result = null;
+  let failure = null;
+  try {
+    result = await fn();
+  } catch (e) {
+    failure = e;
+  }
+  let relaunch = null;
+  if (stop?.wasRunning) {
+    // 等 SQLite 彻底放开 -wal/-shm 再拉起，避免新实例读到半写状态
+    await new Promise((r) => setTimeout(r, 1500));
+    try {
+      relaunch = await launchWorkbuddy(stop.exePath || null);
+    } catch (e) {
+      relaunch = { launched: false, error: e?.message || String(e) };
+    }
+  }
+  if (failure) {
+    failure.relaunch = relaunch;
+    failure.appStop = stop;
+    throw failure;
+  }
+  return { result, appStop: stop, relaunch };
+}
+
+async function runWithAppClosed(fn) {
+  let wasRunning = false;
+  let killed = null;
+  try {
+    const proc = await detectWorkbuddyProcess();
+    wasRunning = proc.running;
+    if (wasRunning) killed = await killWorkbuddy();
+  } catch {
+    wasRunning = false;
+  }
+  const result = await fn();
+  let relaunch = null;
+  if (wasRunning) {
+    try {
+      await killWorkbuddy();
+    } catch {
+      /* ignore */
+    }
+    await new Promise((r) => setTimeout(r, 6000));
+    const p2 = await detectWorkbuddyProcess();
+    if (p2.running) {
+      relaunch = { launched: true, resurrected: true };
+    } else {
+      try {
+        relaunch = await launchWorkbuddy(killed?.exePath || null);
+      } catch (err) {
+        relaunch = { launched: false, error: err?.message || String(err) };
+      }
+    }
+  }
+  return { result, wasRunning, relaunch };
 }
 
 const platformFromReq = (req) => {
@@ -657,26 +783,47 @@ app.post(
       }
     }
 
-    // 1) 先退出 WorkBuddy（未运行则空转）
+    // 1) 关闭 WorkBuddy（全自动切换的第一步）。
+    //    关键机制：WorkBuddy 被关闭后会被 Windows 的崩溃自动恢复拉起来，而**新实例
+    //    读取的是磁盘上当前的登录态**——所以只要在「重开」发生前写好新登录态，
+    //    重开出来的就是切换后账号的 WorkBuddy。这就是自动关 + 自动开成新账号。
     let appStop = null;
+    let wasRunning = false;
     if (stopApp) {
       try {
-        appStop = await stopWorkbuddy();
+        const proc = await detectWorkbuddyProcess();
+        wasRunning = proc.running;
+        if (wasRunning) appStop = await killWorkbuddy();
       } catch (err) {
         return res.status(400).json({ error: `退出 WorkBuddy 失败，已中止切换：${err?.message || err}` });
       }
     }
 
-    // 2) 复制会话（此刻 App 已退出，门禁能直接通过）
-    let sessionCopy = null;
-    if (ids.length) {
+    /**
+     * 1.5) 自动增量同步：把「此前复制过、目标账号里副本仍存在」的会话自动并入本次切换，
+     *      与用户手动勾选的会话**合并**（不是二选一——2026-10-21 用户实测：手动勾了 4 个，
+     *      其余 38 个已复制会话全被跳过，改名与内容都没跟过去）。只补已有副本，绝不产生新会话。
+     */
+    if (req.body?.autoSync !== false) {
       try {
-        sessionCopy = await copySessions({ targetAccountId: id, ids });
-      } catch (err) {
-        // 会话没复制成功就不要再动登录态了：用户的本意是"把对话带过去"，半途切号更糟
-        await relaunchIfStopped(appStop);
-        return res.status(400).json({ error: `会话复制失败，已中止切换：${err?.message || err}` });
+        for (const sid of await sessionIdsNeedingSync({ targetAccountId: id })) {
+          if (!ids.includes(sid)) ids.push(sid);
+        }
+      } catch {
+        /* 源目标相同、档位不支持等：安静跳过，按「无会话需同步」处理 */
       }
+    }
+
+    // 2) 搬家：勾了「同时复制会话」就只搬勾选的（含此前已同步过的），没勾才整包搬
+    let sessionCopy = null;
+    try {
+      sessionCopy = await moveSessionsToAccount({
+        targetAccountId: id,
+        ids: ids.length ? ids : null,
+        sourceVariant: ['cn', 'ai'].includes(String(req.body?.sourceVariant)) ? String(req.body.sourceVariant) : null,
+      });
+    } catch (err) {
+      return res.status(400).json({ error: `会话搬家失败，已中止切换：${err?.message || err}` });
     }
 
     // 3) 写登录态；无论成败都不把用户的应用留在"被关掉"的状态
@@ -687,8 +834,35 @@ app.post(
       await relaunchIfStopped(appStop);
       throw err;
     }
-    const relaunch = await relaunchIfStopped(appStop);
-    res.json({ ...result, sessionCopy, appStop, relaunch });
+
+    // 4) 收尾：把「登录态切换前就已自动重开」的旧账号实例再关一次，让下一次重开
+    //    读到已切换的登录态——重开出来的就是新账号的 WorkBuddy。
+    //    8 秒内没有自动重开就主动拉起兜底（保证用户总能拿到一个能用的 WorkBuddy）。
+    let killed = null;
+    let relaunch = null;
+    if (wasRunning) {
+      try {
+        killed = await killWorkbuddy();
+      } catch (err) {
+        killed = { stopped: false, error: err?.message || String(err) };
+      }
+      await new Promise((r) => setTimeout(r, 8000));
+      const proc = await detectWorkbuddyProcess();
+      if (proc.running) {
+        relaunch = { launched: true, resurrected: true };
+      } else {
+        try {
+          relaunch = await launchWorkbuddy(killed?.exePath || appStop?.exePath || null);
+        } catch (err) {
+          relaunch = { launched: false, error: err?.message || String(err) };
+        }
+      }
+    }
+    console.log(
+      `[switch] → ${String(target.uid || '').slice(0, 8)} 搬家 ${sessionCopy?.moved?.length || 0} 个 / 合并 ${sessionCopy?.merged?.length || 0} 个 / 失败 ${sessionCopy?.errors?.length || 0} 个` +
+        ` / 登录态已写 = ${result?.ok ? 'ok' : 'fail'}`
+    );
+    res.json({ ...result, sessionCopy, appStop, killed, relaunch });
   })
 );
 
@@ -805,12 +979,196 @@ app.post(
   })
 );
 
+/**
+ * 定位「汇总后自动整理」脚本。两套布局都要支持：
+ *   1) 源码/开发运行：项目根目录（server/ 的上一级）
+ *   2) 桌面安装版：electron-builder 的 extraResources 复制到 resources/cleanup/
+ *      （asar 内的文件无法被 spawn 执行，所以必须解到真实磁盘上）
+ */
+function resolveCleanScript() {
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const candidates = [path.resolve(here, '../汇总后自动整理.mjs')];
+  if (process.resourcesPath) {
+    candidates.push(path.join(process.resourcesPath, 'cleanup', '汇总后自动整理.mjs'));
+  }
+  for (const p of candidates) {
+    try {
+      if (fs.existsSync(p)) return p;
+    } catch {
+      /* 忽略单个候选的探测失败，继续下一个 */
+    }
+  }
+  return null;
+}
+
+function kickOffStorageClean(reason = 'after-sync') {
+  try {
+    const script = resolveCleanScript();
+    if (!script) return;
+    const child = spawn(process.execPath, [script], { detached: true, stdio: 'ignore', cwd: path.dirname(script) });
+    child.unref();
+    console.log(`[storage-clean] 已触发（${reason}）→ ${script}`);
+  } catch (e) {
+    console.log('[storage-clean] 触发失败: ' + (e?.message || e));
+  }
+}
+
+/**
+ * 一键同步所有本机账号：内容并集取最新 + 改名跟随，已有副本原位合并、绝不重复复制。
+ * fillMissing=true 时把「目标账号里从来没有」的会话也补全复制过去（全量对齐，占磁盘）。
+ * stopApp=true 时由服务端先结束 WorkBuddy（写库门禁要求），完成后再重新打开。
+ */
+app.post(
+  '/api/sessions/sync-all',
+  wrap(async (req, res) => {
+    const dryRun = req.body?.dryRun === true;
+    const fillMissing = req.body?.fillMissing === true;
+    const pruneOthers = req.body?.pruneOthers === true;
+    // 在哪个档位的界面点汇总，就保留哪个档位的当前账号（另一个档位的会话清掉）
+    const keepVariant = ['cn', 'ai'].includes(String(req.body?.variant)) ? String(req.body.variant) : null;
+    // 跨档位/汇总独有会话都由 syncAllAccounts 内部完成（pruneOthers 分支），这里不再重复做
+    if (dryRun) {
+      res.json(await syncAllAccounts({ stopApp: false, fillMissing, pruneOthers, dryRun: true, keepVariant }));
+      return;
+    }
+    // 默认全自动：关掉 WorkBuddy → 汇总 → 自动重新打开
+    if (req.body?.stopApp !== false) {
+      const { result, appStop, relaunch } = await withSessionOpLock(() =>
+        withAppRestart(() => syncAllAccounts({ stopApp: false, fillMissing, pruneOthers, dryRun: false, keepVariant }))
+      );
+      if (result?.ok) kickOffStorageClean('sync-all');
+      res.json({ ...result, appStop, relaunch });
+      return;
+    }
+    await assertAppClosed();
+    const result = await withSessionOpLock(() =>
+      syncAllAccounts({ stopApp: false, fillMissing, pruneOthers, dryRun: false, keepVariant })
+    );
+    if (result?.ok) kickOffStorageClean('sync-all');
+    res.json({ ...result, relaunch: null });
+  })
+);
+
+/**
+ * 搬家式转移：把当前账号的会话「过户」给目标账号——不复制、磁盘零增长。
+ * 目标账号已有同一对话时先合并内容（取全）再移走源正文；需要 WorkBuddy 已退出。
+ */
+app.post(
+  '/api/sessions/move',
+  wrap(async (req, res) => {
+    const targetAccountId = String(req.body?.targetAccountId || '').trim();
+    if (!targetAccountId) throw Object.assign(new Error('缺少目标账号'), { status: 400 });
+    const dryRun = req.body?.dryRun === true;
+    const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(String) : null;
+    const sourceVariant = ['cn', 'ai'].includes(String(req.body?.sourceVariant)) ? String(req.body.sourceVariant) : null;
+    if (dryRun) {
+      res.json(await moveSessionsToAccount({ targetAccountId, ids, dryRun: true, sourceVariant }));
+      return;
+    }
+    if (req.body?.stopApp !== false) {
+      const { result, appStop, relaunch } = await withSessionOpLock(() =>
+        withAppRestart(() => moveSessionsToAccount({ targetAccountId, ids, sourceVariant }))
+      );
+      res.json({ ...result, appStop, relaunch });
+      return;
+    }
+    await assertAppClosed();
+    const result = await withSessionOpLock(() => moveSessionsToAccount({ targetAccountId, ids, sourceVariant }));
+    res.json({ ...result, relaunch: null });
+  })
+);
+
+/**
+ * 一键去重：同账号内同一家族的多余副本，合并进最完整的一份后软删除多余者；
+ * 复制账本同步改写，此后同步永远原位合并、不再产生重复。dryRun=预演不写入。
+ * 写库需要 WorkBuddy 冻结：stopApp=true 时先冻结、完成后再结束（崩溃恢复自动
+ * 拉起新实例，登录态不变，等同于「重启了一次 WorkBuddy」）。
+ */
+app.post(
+  '/api/sessions/dedupe',
+  wrap(async (req, res) => {
+    const dryRun = req.body?.dryRun === true;
+    // 冻结方案已废除（冻结会把宿主进程一起冻住，用户系统卡死）。
+    // 现在只做门禁：WorkBuddy 在运行就拒绝并提示用户手动退出（托盘右键退出）。
+    const appStop = null;
+    if (dryRun) {
+      res.json(await dedupeSessions({ dryRun: true }));
+      return;
+    }
+    if (req.body?.stopApp !== false) {
+      const { result, appStop, relaunch } = await withSessionOpLock(() =>
+        withAppRestart(() => dedupeSessions({ dryRun: false }))
+      );
+      res.json({ ...result, appStop, relaunch });
+      return;
+    }
+    await assertAppClosed();
+    const result = await withSessionOpLock(() => dedupeSessions({ dryRun: false }));
+    res.json({ ...result, relaunch: null });
+  })
+);
+
 /* ---------------- 积分统计 ---------------- */
 
 /**
  * 只查积分余额（含积分包明细），供账号页卡片渲染。
  * 不扫用量明细，比 /api/credits 快得多；进程内缓存 2 分钟。
  */
+/**
+ * 每个账号「今日是否已签到 / 是否已旅行」——账号卡片上的两个状态小标。
+ * 只查询官方状态接口，不执行任何签到/旅行动作；结果缓存 5 分钟。
+ */
+let dailyStatusCache = { at: 0, data: null };
+app.get(
+  '/api/accounts/daily-status',
+  wrap(async (req, res) => {
+    const force = req.query?.refresh === '1';
+    if (!force && dailyStatusCache.data && Date.now() - dailyStatusCache.at < 5 * 60 * 1000) {
+      res.json(dailyStatusCache.data);
+      return;
+    }
+    const list = loadAccounts().filter((a) => a?.uid && hasPlainToken(a));
+    const entries = await Promise.all(
+      list.map(async (a) => {
+        const [c, tr] = await Promise.all([fetchCheckinStatus(a).catch(() => null), fetchTravelStatus(a).catch(() => null)]);
+        return [
+          String(a.id || a.uid),
+          {
+            checkedIn: !!c?.todayCheckedIn,
+            traveled: !!tr?.traveled,
+            travelState: tr?.state || null,
+            travelDailyLimit: !!tr?.dailyLimit,
+            travelReward: Number(tr?.reward || 0),
+            checkinError: c && c.ok === false ? String(c.error || '查询失败') : null,
+            travelError: tr && tr.ok === false ? String(tr.error || '查询失败') : null,
+          },
+        ];
+      })
+    );
+    const data = { accounts: Object.fromEntries(entries), at: Date.now() };
+    dailyStatusCache = { at: Date.now(), data };
+    res.json(data);
+  })
+);
+
+/**
+ * 每个账号「当前额度超限的模型」+ 恢复时间。
+ * 数据源：该账号最近会话日志里的官方 429 报错（含「将在 xxx 重置」）。
+ * 只返回「恢复时间还在未来」的记录；结果缓存 3 分钟。
+ */
+/**
+ * 每个账号「当前额度超限的模型」+ 恢复时间。
+ * 数据源：**当场探测** —— 用该账号的登录态对「它最近用过的模型」发一次 max_tokens=1 的请求，
+ * 上游回 429 且带重置时间才算超限（见 workbuddy/modelLimits.mjs）。结果缓存 10 分钟。
+ */
+app.get(
+  '/api/accounts/model-limits',
+  wrap(async (req, res) => {
+    // 每个账号当场发一次最小请求探测，结果缓存 10 分钟（见 modelLimits.mjs）
+    res.json(await probeAllModelLimits({ refresh: req.query?.refresh === '1' }));
+  })
+);
+
 app.get(
   '/api/accounts/credits',
   wrap(async (req, res) => {
@@ -1162,6 +1520,15 @@ app.get(/^\/(?!api\/).*/, (req, res) => {
 const onListening = () => {
   const url = `http://127.0.0.1:${PORT}`;
   console.log(`workbuddy控制台已启动: ${url}`);
+  // 后台预热统计缓存：冷扫描要遍历全部会话日志（几十秒），
+  // 启动后先算一遍，用户点「统计」时直接命中缓存，不再等。
+  setTimeout(() => {
+    getStats({ range: '30d', model: '', variants: ['cn', 'ai'] }).catch(() => {});
+  }, 2000);
+  // 预热超限探测（每个账号要发 1-2 个探测请求，3 秒左右），打开页面时直接有结果
+  setTimeout(() => {
+    probeAllModelLimits({ refresh: true }).catch(() => {});
+  }, 4000);
   if (process.env.NO_OPEN !== '1') {
     const cmd =
       process.platform === 'win32'

@@ -30,6 +30,7 @@ fs.mkdirSync(process.env.WB_SWITCH_HOME, { recursive: true });
 fs.mkdirSync(process.env.FREE_TOKEN_CONFIG_DIR, { recursive: true });
 
 const { makeupCandidates, runGrowthForAccount, dig, MAKEUP_MAX_PER_RUN } = await import('../server/workbuddy/growth.mjs');
+const { chatTaskBacklog, completeChatTasks, FREE_MODELS, MODEL_CANDIDATES, GROWTH_EVENT_CODE, MAX_CHATS_PER_TASK } = await import('../server/workbuddy/usageTasks.mjs');
 
 /**
  * 出站必须走 fetch 桩：先清掉代理环境变量，再传 systemProxy:false 跳过 Windows 系统代理探测。
@@ -343,6 +344,152 @@ section('7. 旅行：名额用完不派出、旅行中报 ETA、查询 5xx 计�
   });
   const r3 = await run(account);
   check('查询 5xx 计硬失败', r3.hardFailures >= 1 && r3.ok === false, r3.report);
+}
+
+// ---------------------------------------------------------------- 8. 对话任务补全
+section('8. 对话任务补全：免费模型优先、growthEvent 上报、补完领奖');
+{
+  // chatTaskBacklog 纯函数口径
+  const backlog = chatTaskBacklog([
+    { task_code: 'chat_5', title: '和 AI 聊天 5 次', accept_status: 'in_progress', progress: { current: 2, target: 5 } },
+    { task_code: 'chat_5', title: '已领', accept_status: 'claimed', progress: { current: 5, target: 5 } },
+    { task_code: 'chat_5', title: '没接单', accept_status: 'not_accepted', progress: null },
+    { task_code: 'chat_5', title: '已达标', accept_status: 'in_progress', progress: { current: 5, target: 5 } },
+    { task_code: 'chat_5', title: '锁定', accept_status: 'in_progress', locked: true, progress: { current: 0, target: 5 } },
+    { task_code: 'create_canvas', title: '画布', accept_status: 'in_progress', progress: { current: 0, target: 1 } },
+    { task_code: 'chat_20', title: '超额封顶', accept_status: 'in_progress', progress: { current: 0, target: 20 } },
+  ]);
+  check('只挑未完成的 chat_* 任务', backlog.length === 2 && backlog[0].code === 'chat_5' && backlog[1].code === 'chat_20', backlog);
+  check('need = target - current', backlog[0].need === 3, backlog[0]);
+  check('单任务上限 MAX_CHATS_PER_TASK', backlog[1].need === MAX_CHATS_PER_TASK, backlog[1]);
+  check('非数组输入返回空', chatTaskBacklog(null).length === 0);
+
+  // 免费模型直发 → 进度满 → 补领奖
+  const progress = { current: 2, target: 5 };
+  let claimedChat5 = false;
+  const chats = [];
+  stubFetch({
+    ...quietRoutes(),
+    'GET /v2/activity/growth/tasks': () => ({
+      body: {
+        tasks: [
+          {
+            task_code: 'chat_5',
+            title: '和 AI 聊天 5 次',
+            accept_status: claimedChat5 ? 'claimed' : progress.current >= progress.target ? 'completed' : 'in_progress',
+            progress: { ...progress },
+            reward_credit: 100,
+            reward_energy: 5,
+          },
+        ],
+      },
+    }),
+    'POST /v2/chat/completions': ({ body }) => {
+      chats.push(body);
+      progress.current += 1;
+      return { status: 200, body: { id: 'chatcmpl-x' } };
+    },
+    'POST /v2/activity/growth/tasks/chat_5/claim': () => {
+      claimedChat5 = true;
+      return { body: { credit: 100, energy: 5 } };
+    },
+  });
+  const r1 = await run(account);
+  check('缺口 3 次 → 恰好发 3 次对话', chats.length === 3, chats.length);
+  check('免费模型 hy3 优先', chats.every((b) => b?.model === FREE_MODELS[0]), chats.map((b) => b?.model));
+  check('对话必须流式（非流式官方 400）', chats.every((b) => b?.stream === true), chats.map((b) => b?.stream));
+  const events = chats.map((b) => {
+    try {
+      return JSON.parse(b?.extra_vars?.growthEvent || '[]')[0];
+    } catch {
+      return null;
+    }
+  });
+  check('对话带 chat_request_send 上报（否则不计进度）',
+    events.every((e) => e?.eventCode === GROWTH_EVENT_CODE && e?.id && e?.extra?.requestModelId === FREE_MODELS[0]),
+    events[0]);
+  check('每次对话 id 唯一', new Set(events.map((e) => e.id)).size === events.length);
+  check('补满后复查并领奖', claimedChat5, r1.report);
+  check('报告点名免费模型', (r1.parts || []).join('\n').includes(`免费模型 ${FREE_MODELS[0]}`), r1.parts);
+  check('补全进账计入积分', r1.creditsGained === 100, r1.creditsGained);
+  check('无硬失败', r1.hardFailures === 0, r1.report);
+}
+
+// ---------------------------------------------------------------- 9. 免费模型全灭 → 低倍率兜底
+section('9. 模型回退：免费模型 5xx/429 换下一个，全灭才用低倍率付费模型');
+{
+  const usedModels = [];
+  stubFetch({
+    ...quietRoutes(),
+    'GET /v2/activity/growth/tasks': {
+      body: { tasks: [{ task_code: 'chat_5', title: '和 AI 聊天 5 次', accept_status: 'in_progress', progress: { current: 4, target: 5 } }] },
+    },
+    'POST /v2/chat/completions': ({ body }) => {
+      usedModels.push(body?.model);
+      // 前两个免费模型挂掉，第三个免费模型可用 → 不应碰付费模型
+      return usedModels.length <= 2
+        ? { status: usedModels.length === 1 ? 500 : 429, body: { msg: 'upstream error' } }
+        : { status: 200, body: { id: 'x' } };
+    },
+  });
+  const r = await run(account);
+  const joined = (r.parts || []).join('\n');
+  check('免费模型 500/429 后换下一个免费模型', usedModels.join(',') === `${FREE_MODELS[0]},${FREE_MODELS[1]},${FREE_MODELS[2]}`, usedModels);
+  check('免费模型有可用时不碰付费模型', !usedModels.some((m) => !FREE_MODELS.includes(m)), usedModels);
+  check('5xx 计硬失败、429 只换模型不中止', r.hardFailures === 1 && r.unauthorized !== true, r.report);
+  check('模型不可用如实汇报', joined.includes(`模型 ${FREE_MODELS[0]} 不可用`) && joined.includes(`模型 ${FREE_MODELS[1]} 不可用`), joined);
+  check('补全成功写入报告', joined.includes(`免费模型 ${FREE_MODELS[2]}`), joined);
+
+  // 所有免费模型都挂 → 低倍率付费模型兜底，报告必须点名
+  const paid = MODEL_CANDIDATES.find((m) => !FREE_MODELS.includes(m));
+  const used2 = [];
+  stubFetch({
+    ...quietRoutes(),
+    'GET /v2/activity/growth/tasks': {
+      body: { tasks: [{ task_code: 'chat_5', title: '和 AI 聊天 5 次', accept_status: 'in_progress', progress: { current: 0, target: 2 } }] },
+    },
+    'POST /v2/chat/completions': ({ body }) => {
+      used2.push(body?.model);
+      return FREE_MODELS.includes(body?.model)
+        ? { status: 503, body: { msg: 'unavailable' } }
+        : { status: 200, body: { id: 'x' } };
+    },
+  });
+  const r2 = await run(account);
+  check('免费全灭退到低倍率付费模型', used2[used2.length - 1] === paid, used2);
+  check('付费模型点名提醒（积分消耗）', (r2.parts || []).join('\n').includes(`付费模型 ${paid}`), r2.parts);
+}
+
+// ---------------------------------------------------------------- 10. 对话补全的失控保险
+section('10. 失控保险：目标虚高时单任务封顶；模型全灭计失败不抛错');
+{
+  let n = 0;
+  stubFetch({
+    ...quietRoutes(),
+    'GET /v2/activity/growth/tasks': {
+      body: { tasks: [{ task_code: 'chat_99', title: '夸张目标', accept_status: 'in_progress', progress: { current: 0, target: 99 } }] },
+    },
+    'POST /v2/chat/completions': () => {
+      n += 1;
+      return { status: 200, body: { id: 'x' } };
+    },
+  });
+  const r = await run(account);
+  check('进度永远不满也不超过单任务上限', n === MAX_CHATS_PER_TASK, n);
+  check('不把进度未满当失败刷屏', r.failures === 0, r.report);
+
+  // 所有候选模型都不可用 → 计失败、报告说明，绝不抛异常污染整轮
+  stubFetch({
+    ...quietRoutes(),
+    'GET /v2/activity/growth/tasks': {
+      body: { tasks: [{ task_code: 'chat_5', title: '和 AI 聊天 5 次', accept_status: 'in_progress', progress: { current: 0, target: 1 } }] },
+    },
+    'POST /v2/chat/completions': { status: 404, body: { msg: 'not found' } },
+  });
+  const r2 = await run(account);
+  check('全部候选不可用计失败', r2.failures >= 1 && r2.ok === true, r2.report);
+  check('报告说明还差几次', (r2.parts || []).join('\n').includes('还差 1 次'), r2.parts);
+  check('4xx 不算硬失败', r2.hardFailures === 0, r2.report);
 }
 
 // ---------------------------------------------------------------- 汇总

@@ -110,7 +110,7 @@ node scripts/test-session-copy.mjs    # 会话复制 / 门禁 / 回滚 / 账本 
 node scripts/test-roundtrip-flow.mjs  # 往返全流程：不预置账本、按真实操作链跑端到端（49 项断言）
 node scripts/test-stop-process.mjs    # 自动退出 WorkBuddy 的进程链路（23 项断言，仅 Windows）
 node scripts/test-token-refresh.mjs   # 凭据刷新判据与版本自检（46 项断言，官方接口用桩替换）
-node scripts/test-growth.mjs          # 成长中心六模块与补登候选（49 项断言，官方接口用桩替换）
+node scripts/test-growth.mjs          # 成长中心模块、补登候选与对话任务补全（74 项断言，官方接口用桩替换）
 ```
 
 `test-session-copy.mjs` 里有一部分用例是**手工预置账本**再验证合并的——它只能证明「账本里已经有那一条时能合并」。`test-roundtrip-flow.mjs` 补上这个缺口：**从零开始**跑「登录 A → 复制给 B → 切登录到 B → 在 B 继续聊 + 改名 → 切回 A → 复制回 A」（含跨账号接力 A→B→C→A、一个会话分发到两个账号、两边都继续聊），每一步都断言**目标账号里没有多出无法解释的会话**。跨账号接力的重复会话就是这套用例抓出来的。
@@ -125,6 +125,7 @@ node scripts/test-growth.mjs          # 成长中心六模块与补登候选（4
 | --- | --- | --- | --- |
 | 1 | **Buddy 旅行** | `buddy/travel/status` → `claim` → `config` → `depart` | 到站先领礼物再派出；服务端已说"今日名额用完"就不再派出，省掉两个必然失败的请求 |
 | 2 | **任务** | `tasks` → `tasks/accept` → `tasks/{code}/claim` | 接单 body 是**复数** `task_codes` 数组（单数 `task_code` 官方一律 400）；只有 `completed` 才发奖 |
+| 2.5 | **对话任务补全** | `/v2/chat/completions`（带 `extra_vars.growthEvent` 上报） | `chat_*` 类任务（如「和 AI 聊天 5 次」）只有真实发起模型对话才计进度（`server/workbuddy/usageTasks.mjs`）。模型选择：**免费模型优先**（hy3 / step-5-preview / wb-lite，实测 0 积分/次），全部不可用才退到**低倍率付费模型**（按实测倍率升序）并在报告里点名提醒；单任务每轮最多补 10 次 |
 | 3 | **断登补签** | `streak` + `heatmap` → `makeup-cards/use` | 只补**当月、今天之前、`score==0`、未补登过**的日期；**每轮最多用 1 张卡** |
 | 4 | **连登兑换** | `redeem/summary` → `redeem` | 入门 7 天 / 进阶 14 天 / 巅峰 28 天；`tier` 只认档位标识 `7d`/`14d`/`28d` |
 | 5 | **开盲盒** | `lottery/chances` → `lottery/draw` | 写路径不可逆，**每轮只开一次**；中实物奖会提醒去填收件信息 |

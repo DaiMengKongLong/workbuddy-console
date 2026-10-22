@@ -33,6 +33,7 @@ import {
   useToast,
 } from '../components/ui';
 import { del, get, patch, post, TIMEOUT } from '../lib/api';
+import { BRAND_MARKS } from '../lib/modelBrands';
 import { fmtDateTime } from '../lib/format';
 import type {
   AccountBalancesResponse,
@@ -130,12 +131,10 @@ function Avatar({ name, seed, size = 'md' }: { name: string; seed: string; size?
 }
 
 /**
- * 卡片上展示的积分包：**全部包**（含 0 剩余的），按官方客户端的类别顺序排列，
- * 同类别按到期时间升序。
+ * 卡片上展示的积分包：**只展示还有剩余（>0）的包**，按类别顺序、同类别按到期时间升序。
  *
- * 与官方客户端对齐：客户端会把已用完的「套餐基础积分」（如 0/500）也列出来，
- * 之前在这里过滤掉 0 剩余的包，导致卡片上"看不到套餐基础积分"。
- * 排序遵循客户端的三分类顺序：套餐基础积分 → 平台奖励积分 → 购买积分。
+ * 用户明确要求：剩余为 0 的包（如「0 套餐基础积分 10/31 23:59」）不显示——
+ * 它们既不能用，还会干扰「谁先过期」的判断。
  */
 const PACKAGE_CATEGORY_ORDER: Record<string, number> = {
   套餐基础积分: 0,
@@ -145,7 +144,7 @@ const PACKAGE_CATEGORY_ORDER: Record<string, number> = {
 
 function usablePackages(balance: CreditBalance | null | undefined): CreditPackage[] {
   return (balance?.packages || [])
-    .slice()
+    .filter((p) => (p.remaining ?? 0) > 0)
     .sort((a, b) => {
       const ca = PACKAGE_CATEGORY_ORDER[a.name] ?? 3;
       const cb = PACKAGE_CATEGORY_ORDER[b.name] ?? 3;
@@ -154,6 +153,151 @@ function usablePackages(balance: CreditBalance | null | undefined): CreditPackag
       const eb = b.expireAt ?? Number.POSITIVE_INFINITY;
       return ea === eb ? 0 : ea < eb ? -1 : 1;
     });
+}
+
+/** 超限模型的官方品牌图形（Simple Icons 24×24 路径；智谱用官方 favicon） */
+function ModelIcon({ model, className, mono = false }: { model: string; className?: string; mono?: boolean }) {
+  const m = String(model || "").toLowerCase();
+  if (m.includes("glm") || m.includes("zhipu") || m.includes("chatglm")) {
+    return <img src="/brands/glm.ico" alt="" className={className + " object-contain"} draggable={false} />;
+  }
+  const mark =
+    m.includes("deepseek")
+      ? BRAND_MARKS.deepseek
+      : m.includes("kimi") || m.includes("moonshot")
+        ? BRAND_MARKS.kimi
+        : m.includes("minimax")
+          ? BRAND_MARKS.minimax
+          : m.includes("mimo") || m.includes("xiaomi")
+            ? BRAND_MARKS.xiaomi
+            : m.includes("qwen") || m.includes("tongyi")
+              ? BRAND_MARKS.qwen
+              : null;
+  if (mark) {
+    return (
+      <svg viewBox="0 0 24 24" className={className} aria-hidden="true">
+        <path d={mark.path} fill={mono ? "currentColor" : mark.color} />
+      </svg>
+    );
+  }
+  // 其它：首字母
+  const ch = (String(model || "?").replace(/[^a-zA-Z0-9]/g, "")[0] || "?").toUpperCase();
+  return (
+    <svg viewBox="0 0 20 20" className={className}>
+      <text x="10" y="14" textAnchor="middle" fontSize="11" fontWeight="700" fill="currentColor">
+        {ch}
+      </text>
+    </svg>
+  );
+}
+
+/**
+ * 模型额度超限小标：某个模型的用量超出限额时显示该模型图标（红色），
+ * 鼠标悬停显示「何时恢复」。数据来自会话日志里的官方 429 报错。
+ */
+function ModelLimitBadges({ limits }: { limits?: { model: string; resetAt: number }[] }) {
+  if (!limits || !limits.length) return null;
+  const fmt = (ts: number) => {
+    const d = new Date(ts);
+    const p = (n: number) => String(n).padStart(2, '0');
+    return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  };
+  return (
+    <span className="inline-flex items-center gap-1.5">
+      {limits.slice(0, 4).map((x) => (
+        <span
+          key={x.model}
+          className="inline-flex h-6 items-center justify-center rounded-md bg-rose-50 px-1"
+          title={`${x.model} 用量已超限额，将于 ${fmt(x.resetAt)} 恢复`}
+        >
+          <ModelIcon model={x.model} mono className="h-3.5 w-3.5 text-rose-500" />
+        </span>
+      ))}
+    </span>
+  );
+}
+
+/**
+ * 今日状态小标：日历勾（签到）+ 小飞机（旅行）。
+ * 已完成 → 绿色；未完成 → 灰色；查询失败 → 灰色并给出提示。
+ */
+function DailyBadges({
+  daily,
+}: {
+  daily?: {
+    checkedIn?: boolean;
+    traveled?: boolean;
+    travelState?: string | null;
+    travelDailyLimit?: boolean;
+    travelReward?: number;
+    checkinError?: string | null;
+    travelError?: string | null;
+  };
+}) {
+  if (!daily) return null;
+  const done = 'text-emerald-500';
+  const idle = 'text-zinc-300';
+  const wrap = (active: boolean) =>
+    `inline-flex h-6 w-6 items-center justify-center rounded-full ${active ? 'bg-emerald-50' : 'bg-zinc-100'}`;
+
+  // 旅行三种状态：旅行中（含已到达）/ 今日名额已用完 / 未旅行
+  const state = daily.travelState || (daily.traveled ? 'traveling' : 'idle');
+  const traveling = state === 'traveling' || state === 'arrived' || !!daily.traveled;
+  const limitReached = !traveling && !!daily.travelDailyLimit;
+  const reward = Number(daily.travelReward || 0);
+
+  // 三色：绿=正在旅行，黄=今日名额用完，灰=未旅行
+  const travelTone = traveling
+    ? { chipBg: '#E7F6EE', iconColor: '#2FBF8F' }
+    : limitReached
+      ? { chipBg: '#FEF9C3', iconColor: '#EAB308' }
+      : { chipBg: '#F1F2F4', iconColor: '#A1A6AE' };
+
+  const travelTitle = daily.travelError
+    ? `旅行状态查询失败：${daily.travelError}`
+    : traveling
+      ? state === 'arrived'
+        ? `旅行已到达，待领取${reward > 0 ? ` +${reward}` : ''} 积分`
+        : `旅行中${reward > 0 ? `：已获得 ${reward} 积分` : '（Buddy 已出发）'}`
+      : limitReached
+        ? '今日旅行名额已用完'
+        : '今日未旅行';
+
+  return (
+    <span className="inline-flex items-center gap-1.5">
+      <span
+        className={wrap(!!daily.checkedIn)}
+        title={daily.checkinError ? `签到状态查询失败：${daily.checkinError}` : daily.checkedIn ? '今日已签到' : '今日未签到'}
+      >
+        <svg viewBox="0 0 20 20" className={`h-3.5 w-3.5 ${daily.checkedIn ? done : idle}`} fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+          <rect x="3" y="4.5" width="14" height="12.5" rx="2" />
+          <path d="M6.5 2.6v3.4M13.5 2.6v3.4M3 8.6h14" />
+          <path d="M11.6 13.2l1.5 1.5 2.6-2.8" />
+        </svg>
+      </span>
+
+      {/* 旅行标：直接复刻 WorkBuddy Switch 的做法 —— lucide PlaneTakeoff（自带底线）放进浅色圆角徽标 */}
+      <span
+        className="inline-flex h-6 items-center justify-center rounded-md px-1"
+        style={{ background: travelTone.chipBg }}
+        title={travelTitle}
+      >
+        <svg
+          viewBox="0 0 24 24"
+          width="14"
+          height="14"
+          fill="none"
+          stroke={travelTone.iconColor}
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        >
+          <path d="M2 22h20" />
+          <path d="M6.36 17.4 4 17l-2-4 1.1-.55a2 2 0 0 1 1.8 0l.17.1a2 2 0 0 0 1.8 0L8 12 5 6l.9-.45a2 2 0 0 1 2.09.2l4.02 3a2 2 0 0 0 2.1.2l4.19-2.06a2.41 2.41 0 0 1 1.73-.17L21 7a1.4 1.4 0 0 1 .87 1.99l-.38.76c-.23.46-.6.84-1.07 1.08L7.58 17.2a2 2 0 0 1-1.22.18Z" />
+        </svg>
+      </span>
+    </span>
+  );
 }
 
 /**
@@ -223,6 +367,8 @@ function AccountCard({
   isCurrent,
   busy,
   balance,
+  daily,
+  modelLimits,
   balanceLoading,
   authInvalid,
   onSwitch,
@@ -236,6 +382,8 @@ function AccountCard({
   isCurrent: boolean;
   busy: boolean;
   balance: CreditBalance | null;
+  daily?: { checkedIn?: boolean; traveled?: boolean; checkinError?: string | null; travelError?: string | null };
+  modelLimits?: { model: string; resetAt: number }[];
   balanceLoading: boolean;
   /** 官方接口已明确拒绝该账号的凭据（401/403）——本地未过期也不算数 */
   authInvalid: boolean;
@@ -306,24 +454,27 @@ function AccountCard({
             <p className="mt-0.5 truncate font-mono text-xs leading-5 text-zinc-400" title={account.uid}>
               UID {account.uid}
             </p>
-            {/* 备注单独显示一行：即使展示名被「手机号/邮箱」占用，改完备注也能立刻看到。
-                没有备注时渲染同构的隐形占位行，保证每张卡片的头部等高、信息行对齐 */}
-            {account.note ? (
-              <p className="mt-1 truncate text-xs leading-5 text-zinc-500" title={`备注：${account.note}`}>
-                <IconEdit className="mr-1 inline h-3 w-3 -mt-0.5 text-zinc-300" />
-                备注：{account.note}
-              </p>
-            ) : (
-              <p className="mt-1 truncate text-xs leading-5" aria-hidden="true">
-                <IconEdit className="mr-1 inline h-3 w-3 -mt-0.5" />
-                <span className="invisible">备注：占位</span>
-              </p>
-            )}
+            {/* 备注行：直接点击即可修改（原「备注」按钮已并入这里），无备注时显示浅色提示 */}
+            <button
+              type="button"
+              onClick={onRename}
+              title={account.note ? `备注：${account.note}（点击修改）` : '点击添加备注'}
+              className="group mt-1 flex max-w-full items-center gap-1 truncate text-left text-xs leading-5 text-zinc-500 transition-colors hover:text-indigo-600"
+            >
+              <IconEdit className="h-3 w-3 shrink-0 text-zinc-300 transition-colors group-hover:text-indigo-400" />
+              {account.note ? (
+                <span className="truncate">备注：{account.note}</span>
+              ) : (
+                <span className="truncate text-zinc-400 group-hover:text-indigo-500">添加备注</span>
+              )}
+            </button>
             <div className="mt-1.5 flex min-w-0 flex-wrap items-center gap-1.5">
               <Badge color="gray">{account.variantLabel}</Badge>
               <span title={credTitle}>
                 <Badge color={credState.color}>{credState.text}</Badge>
               </span>
+              <DailyBadges daily={daily} />
+              <ModelLimitBadges limits={modelLimits} />
             </div>
           </div>
         </div>
@@ -339,7 +490,12 @@ function AccountCard({
               {balance ? fmtCredits(balance.remaining) : <span className="text-zinc-300">—</span>}
             </strong>
           </span>
-          <span className="text-xs text-zinc-400">{balance ? `${pkgTotal} 个积分包` : '—'}</span>
+          <span
+            className="text-xs text-zinc-400"
+            title="按周期汇总后的积分类别（套餐 / 平台奖励 / 购买）；点「查看全部」看逐笔发放记录"
+          >
+            {balance ? `${pkgTotal} 个积分池` : '—'}
+          </span>
           <div
             className="ml-auto flex items-center gap-1.5 text-xs text-zinc-400"
             title={
@@ -407,10 +563,6 @@ function AccountCard({
           {isCurrent ? <IconCheck className="w-3.5 h-3.5" /> : <IconSwitch className="w-3.5 h-3.5" />}
           {isCurrent ? '使用中' : '切换账号'}
         </Button>
-        <Button size="sm" className="h-7 rounded-full px-2.5 pr-3.5 text-xs" onClick={onRename}>
-          <IconEdit className="w-3.5 h-3.5" />
-          备注
-        </Button>
         <Button
           size="sm"
           className="h-7 rounded-full px-2.5 pr-3.5 text-xs"
@@ -418,12 +570,12 @@ function AccountCard({
           onClick={onSyncSessions}
           title={
             isCurrent
-              ? '这就是当前正在使用的账号，源与目标相同，无需复制会话'
-              : '把当前登录账号的会话复制给这个账号（新会话 id，源账号数据不受影响）'
+              ? '这就是当前正在使用的账号，源与目标相同，无需转移会话'
+              : '把当前登录账号的会话转到这个账号：源账号不再保留，磁盘只存一份'
           }
         >
           <IconCopy className="w-3.5 h-3.5" />
-          同步会话
+          转到此账号
         </Button>
         <Button
           size="sm"
@@ -981,8 +1133,8 @@ function PackagesDialog({ account, balance, onClose }: { account: AccountInfo | 
           <div className="mb-4 grid grid-cols-2 gap-1 rounded-xl bg-zinc-100 p-1">
             {(
               [
-                { key: 'active' as const, label: `有效期内 ${active.length}` },
-                { key: 'expired' as const, label: `已过期 ${expired.length}` },
+                { key: 'active' as const, label: `有效期内 ${active.length} 笔` },
+                { key: 'expired' as const, label: `已过期 ${expired.length} 笔` },
               ]
             ).map((t) => (
               <button
@@ -1205,12 +1357,14 @@ function SessionCopyDialog({
   onClose: () => void;
   onDone: () => void;
 }) {
+  // 之前漏了这行：confirm 落到全局 window.confirm，弹窗显示 [object Object]
+  const confirm = useConfirm();
   const toast = useToast();
   const [data, setData] = useState<SessionListResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState('');
   const [query, setQuery] = useState('');
-  const [hideCopied, setHideCopied] = useState(true);
+  const [hideCopied, setHideCopied] = useState(false);
   /** 默认勾选：由服务端直接结束 WorkBuddy 进程，用户不必自己动手 */
   const [stopApp, setStopApp] = useState(true);
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -1239,10 +1393,21 @@ function SessionCopyDialog({
     setSelected(new Set());
     setReport(null);
     setQuery('');
-    setHideCopied(true);
+    setHideCopied(false);
     setStopApp(true);
     void load();
   }, [open, targetId, load]);
+
+  // 列表就绪后自动预勾选「之前同步过」的会话：用户点开弹窗直接点「开始复制」，
+  // 就能把所有已同步会话的内容与改名对齐到最新（不会产生新副本、不会重复）。
+  useEffect(() => {
+    if (!open || loading || !data) return;
+    const pre = new Set(
+      data.sessions.filter((s) => s.copied && s.hasBody).map((s) => s.id)
+    );
+    setSelected(pre);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, loading, data]);
 
   const sessions = data?.sessions || [];
   const copiedCount = useMemo(() => sessions.filter((s) => s.copied).length, [sessions]);
@@ -1266,6 +1431,12 @@ function SessionCopyDialog({
     () => sessions.reduce((sum, s) => (selected.has(s.id) ? sum + s.bytes : sum), 0),
     [sessions, selected]
   );
+  /** 预勾选说明：打开弹窗时自动勾上了多少个「之前同步过」的会话 */
+  const preCheckedNote = useMemo(() => {
+    if (loading || !data) return '';
+    const n = data.sessions.filter((s) => s.copied && s.hasBody).length;
+    return n ? `（已自动勾选之前同步过的 ${n} 个，点「开始复制」即全部对齐到最新）` : '';
+  }, [loading, data]);
 
   const toggle = (id: string, on: boolean) =>
     setSelected((prev) => {
@@ -1288,18 +1459,22 @@ function SessionCopyDialog({
             id: target.id,
             copySessionIds: ids,
             stopApp,
+            sourceVariant: (window as any).__wbVariant || undefined,
           },
           { timeoutMs: TIMEOUT.switch }
         );
         const rep = r?.sessionCopy || null;
         const failed = rep?.errors?.length || 0;
+        const movedCount = rep?.moved?.length || 0;
+        const mergedCount = rep?.merged?.length || 0;
         const reopenFailed = r?.relaunch ? r.relaunch.launched === false : false;
         const tail = relaunchTail(r?.relaunch, !!r?.appStop?.wasRunning);
         toast(
           failed || reopenFailed ? 'err' : 'ok',
-          `已复制 ${rep?.copied.length || 0} 个会话并切换到「${target.name}」` +
-            (failed ? `，其中 ${failed} 个复制失败（见下方明细）` : '') +
-            `，${tail}`
+          `已切换到「${target.name}」，${movedCount + mergedCount} 个会话已转移到该账号` +
+            (mergedCount ? `（其中 ${mergedCount} 个与原有副本合并为全量内容）` : '') +
+            (failed ? `，${failed} 个失败（见下方明细）` : '') +
+            `；${tail}`
         );
         onDone();
         // 失败明细留在弹窗里给用户看；全部成功就直接关掉——登录态已切换，
@@ -1308,26 +1483,61 @@ function SessionCopyDialog({
         else onClose();
         return;
       }
-      const rep = await post<SessionCopyReport>(
-        '/api/sessions/copy',
+      // 先预演（只读），让用户看清要转移多少个再确认——绝不一点就动数据
+      const preview = await post<any>(
+        '/api/sessions/move',
+        { targetAccountId: target.id, ids, dryRun: true, sourceVariant: (window as any).__wbVariant || undefined },
+        { timeoutMs: TIMEOUT.switch }
+      );
+      const pTotal = (preview?.moved?.length || 0) + (preview?.merged?.length || 0);
+      if (!pTotal) {
+        toast('ok', '没有需要转移的会话');
+        setBusy(false);
+        return;
+      }
+      const sure = await confirm({
+        title: '确认转移会话',
+        message: (
+          <>
+            <div>
+              将把 <b>{pTotal}</b> 个会话从当前账号<b>转移</b>到「<b>{target.name}</b>」
+              {preview?.merged?.length ? <>（其中 {preview.merged.length} 个与目标已有的同一会话合并为全量内容）</> : null}。
+            </div>
+            <ul className="mt-2 list-disc pl-5 text-sm leading-relaxed">
+              <li>转移后这些会话从当前账号消失，目标账号拥有全部（磁盘只保留一份）</li>
+              <li>执行前自动备份会话库；合并时源正文移入备份目录，可随时找回</li>
+              <li>确认后<b>自动关闭 WorkBuddy</b>，完成后<b>自动重新打开</b>（无需手动操作）</li>
+            </ul>
+          </>
+        ),
+      });
+      if (!sure) {
+        setBusy(false);
+        return;
+      }
+      const rep = await post<any>(
+        '/api/sessions/move',
         {
-          accountId: target.id,
+          targetAccountId: target.id,
           ids,
-          stopApp,
+          sourceVariant: (window as any).__wbVariant || undefined,
         },
         { timeoutMs: TIMEOUT.switch }
       );
-      setReport(rep);
-      const reopenFailed = rep.relaunch ? rep.relaunch.launched === false : false;
-      const procNote = rep.appStop?.wasRunning
-        ? `；${relaunchTail(rep.relaunch, true)}`
-        : '';
-      if (rep.ok && !reopenFailed) toast('ok', `已复制 ${rep.copied.length} 个会话到「${target.name}」${procNote}`);
-      else
+      const movedCount = rep?.moved?.length || 0;
+      const mergedCount = rep?.merged?.length || 0;
+      const failed = rep?.errors?.length || 0;
+      if (!failed) {
         toast(
-          'err',
-          `复制完成：成功 ${rep.copied.length} 个，失败 ${rep.errors.length} 个（详见列表下方）${procNote}`
+          'ok',
+          `已把 ${movedCount + mergedCount} 个会话转移到「${target.name}」` +
+            (mergedCount ? `（其中 ${mergedCount} 个与原有副本合并为全量内容）` : '') +
+            '，磁盘上只保留一份'
         );
+        onClose();
+      } else {
+        toast('err', `转移完成：成功 ${movedCount + mergedCount} 个，失败 ${failed} 个`);
+      }
       setSelected(new Set());
       await load();
       onDone();
@@ -1346,17 +1556,18 @@ function SessionCopyDialog({
       open={open}
       onClose={busy ? () => {} : onClose}
       width="max-w-3xl"
-      title={mode === 'switch' ? `复制会话并切换到「${target?.name}」` : `把会话复制给「${target?.name}」`}
+      title={mode === 'switch' ? `转移会话并切换到「${target?.name}」` : `把会话转到「${target?.name}」`}
       subtitle={
         data
           ? `来源：当前登录账号 ${data.sourceUid.slice(0, 8)}… → 目标：${target?.name}（${target?.variantLabel}）`
-          : '复制会给每个会话生成新的会话 id，源账号的数据完全不受影响'
+          : '转移后源账号不再保留这些会话，磁盘上只存一份'
       }
       footer={
         <>
           <span className="mr-auto text-xs text-zinc-500">
             已选 <b className="tabular-nums text-zinc-800">{selected.size}</b> 个 · 约{' '}
             <b className="tabular-nums text-zinc-800">{fmtBytes(selectedBytes)}</b>
+            {preCheckedNote}
           </span>
           <Button onClick={onClose} disabled={busy}>
             取消
@@ -1373,7 +1584,7 @@ function SessionCopyDialog({
             }
           >
             <IconCopy className="w-3.5 h-3.5" />
-            {mode === 'switch' ? '复制并切换' : '开始复制'}
+            {mode === 'switch' ? '转移并切换' : '开始转移'}
           </Button>
         </>
       }
@@ -1580,6 +1791,10 @@ export default function AccountsPage() {
   const [scanOpen, setScanOpen] = useState(false);
   /** 档位筛选：与 workbuddy-switch 一致，两套登录态分开管理 */
   const [variant, setVariant] = useState<'cn' | 'ai'>('cn');
+  // 记录当前档位，供同步会话/切换账号弹窗在请求里带上（跨档位搬运靠它判断源）
+  useEffect(() => {
+    (window as any).__wbVariant = variant;
+  }, [variant]);
   /** WorkBuddy 进程是否在运行：运行时切换会被它改写回去，需要提前提醒 */
   const [wbRunning, setWbRunning] = useState(false);
   /** 「退出 WorkBuddy」按钮的进行态 */
@@ -1587,6 +1802,146 @@ export default function AccountsPage() {
   /** 会话复制弹窗的目标账号；`sessionMode` 决定按钮是「开始复制」还是「复制并切换」 */
   const [sessionTarget, setSessionTarget] = useState<AccountInfo | null>(null);
   const [sessionMode, setSessionMode] = useState<'copy' | 'switch'>('copy');
+  /** 一键同步所有账号的进行态 */
+  const [syncAllBusy, setSyncAllBusy] = useState(false);
+  const [summaryBusy, setSummaryBusy] = useState(false);
+  /** 一键去重的进行态 */
+  const [dedupeBusy, setDedupeBusy] = useState(false);
+
+  /** 一键去重：同账号内重复会话合并成一份（先预演再确认执行） */
+  const dedupeNow = async () => {
+    setDedupeBusy(true);
+    let plan: any = null;
+    try {
+      plan = await post<any>('/api/sessions/dedupe', { dryRun: true }, { timeoutMs: 600000 });
+    } catch (e: any) {
+      setDedupeBusy(false);
+      toast('err', `预演失败：${e?.message || e}`);
+      return;
+    }
+    setDedupeBusy(false);
+    const nGroups = plan?.groups?.length || 0;
+    const nRemoved = plan?.removed?.length || 0;
+    const nRenamed = plan?.renamed?.length || 0;
+    const lines = plan?.appendedLines || 0;
+    if (!nGroups) {
+      toast('ok', '没有发现重复会话，无需清理');
+      return;
+    }
+    const ok = await confirm({
+      title: '确认执行一键去重',
+      message: (
+        <>
+          <div>预演结果（<b>还没有改动任何数据</b>）：</div>
+          <ul className="mt-2 list-disc pl-5 text-sm leading-relaxed">
+            <li>{nGroups} 组同一对话的重复副本：<b>内容少的会合并进内容多的那一份</b>（缺的消息补进来，按时间排序），再删除 {nRemoved} 个多余副本</li>
+            <li>{nRenamed} 个会话名将统一为最新的手改名字</li>
+            <li className="text-zinc-500">删除的只是「重复副本」：执行前自动备份会话库，正文文件也仍保留在磁盘上，可恢复</li>
+          </ul>
+          <div className="mt-2 text-xs text-zinc-500">确认后自动关闭 WorkBuddy（先退出再写数据，不会丢内容），完成后自动重新打开，全程无需你手动操作。</div>
+        </>
+      ),
+    });
+    if (!ok) return;
+    setDedupeBusy(true);
+    try {
+      const r = await post<any>('/api/sessions/dedupe', { stopApp: true }, { timeoutMs: 900000 });
+      const parts = [`清理 ${r?.groups?.length || 0} 组`, `删除重复副本 ${r?.removed?.length || 0} 个`, `补入 ${r?.appendedLines || 0} 行`];
+      if (r?.errors?.length) parts.push(`失败 ${r.errors.length} 个`);
+      if (r?.appStop?.wasRunning) parts.push(r?.relaunch?.launched ? 'WorkBuddy 已重新打开' : 'WorkBuddy 未自动打开，请手动启动');
+      toast(r?.ok ? 'ok' : 'err', `去重完成：${parts.join('，')}`);
+    } catch (e: any) {
+      toast('err', e?.message || '去重失败');
+    } finally {
+      setDedupeBusy(false);
+    }
+  };
+
+  /** 一键同步：全部本机账号两两对齐（内容并集取最新 + 改名跟随），可选补全缺失会话 */
+  const syncAllNow = async (fillMissing: boolean, pruneOthers = false) => {
+    setSyncAllBusy(true);
+    if (pruneOthers) setSummaryBusy(true);
+    // 全量汇总：连国际版的会话也一起并进来
+    const crossVariant = fillMissing && pruneOthers;
+    const variant = (window as any).__wbVariant === 'ai' ? 'ai' : 'cn';
+    const payload = { fillMissing, pruneOthers, crossVariant, variant };
+    let plan: any = null;
+    try {
+      // 先预演：只读，不动任何数据，WorkBuddy 开着也能跑
+      plan = await post<any>('/api/sessions/sync-all', { dryRun: true, ...payload }, { timeoutMs: 600000 });
+    } catch (e: any) {
+      setSyncAllBusy(false);
+      setSummaryBusy(false);
+      toast('err', `预演失败：${e?.message || e}`);
+      return;
+    }
+    setSyncAllBusy(false);
+    if (pruneOthers) setSummaryBusy(false); // 预演结束就复位，避免取消后按钮一直转圈
+    const nContent = plan?.contentSynced?.length || 0;
+    const nTitle = plan?.titleSynced?.length || 0;
+    const lines = plan?.contentSynced?.reduce((s: number, c: any) => s + (c.appendedLines || 0), 0) || 0;
+    const cross = Array.isArray(plan?.crossVariant) ? plan.crossVariant : [];
+    const nCross = cross.reduce((s: number, c: any) => s + (c.copied || 0), 0);
+    const crossMb = Math.round(cross.reduce((s: number, c: any) => s + (c.bytes || 0), 0) / 1048576);
+    // 全量汇总：其他国内账号独有的会话（单向汇总进当前账号）
+    const collected = plan?.collected?.copied || 0;
+    const collectedMb = Math.round((plan?.collected?.bytes || 0) / 1048576);
+    // 跨档位（国际版）独有会话
+    const crossCnt = plan?.crossVariantCopy?.copied || 0;
+    const crossOnlyMb = Math.round((plan?.crossVariantCopy?.freedBytes || 0) / 1048576);
+    const ok = await confirm({
+      title: pruneOthers ? '确认执行全账号会话同步汇总' : '确认执行一键同步',
+      message: (
+        <>
+          <div>预演结果（<b>还没有改动任何数据</b>）：</div>
+          <ul className="mt-2 list-disc pl-5 text-sm leading-relaxed">
+            <li>{nContent} 个会话将补入新内容（共 {lines} 行，<b>只追加、不删除、不覆盖</b>）</li>
+            <li>{nTitle} 个会话将更新名称（只写 title 两个字段）</li>
+            {collected > 0 ? (
+              <li>
+                <b>{collected} 个其他账号独有的会话</b>将汇总进当前账号（约 {collectedMb} MB）
+              </li>
+            ) : null}
+            {crossCnt > 0 ? (
+              <li>
+                <b>{crossCnt} 个国际版独有的会话</b>将并入当前账号（约 {crossOnlyMb} MB）
+              </li>
+            ) : null}
+            {(plan?.skippedDeleted || []).length ? <li className="text-zinc-500">{(plan.skippedDeleted || []).length} 个会话你已在目标账号删过，<b>不会回填</b>（尊重删除）</li> : null}
+            {pruneOthers && plan?.mergedWithin && plan.mergedWithin.groups ? <li><b>同账号内合并：</b>{plan.mergedWithin.groups} 组同一对话的多份副本将合并成最完整的一份（内容按时间取全，删掉 {plan.mergedWithin.removed} 份）</li> : null}
+            {pruneOthers && plan?.prune ? <li><b>汇总后清理：</b>删除 {(plan.prune.pruned || 0)} 个其他账号的冗余副本（释放约 {Math.round(((plan.prune.freedBytes) || 0) / 1048576)} MB），只保留当前账号一份；你已删除的对话也会从其他账号一并清掉</li> : null}
+            <li className="text-zinc-500">执行前自动备份整个会话库到 ~/.wb-switch/backups/，改坏可回滚</li>
+          </ul>
+          <div className="mt-2 text-xs text-zinc-500">确认后自动关闭 WorkBuddy（先退出再写数据，不会丢内容），完成后自动重新打开，全程无需你手动操作。</div>
+        </>
+      ),
+    });
+    if (!ok) return;
+    setSyncAllBusy(true);
+    if (pruneOthers) setSummaryBusy(true);
+    try {
+      const r = await post<any>('/api/sessions/sync-all', { stopApp: true, ...payload }, { timeoutMs: 3600000 });
+      const parts = [
+        `复制 ${r?.copied?.length || 0} 个`,
+        `内容更新 ${r?.contentSynced?.length || 0} 个`,
+        `改名 ${r?.titleSynced?.length || 0} 个`,
+      ];
+      const crossDone = Array.isArray(r?.crossVariant) ? r.crossVariant.reduce((s: number, c: any) => s + (c.copied || 0), 0) : 0;
+      if (crossDone) parts.push(`其他档位并入 ${crossDone} 个`);
+      const collectedDone = r?.collected?.copied || 0;
+      if (collectedDone) parts.push(`其他账号独有并入 ${collectedDone} 个`);
+      const crossOnly = r?.crossVariantCopy?.copied || 0;
+      if (crossOnly) parts.push(`国际版并入 ${crossOnly} 个`);
+      if (r?.errors?.length) parts.push(`失败 ${r.errors.length} 个`);
+      if (r?.appStop?.wasRunning) parts.push(r?.relaunch?.launched ? 'WorkBuddy 已重新打开' : 'WorkBuddy 未自动打开，请手动启动');
+      toast(r?.ok ? 'ok' : 'err', `全账号同步完成：${parts.join('，')}`);
+    } catch (e: any) {
+      toast('err', e?.message || '同步失败');
+    } finally {
+      setSyncAllBusy(false);
+      setSummaryBusy(false);
+    }
+  };
   /** 切换确认框里两个勾选的值（弹窗消息是快照，只能靠 ref 传出来） */
   const copyOnSwitchRef = useRef(false);
   const stopAppRef = useRef(true);
@@ -1674,13 +2029,21 @@ export default function AccountsPage() {
         },
         { timeoutMs: TIMEOUT.switch }
       );
-      const copied = r?.sessionCopy?.copied.length || 0;
+      // 切换时服务端可能返回「搬家」结果（moved/merged），也可能返回「复制」结果（copied/skipped），
+      // 两种都要兼容——之前只读 copied，字段不存在时抛 TypeError，界面就弹红框。
+      const copied = r?.sessionCopy?.copied?.length || r?.sessionCopy?.moved?.length || 0;
+      const merged = r?.sessionCopy?.merged?.length || 0;
+      const synced = r?.sessionCopy?.skipped?.length || 0;
       const wasStopped = !!r?.appStop?.wasRunning;
       const reopenFailed = r?.relaunch ? r.relaunch.launched === false : false;
       const tail = relaunchTail(r?.relaunch, wasStopped || !!r?.appStop?.wasRunning);
       toast(
         reopenFailed ? 'err' : 'ok',
-        `已切换到「${account.name}」${copied ? `，并复制了 ${copied} 个会话` : ''}，${tail}`
+        `已切换到「${account.name}」` +
+          (copied ? `，${copied} 个会话已转到该账号` : '') +
+          (merged ? `（其中 ${merged} 个与原副本合并取全）` : '') +
+          (synced ? `；${synced} 个已同步会话的最新内容与改名已带过去` : '') +
+          `，${tail}`
       );
       if (r?.backupPath) console.info('登录态备份：', r.backupPath);
       setSessionTarget(null);
@@ -1828,6 +2191,55 @@ export default function AccountsPage() {
     }
   };
 
+  /** 各账号「模型额度超限」状态（后端缓存 3 分钟） */
+  const [modelLimits, setModelLimits] = useState<Record<string, { model: string; resetAt: number }[]>>({});
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const r = await get<{ accounts: Record<string, any> }>('/api/accounts/model-limits');
+        if (!cancelled && r?.accounts) setModelLimits(r.accounts);
+      } catch {
+        /* 查询失败不显示即可 */
+      }
+    };
+    load();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  /** 今日签到/旅行状态（每 5 分钟由后端缓存刷新） */
+  const [dailyStatus, setDailyStatus] = useState<
+    Record<
+      string,
+      {
+        checkedIn?: boolean;
+        traveled?: boolean;
+        travelState?: string | null;
+        travelDailyLimit?: boolean;
+        travelReward?: number;
+        checkinError?: string | null;
+        travelError?: string | null;
+      }
+    >
+  >({});
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const r = await get<{ accounts: Record<string, any> }>('/api/accounts/daily-status');
+        if (!cancelled && r?.accounts) setDailyStatus(r.accounts);
+      } catch {
+        /* 查询失败不影响主界面 */
+      }
+    };
+    load();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const balanceOf = useCallback(
     (id: string): CreditBalance | null => balances?.accounts?.find((r) => r.accountId === id)?.balance ?? null,
     [balances]
@@ -1839,10 +2251,22 @@ export default function AccountsPage() {
     [balances]
   );
 
-  const visibleAccounts = useMemo(
-    () => (data?.accounts || []).filter((a) => a.variant === variant),
-    [data, variant]
-  );
+  /**
+   * 账号排序：按「还有剩余（>0）的积分包里最早的过期时间」升序——谁先过期谁排前面。
+   * 剩余为 0 的包不参与排序（它们的到期时间没有意义）；没有有效积分的账号排最后。
+   */
+  const visibleAccounts = useMemo(() => {
+    const list = (data?.accounts || []).filter((a) => a.variant === variant);
+    const earliestExpiry = (accountId: string): number => {
+      const balance = balances?.accounts?.find((r) => r.accountId === accountId)?.balance;
+      const times = (balance?.packages || [])
+        .filter((p) => (p.remaining ?? 0) > 0 && p.expireAt)
+        .map((p) => Number(p.expireAt))
+        .filter((n) => Number.isFinite(n) && n > 0);
+      return times.length ? Math.min(...times) : Number.POSITIVE_INFINITY;
+    };
+    return list.slice().sort((x, y) => earliestExpiry(x.id) - earliestExpiry(y.id));
+  }, [data, variant, balances]);
   const activeVariant = (data?.variants || []).find((v) => v.id === variant);
 
   const stats = useMemo(() => {
@@ -2028,9 +2452,28 @@ export default function AccountsPage() {
               </span>
             )}
           </div>
-          <span className="text-xs text-zinc-400">
-            {balanceLoading ? '余额查询中…' : balances?.collectedAt ? `余额更新于 ${fmtClock(balances.collectedAt)}` : ''}
-          </span>
+          <div className="flex items-center gap-2">
+            <Button
+              variant="primary"
+              size="sm"
+              loading={summaryBusy}
+              disabled={syncAllBusy}
+              onClick={() => syncAllNow(false, true)}
+              title="把各账号（含国际版）独有的会话都并进当前账号，同一对话合并成一份；铺满后自动清理其他账号的冗余副本"
+            >
+              全账号会话同步汇总
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              loading={dedupeBusy}
+              disabled={dedupeBusy}
+              onClick={dedupeNow}
+              title="同名的同一对话只保留内容最完整的一份，其余副本删除（先预演确认，执行前自动备份）"
+            >
+              一键去重
+            </Button>
+          </div>
         </div>
 
         {visibleAccounts.length === 0 ? (
@@ -2051,6 +2494,8 @@ export default function AccountsPage() {
                 account={a}
                 isCurrent={current?.account?.id === a.id}
                 busy={busyId === a.id}
+                daily={dailyStatus[a.id] || dailyStatus[a.uid] || undefined}
+                modelLimits={modelLimits[a.id] || modelLimits[a.uid] || undefined}
                 balance={balanceOf(a.id)}
                 balanceLoading={balanceLoading && !balanceOf(a.id)}
                 authInvalid={authInvalidIds.has(a.id)}

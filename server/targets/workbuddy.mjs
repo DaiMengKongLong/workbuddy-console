@@ -241,7 +241,7 @@ function shortExecError(err) {
  * 进程叫 `WorkBuddy Console`（electron-builder 的 productName）。一旦放宽成前缀匹配，
  * 切号时就会**把控制台自己杀掉**，切换动作当场中断。
  */
-export const WORKBUDDY_PROCESS_NAMES = ['WorkBuddy', 'CodeBuddy'];
+export const WORKBUDDY_PROCESS_NAMES = ['WorkBuddy'];
 
 /** 解析 PowerShell 序列化的启动时间：PS 5.1 为 "/Date(ms)/"，PS 7 为 ISO 字符串 */
 function parseStartTime(v) {
@@ -614,9 +614,57 @@ export function installRoots(env = process.env) {
   return roots;
 }
 
+/**
+ * exe 路径持久化缓存：`~/.wb-switch/workbuddy_exe.json`（与 workbuddy-switch 共用同一文件）。
+ *
+ * 为什么必须缓存：WorkBuddy 常被装在自定义位置（本机 `D:\WorkbuddyCN\WorkBuddy.exe`，
+ * 不在任何 Program Files / LocalAppData\Programs 下，根目录扫描扫不到 D 盘根）。
+ * 而切换流程是「先杀进程 → 再重新打开」，杀完就再也读不到进程的真实路径了——
+ * 一旦杀之前那一次 PowerShell 探测没拿到 Path，relaunch 就报「未能定位可执行文件」，
+ * 用户只能手动打开（2026-10-21 用户反馈：切换后 WorkBuddy 没有自动重新打开）。
+ * 缓存写入发生在杀进程之前，读取发生在 relaunch 定位时，正好补上这条链。
+ */
+const EXE_CACHE_FILE = path.join(os.homedir(), '.wb-switch', 'workbuddy_exe.json');
+
+function readExeCache() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(EXE_CACHE_FILE, 'utf8'));
+    return raw && typeof raw === 'object' ? raw : {};
+  } catch {
+    return {};
+  }
+}
+
+/** 缓存里第一条真实存在的 exe 路径（key 只是习惯命名，读取端只认值） */
+function exeFromCache() {
+  for (const v of Object.values(readExeCache())) {
+    const p = String(v || '');
+    if (p && existsQuiet(p)) return p;
+  }
+  return null;
+}
+
+/** 把运行中读到的 exe 路径记下来；已记录过（大小写不敏感）就不重写 */
+function rememberExePath(exePath) {
+  const p = String(exePath || '').trim();
+  if (!p || !existsQuiet(p)) return;
+  try {
+    const data = readExeCache();
+    if (Object.values(data).some((v) => String(v || '').toLowerCase() === p.toLowerCase())) return;
+    data.cn = p; // key 无所谓，读取端只按「值是否存在」匹配
+    fs.mkdirSync(path.dirname(EXE_CACHE_FILE), { recursive: true });
+    fs.writeFileSync(EXE_CACHE_FILE, JSON.stringify(data, null, 2));
+  } catch {
+    /* 缓存写失败无关紧要，不干扰主流程 */
+  }
+}
+
 /** 定位 WorkBuddy 可执行文件：优先检测到的真实路径，再按常见安装位置兜底，最后扫安装根目录 */
 export function findWorkbuddyExe(detectedPath) {
   if (existsQuiet(detectedPath)) return detectedPath;
+  // 进程已死、读不到路径时的第一条捷径：上次运行时记下的真实路径
+  const cached = exeFromCache();
+  if (cached) return cached;
   const home = os.homedir();
   const quick = [
     path.join(process.env.LOCALAPPDATA || '', 'Programs', 'WorkBuddy', 'WorkBuddy.exe'),
@@ -701,12 +749,102 @@ const STOP_FORCE_MS = 12000;
 
 /** 给单个 PID 发终止信号（win32 走 taskkill，其他平台走 kill） */
 function terminatePid(pid, force) {
-  const args =
-    process.platform === 'win32'
-      ? ['/PID', String(pid), '/T', ...(force ? ['/F'] : [])]
-      : [force ? '-KILL' : '-TERM', String(pid)];
-  // 单个进程杀不掉不影响其余：主进程一死，它的子进程通常已经一起没了
-  return run(process.platform === 'win32' ? 'taskkill' : 'kill', args).catch(() => {});
+  if (process.platform !== 'win32') {
+    return run('kill', [force ? '-KILL' : '-TERM', String(pid)]).catch(() => {});
+  }
+  const args = ['/PID', String(pid), '/T', ...(force ? ['/F'] : [])];
+  // taskkill 偶发失败（PATH/权限/竞态）且原实现把错误静默吞掉，用户只看到
+  // 「仍在运行」却不知道为什么。这里先 taskkill，失败立刻用 PowerShell
+  // Stop-Process 兜底（实测可杀），两边都失败才放弃该 PID。
+  return run('taskkill', args, 10000, { windowsHide: true }).catch((err1) => {
+    return run(
+      'powershell.exe',
+      ['-NoProfile', '-Command', `Stop-Process -Id ${Number(pid)} -Force -ErrorAction Stop`],
+      10000,
+      { windowsHide: true }
+    ).catch((err2) => {
+      console.log(
+        `[stop] PID ${pid} 两种方式都杀不掉: taskkill=${err1?.code || err1?.message} Stop-Process=${err2?.message || err2}`
+      );
+      return; // 单个杀不掉不影响其余进程（沿用原语义）
+    });
+  });
+}
+
+const SUSPEND_SCRIPT = path.join(import.meta.dirname ?? '.', 'suspend-workbuddy.ps1');
+
+/**
+ * asar 是虚拟文件系统：`powershell -File <.../app.asar/server/.../x.ps1>` 直接读不到内容，
+ * 打包后冻结会静默失败。这里在打包场景先把脚本落到系统临时目录再交给 PowerShell；
+ * 开发模式（node 直接跑）路径不含 app.asar，原样返回，不产生额外 IO。
+ */
+function suspendScriptPath() {
+  if (!SUSPEND_SCRIPT.includes('app.asar')) return SUSPEND_SCRIPT;
+  const tmp = path.join(os.tmpdir(), 'wb-console-suspend-workbuddy.ps1');
+  try {
+    // Electron 的 fs 补丁支持直接读取 asar 内文件，这里只是把它落到真实磁盘
+    fs.writeFileSync(tmp, fs.readFileSync(SUSPEND_SCRIPT, 'utf8'), 'utf8');
+    return tmp;
+  } catch (e) {
+    throw new Error(`冻结脚本无法解压到临时目录：${e?.message || e}`);
+  }
+}
+
+/**
+ * 冻结 WorkBuddy（NtSuspendProcess 挂起全部进程，不杀死）。
+ *
+ * 为什么不用强杀：WorkBuddy 被强杀后会被 Windows 的「崩溃自动重启」机制立刻
+ * 拉活（实测杀光后 5 秒内 11 个新进程），force 轮永远判定失败，切换被拦。
+ * 冻结则完全不触发该机制：进程活着但线程全部挂起——不会写库、不会改登录态、
+ * 不会复活，是「停住它但不杀它」的最安全形态。
+ *
+ * 何时解冻/杀死由调用方决定：切换流程会在写完登录态后 kill 掉冻结进程，
+ * 此时崩溃自动重启拉起的「新实例」读取的是磁盘上**已切换**的登录态——
+ * 相当于自动打开了切换后账号的 WorkBuddy（2026-10-21 用户要求的最终形态）。
+ */
+export async function suspendWorkbuddy() {
+  if (process.platform !== 'win32') {
+    throw new Error('当前平台不支持冻结 WorkBuddy');
+  }
+  const proc = await detectWorkbuddyProcess();
+  if (!proc.running) {
+    return { suspended: true, wasRunning: false, count: 0 };
+  }
+  const stdout = await run('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', suspendScriptPath()], 15000, {
+    windowsHide: true,
+  });
+  const count = Number(String(stdout).trim().match(/suspended (\d+)/)?.[1] || 0);
+  return { suspended: true, wasRunning: count > 0, count };
+}
+
+/** 结束（强杀）全部 WorkBuddy 进程并确认消失；用于冻结后的收尾 */
+export async function killWorkbuddy() {
+  const proc = await detectWorkbuddyProcess();
+  if (!proc.running) {
+    return { stopped: true, wasRunning: false, killed: [], forced: true, exePath: proc.exePath || null };
+  }
+  const exePath = proc.exePath || null;
+  rememberExePath(exePath);
+  const killed = new Set();
+  const deadline = Date.now() + 15000;
+  for (;;) {
+    const { processes, error } = await listWorkbuddyProcesses();
+    if (error) break; // 探测失败不强求，交给下面的最终检查
+    if (!processes.length) break;
+    for (const p of processes) killed.add(p.pid);
+    for (const p of processes) await terminatePid(p.pid, true);
+    if (Date.now() >= deadline) break;
+    await sleep(400);
+  }
+  const confirm = await waitUntilGone(2000);
+  return {
+    stopped: confirm.gone,
+    wasRunning: true,
+    killed: [...killed],
+    forced: true,
+    exePath,
+    resurrected: !confirm.gone, // 被崩溃恢复拉活了：新实例读的是新登录态，无害
+  };
 }
 
 /**
@@ -737,6 +875,8 @@ export async function stopWorkbuddy({
   }
 
   const exePath = first.processes.find((p) => p.exePath)?.exePath || null;
+  // 杀进程前把真实路径记下来：杀完就再也读不到了，relaunch 全靠这份缓存兜底
+  rememberExePath(exePath);
   const killed = new Set();
 
   /**

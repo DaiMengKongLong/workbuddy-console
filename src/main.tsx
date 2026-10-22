@@ -28,6 +28,17 @@ class ErrorBoundary extends React.Component<
       message: `渲染异常：${error.message}`,
       detail: info.componentStack ? String(info.componentStack).slice(0, 2000) : undefined,
     });
+    // 自动恢复：渲染异常多半来自旧版 JS 缓存/瞬时状态，自动刷新一次即可恢复；
+    // 10 秒内只自动刷新一次，避免错误循环时反复刷屏（仍保留手动「重试/刷新」按钮）。
+    try {
+      const last = Number(sessionStorage.getItem('render-reload-at') || 0);
+      if (Date.now() - last > 10000) {
+        sessionStorage.setItem('render-reload-at', String(Date.now()));
+        setTimeout(() => location.reload(), 600);
+      }
+    } catch {
+      /* 隐私模式下 sessionStorage 不可用：跳过自动刷新 */
+    }
   }
 
   render() {

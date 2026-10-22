@@ -29,12 +29,18 @@ for (const d of [dataRoot, storeHome, cfgDir, fakeLocalAppData, fakeAppData]) {
   fs.mkdirSync(d, { recursive: true });
 }
 
-process.env.WB_DATA_ROOT_CN = dataRoot;
+process.env.WB_DATA_ROOT_CN = dataRoot; // 旧版隔离机制，现已不被读取（保留以防回退）
 process.env.WB_SWITCH_HOME = storeHome;
 process.env.FREE_TOKEN_CONFIG_DIR = cfgDir;
 process.env.LOCALAPPDATA = fakeLocalAppData;
 process.env.APPDATA = fakeAppData;
 process.env.WB_FAKE_APP_RUNNING = '0';
+/* 合并版的数据根解析走 config.json 的 settings.workbuddyDir 覆盖（不再读 WB_DATA_ROOT_CN）；
+   必须在首次调用 detectWorkbuddyDir 之前落盘，否则会探测到真实的 ~/.workbuddy */
+fs.writeFileSync(
+  path.join(cfgDir, 'config.json'),
+  JSON.stringify({ version: 1, settings: { workbuddyDir: dataRoot } })
+);
 
 const out = (s) => fs.writeSync(1, s + '\n');
 let pass = 0;
@@ -67,10 +73,20 @@ const CID = {
   stopApp: 'aaaaaaa2-0000-4000-8000-000000000008',
 };
 
-/** 与真实客户端同形的 JSONL 正文：每行都有 sessionId，正文里还夹着会话 id */
+/** 与真实客户端同形的 JSONL 正文：每行都有 sessionId，正文里还夹着会话 id。
+ *  夹带一行 ~160KB 的填充消息：合并实现有「公共前缀 <64KB 判为不同对话」的保护，
+ *  夹具必须放大到真实正文尺寸，内容同步/分叉场景才能走到合并路径。 */
 const bodyText = (cid) =>
   [
     JSON.stringify({ type: 'session-meta', id: 'meta-1', sessionId: cid, timestamp: 1, meta: { host: 'x' } }),
+    JSON.stringify({
+      id: 'pad-1',
+      timestamp: 1.5,
+      type: 'message',
+      role: 'user',
+      content: [{ type: 'input_text', text: 'pad '.repeat(40 * 1024) }],
+      sessionId: cid,
+    }),
     JSON.stringify({
       id: 'msg-1',
       timestamp: 2,
@@ -237,7 +253,7 @@ const baselineJsonl = listJsonl().length;
 
 /* ---------- 1. 基础能力 ---------- */
 out('== 1. 基础能力 ==');
-ok(sessionDataRoot('cn') === path.resolve(dataRoot), 'WB_DATA_ROOT_CN 覆盖生效（测试不碰真实数据根）');
+ok(sessionDataRoot('cn') === path.resolve(dataRoot), 'config.json 的 workbuddyDir 覆盖生效（测试不碰真实数据根）');
 ok((await sessionCopySupported('cn')) === true, '档位能力探测：projects/ + sessions 表 → 支持');
 
 /* ---------- 2. 会话列表 ---------- */
@@ -545,9 +561,9 @@ ok(
 {
   const merged = fs.readFileSync(bodyPath.other, 'utf8');
   const lines = merged.split('\n').filter((l) => l.trim());
-  ok(lines.length === 5, '原会话正文从 3 行变为 5 行（追加了 2 行增量）');
+  ok(lines.length === 6, '原会话正文从 4 行变为 6 行（追加了 2 行增量）');
   ok(!merged.includes(CID.plain), '回写后的原正文不残留副本会话 id');
-  ok(lines[3].includes('msg-3') && lines[4].includes('msg-4'), '追加的两行就是副本新增的消息');
+  ok(lines[4].includes('msg-3') && lines[5].includes('msg-4'), '追加的两行就是副本新增的消息');
 }
 ok(listJsonl().length === beforeSyncFiles && countRows(TARGET_UID) === beforeSyncRows, '内容回写不产生新的正文文件或会话行');
 {
@@ -556,9 +572,9 @@ ok(listJsonl().length === beforeSyncFiles && countRows(TARGET_UID) === beforeSyn
   d.close();
   ok(row?.updated_at === 1700000099000 && row?.last_activity_at === 1700000099001, '原会话行的活动时间已推进到副本的新值');
 }
-// 备份产物里要有回写前的原正文
+// 备份产物里要有回写前的原正文（合并版命名：<原名>.pre-merge）
 ok(
-  fs.existsSync(path.join(syncReport.backupPath, `${CID.other}.jsonl`)),
+  fs.existsSync(path.join(syncReport.backupPath, `${CID.other}.jsonl.pre-merge`)),
   '回写前的原正文已备份到本次操作的备份目录'
 );
 // 幂等：再跑一次，没有新增量就不追加
@@ -568,8 +584,8 @@ ok(
   '再次往返时无新增量，不做重复追加（幂等）'
 );
 ok(
-  fs.readFileSync(bodyPath.other, 'utf8').split('\n').filter((l) => l.trim()).length === 5,
-  '原会话正文仍为 5 行（没有被二次追加）'
+  fs.readFileSync(bodyPath.other, 'utf8').split('\n').filter((l) => l.trim()).length === 6,
+  '原会话正文仍为 6 行（没有被二次追加）'
 );
 
 /* ---------- 10. 两侧都新增过内容时，重复往返不得重复追加 ---------- */
@@ -613,12 +629,12 @@ ok(
   forkReport.contentSynced?.[0]?.appendedLines === 1,
   `分叉后只追加副本那一行增量（实际 ${forkReport.contentSynced?.[0]?.appendedLines} 行）`
 );
-ok(readOriginLines().length === 7, '原会话变为 7 行（原3 + 双向各1 + 合并1）');
+ok(readOriginLines().length === 8, '原会话变为 8 行（原4 + 副本2 + 双向各1）');
 ok(readOriginLines().some((l) => l.includes('msg-5')) && readOriginLines().some((l) => l.includes('msg-6')), '两侧新增内容都在：没有丢内容');
 
 const forkRerun = await copySessions({ targetAccountId: TARGET_ACCOUNT_ID, ids: [CID.plain] });
 ok((forkRerun.contentSynced || []).length === 0, '同一操作重复执行不再追加（幂等护栏生效）');
-ok(readOriginLines().length === 7, `重复执行后原会话仍是 7 行（实际 ${readOriginLines().length} 行，旧实现会变成 8 行）`);
+ok(readOriginLines().length === 8, `重复执行后原会话仍是 8 行（实际 ${readOriginLines().length} 行，旧实现会变成 9 行）`);
 
 /* ---------- 11. 账本记着的副本已被删除 → 不能"跳过" ---------- */
 out('\n== 11. 陈旧账本：目标账号里的副本已被删除 ==');
@@ -676,7 +692,7 @@ ok(orphanReport.skipped.length === 0, '原会话没了就不再报「已同步�
 ok(orphanReport.copied.length === 1, '改为普通复制把内容带过去');
 ok(countRows(TARGET_UID) === beforeOrphanRows + 1, '目标账号多了一条新会话');
 ok(
-  fs.readFileSync(bodyPath.other, 'utf8').split('\n').filter((l) => l.trim()).length === 7,
+  fs.readFileSync(bodyPath.other, 'utf8').split('\n').filter((l) => l.trim()).length === 8,
   '已删除的原会话正文没有被改写'
 );
 

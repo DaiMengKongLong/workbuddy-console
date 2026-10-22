@@ -10,6 +10,16 @@ files:
   - server/**
   - build/** # 运行时托盘图标也在 build/ 下，必须随包
   - package.json
+# 会话整理/清理脚本必须落在真实磁盘才能被 spawn 执行（asar 内路径子进程读不到）：
+# 复制到 resources/cleanup/，服务端在打包环境按 process.resourcesPath 回退查找。
+extraResources:
+  - from: .
+    to: cleanup
+    filter:
+      - 汇总后自动整理.mjs
+      - 归档并清理.mjs
+      - 重复对话合并.mjs
+      - 合并内核.mjs
 # 统一产物命名（避免 productName 中的空格影响 Release 附件上传）
 artifactName: WorkBuddy-Console-${version}-${os}-${arch}.${ext}
 asar: true

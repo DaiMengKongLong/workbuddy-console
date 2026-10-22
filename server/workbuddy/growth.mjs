@@ -11,6 +11,10 @@
  *   2. 任务        GET  /tasks                 accept_status: not_accepted|accepted|in_progress|completed|claimed
  *                  POST /tasks/accept          {task_codes:[...]}   接单（复数数组；单数 task_code 一律 400）
  *                  POST /tasks/{code}/claim    {}                   领奖（只有 completed 才发奖）
+ *   2.5 对话任务    chat_* 类任务（如 chat_5「和 AI 聊天 5 次」）只有真实发起模型对话才计进度：
+ *                  对话请求带 extra_vars.growthEvent（eventCode=chat_request_send，逆向自官方
+ *                  桌面端 5.x，实测有效）。模型选择：免费模型（hy3 等，实测 0 积分/次）优先，
+ *                  全部不可用才退到低倍率付费模型——实现见 usageTasks.mjs。
  *   3. 断登补签    GET  /streak                streak.days / makeup_cards / makeup_dates / launch_date
  *                  GET  /heatmap               cells[{date,score}] / today.date（服务端日期）
  *                  POST /makeup-cards/use      {target_date}        每轮最多 1 张
@@ -42,10 +46,13 @@ import { proxyFetch } from '../proxy.mjs';
 import { variantOf, officialNetHint } from './variant.mjs';
 import { authHeaders } from './credits.mjs';
 import { hasPlainToken, isEnvelope } from './accounts.mjs';
+import { chatTaskBacklog, completeChatTasks } from './usageTasks.mjs';
 
 const GROWTH_BASE = '/v2/activity/growth';
 /** 每轮最多用掉一张补登卡（与参考实现一致；断登多天时分轮消化） */
 export const MAKEUP_MAX_PER_RUN = 1;
+/** 对话任务补满后等进度落库的复查间隔（服务端把进度翻成 completed 有秒级延迟） */
+const CLAIM_RECHECK_DELAY_MS = 5000;
 /** 补登候选的最早日期：成长中心活动上线日（与官方 H5 口径一致） */
 const LAUNCH_FLOOR = '2026-06-17';
 
@@ -239,6 +246,33 @@ export function growthEligible(account) {
  * 返回 { ok, report, parts, creditsGained, energy, streakDays, failures, hardFailures, idle, unauthorized }
  * ok=false 只在中止级问题（不支持/认证拒绝/硬失败）时出现；单模块失败记在 parts+failures 里。
  */
+/**
+ * 查询某账号今日「Buddy 旅行」状态（只查询，不派出发）。
+ * state: idle（未旅行）| traveling（已出发）| arrived（已到达待领取）
+ */
+export async function fetchTravelStatus(account) {
+  try {
+    const { apiEndpoint: endpoint } = variantOf(account);
+    const url = `${endpoint}${GROWTH_BASE}/buddy/travel/status`;
+    // 用 Node 原生 fetch 直连（官方境内域名，避免系统代理残留导致失败）
+    const res = await fetch(url, { headers: authHeaders(account, url), signal: AbortSignal.timeout(15000) });
+    if (res.status !== 200) return { ok: false, traveled: false, state: '', error: `HTTP ${res.status}` };
+    const json = await res.json().catch(() => null);
+    const state = String(dig(json, 'state') || '');
+    return {
+      ok: true,
+      traveled: state === 'traveling' || state === 'arrived',
+      state,
+      /** 今日名额已用完（state=idle 且 daily_limit_reached=true） */
+      dailyLimit: Boolean(dig(json, 'daily_limit_reached')),
+      /** 本次/今日旅行可得的积分（官方字段 reward_credit，未旅行时为 0） */
+      reward: asInt(dig(json, 'reward_credit')),
+    };
+  } catch (err) {
+    return { ok: false, traveled: false, state: '', error: err?.message || String(err) };
+  }
+}
+
 export async function runGrowthForAccount(account, options = {}) {
   const eligible = growthEligible(account);
   if (!eligible.ok) {
@@ -362,12 +396,44 @@ export async function runGrowthForAccount(account, options = {}) {
   }
 
   // --- 2. 任务领奖（放在抽奖前：任务送的抽奖机会/能量，后面马上能用上）---
+  /** 任务标题表（任务模块查到列表后填充；对话补全复查时复用） */
+  const titles = new Map();
+  /** 领走列表里所有 completed 任务的奖励（任务模块与对话补全后复查共用） */
+  const claimCompleted = async (list) => {
+    for (const task of list) {
+      if (task?.locked || task?.accept_status !== 'completed') continue; // 只有 completed 才发奖
+      const code = task.task_code;
+      const title = titles.get(code) || code;
+      try {
+        const c = await p(`${base}/tasks/${encodeURIComponent(code)}/claim`, {});
+        if (authAbort(c.status)) return abortResult(c.status);
+        if (!c.networkError && c.status >= 200 && c.status < 300 && !dig(c.json, 'already_claimed')) {
+          const rc = firstInt(c.json, 'credit', task.reward_credit);
+          const re = firstInt(c.json, 'energy', task.reward_energy);
+          creditsGained += rc;
+          parts.push(`领任务奖「${title}」+${rc} 积分 +${re} 能量`);
+          successes += 1;
+        } else if (!c.networkError && c.status >= 200 && c.status < 300) {
+          parts.push(`任务奖「${title}」已领过`);
+        } else {
+          const msg = c.networkError || String(dig(c.json, 'msg') || `HTTP ${c.status}`);
+          parts.push(`领任务奖「${title}」失败：${msg}`);
+          failures += 1;
+          hardFailures += isHardFailure(c.status, c.networkError) ? 1 : 0;
+        }
+      } catch (e) {
+        parts.push(`领任务奖「${title}」异常（${e?.message || e}）`);
+        failures += 1;
+        hardFailures += 1;
+      }
+    }
+  };
   try {
     const t = await g(`${base}/tasks`);
     if (authAbort(t.status)) return abortResult(t.status);
     if (!noteHttp(t, '查任务列表')) {
       const tasks = dig(t.json, 'tasks') || [];
-      const titles = new Map(tasks.map((x) => [x?.task_code, x?.title || x?.task_code]));
+      for (const x of tasks) titles.set(x?.task_code, x?.title || x?.task_code);
       const pending = tasks
         .filter((x) => x?.task_code && !x?.locked && x?.accept_status === 'not_accepted')
         .map((x) => x.task_code);
@@ -397,36 +463,52 @@ export async function runGrowthForAccount(account, options = {}) {
           }
         }
       }
-      for (const task of tasks) {
-        if (task?.locked || task?.accept_status !== 'completed') continue; // 只有 completed 才发奖
-        const code = task.task_code;
-        const title = titles.get(code) || code;
-        try {
-          const c = await p(`${base}/tasks/${encodeURIComponent(code)}/claim`, {});
-          if (authAbort(c.status)) return abortResult(c.status);
-          if (!c.networkError && c.status >= 200 && c.status < 300 && !dig(c.json, 'already_claimed')) {
-            const rc = firstInt(c.json, 'credit', task.reward_credit);
-            const re = firstInt(c.json, 'energy', task.reward_energy);
-            creditsGained += rc;
-            parts.push(`领任务奖「${title}」+${rc} 积分 +${re} 能量`);
-            successes += 1;
-          } else if (!c.networkError && c.status >= 200 && c.status < 300) {
-            parts.push(`任务奖「${title}」已领过`);
-          } else {
-            const msg = c.networkError || String(dig(c.json, 'msg') || `HTTP ${c.status}`);
-            parts.push(`领任务奖「${title}」失败：${msg}`);
-            failures += 1;
-            hardFailures += isHardFailure(c.status, c.networkError) ? 1 : 0;
+      await claimCompleted(tasks);
+    }
+  } catch (e) {
+    parts.push(`任务模块异常（${e?.message || e}）`);
+    failures += 1;
+    hardFailures += 1;
+  }
+
+  // --- 2.5 对话任务补全（免费模型优先 → 低倍率模型兜底）---
+  /**
+   * chat_* 类任务只有真实发起模型对话才会计进度（见 usageTasks.mjs 头注释）。
+   * 上一段只接单/领奖，这里复查一遍：还有对话缺口的就用选定模型补足，
+   * 补完再复查并补领奖。整段独立 try，失败不影响其余模块。
+   */
+  try {
+    const t2 = await g(`${base}/tasks`);
+    if (authAbort(t2.status)) return abortResult(t2.status);
+    if (!noteHttp(t2, '查任务进度')) {
+      const backlog = chatTaskBacklog(dig(t2.json, 'tasks'));
+      if (backlog.length) {
+        const r2 = await completeChatTasks(account, backlog, {
+          systemProxy: options.systemProxy,
+        });
+        parts.push(...r2.parts);
+        successes += r2.successes;
+        failures += r2.failures;
+        hardFailures += r2.hardFailures;
+        if (r2.changed) {
+          // 对话发出后服务端把进度落成 completed 有秒级延迟：立即复查领一次，
+          // 仍有未完成的等几秒再复查一轮（claim 幂等，多查无害）。
+          const pendingCodes = new Set(backlog.map((b) => b.code));
+          for (let attempt = 0; attempt < 2; attempt++) {
+            const t3 = await g(`${base}/tasks`);
+            if (authAbort(t3.status) || noteHttp(t3, '复查任务')) break;
+            const fresh = dig(t3.json, 'tasks') || [];
+            for (const x of fresh) if (!titles.has(x?.task_code)) titles.set(x?.task_code, x?.title || x?.task_code);
+            await claimCompleted(fresh);
+            const stillPending = fresh.some((x) => pendingCodes.has(x?.task_code) && x?.accept_status !== 'claimed');
+            if (!stillPending) break;
+            await new Promise((r) => setTimeout(r, CLAIM_RECHECK_DELAY_MS));
           }
-        } catch (e) {
-          parts.push(`领任务奖「${title}」异常（${e?.message || e}）`);
-          failures += 1;
-          hardFailures += 1;
         }
       }
     }
   } catch (e) {
-    parts.push(`任务模块异常（${e?.message || e}）`);
+    parts.push(`对话任务补全异常（${e?.message || e}）`);
     failures += 1;
     hardFailures += 1;
   }

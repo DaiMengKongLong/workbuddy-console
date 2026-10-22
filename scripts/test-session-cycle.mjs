@@ -21,12 +21,17 @@ const appdata = path.join(tmpRoot, 'appdata');
 for (const d of [dataRoot, storeHome, cfgDir, lad, appdata, path.join(dataRoot, 'projects', 'demo-ws')]) {
   fs.mkdirSync(d, { recursive: true });
 }
-process.env.WB_DATA_ROOT_CN = dataRoot;
+process.env.WB_DATA_ROOT_CN = dataRoot; // 旧版隔离机制，现已不被读取（保留以防回退）
 process.env.WB_SWITCH_HOME = storeHome;
 process.env.FREE_TOKEN_CONFIG_DIR = cfgDir;
 process.env.LOCALAPPDATA = lad;
 process.env.APPDATA = appdata;
 process.env.WB_FAKE_APP_RUNNING = '0';
+/* 合并版的数据根解析走 config.json 的 settings.workbuddyDir 覆盖（不再读 WB_DATA_ROOT_CN） */
+fs.writeFileSync(
+  path.join(cfgDir, 'config.json'),
+  JSON.stringify({ version: 1, settings: { workbuddyDir: dataRoot } })
+);
 
 const out = (s) => fs.writeSync(1, s + '\n');
 let pass = 0;

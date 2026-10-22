@@ -8,6 +8,8 @@ out-*/
 # 本地开发脚手架 / UI 走查截图等临时产物，不进版本库
 /_dev/
 *.log
+# 归档并清理.mjs 生成的「上次归档校验结果」，每次 --archive 都会重写
+archive-state.json
 .DS_Store
 /.zcode
 /.workbuddy/memory

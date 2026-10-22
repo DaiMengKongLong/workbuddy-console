@@ -67,8 +67,8 @@ function runInWorker(opts) {
   });
 }
 
-/** 结果级缓存：同一筛选参数 30 秒内直接复用（定时刷新近乎零开销），force=1 强制重扫 */
-const RESULT_TTL = 30_000;
+/** 结果级缓存：同一筛选参数 10 分钟内直接复用（冷扫描要 30-40 秒），force=1 强制重扫 */
+const RESULT_TTL = 10 * 60 * 1000;
 const resultCache = new Map();
 const inflightByKey = new Map();
 

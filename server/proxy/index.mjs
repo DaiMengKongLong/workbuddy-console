@@ -1000,6 +1000,38 @@ function publicStatus(port, { reveal = false } = {}) {
   };
 }
 
+/** 伪模型：不是真实模型 id，发给上游等于把选择权丢回去（忙时挂起/429），自检不能用它 */
+const PSEUDO_MODELS = new Set(['auto', 'default']);
+
+export function isPseudoModel(model) {
+  return PSEUDO_MODELS.has(String(model || '').trim());
+}
+
+/**
+ * 自检模型挑选（纯函数，供测试）：跳过伪模型，**优先免费模型 hy3**（实测 0 积分/次，
+ * 全天响应稳定）；hy3 不在列表里时取第一个真实模型。
+ * 用免费模型做自检还有一层意义：自检消耗是真实的——用 auto 实测被路由到 hy4-preview
+ * （≈41.8 积分/次），点一次自检烧一次积分。
+ */
+export function pickTestModel(ids) {
+  const real = (Array.isArray(ids) ? ids : []).map((m) => String(m || '').trim()).filter((m) => m && !isPseudoModel(m));
+  return real.includes('hy3') ? 'hy3' : real[0] || '';
+}
+
+/** 自检预览：chatComplete 聚合出的是 OpenAI 形状的 JSON，抽出正文给人看 */
+function testPreview(text) {
+  let preview = String(text || '');
+  try {
+    const msg = JSON.parse(preview)?.choices?.[0]?.message;
+    const content = typeof msg?.content === 'string' ? msg.content : '';
+    const reasoning = typeof msg?.reasoning_content === 'string' ? msg.reasoning_content : '';
+    preview = content || (reasoning ? `（思考）${reasoning}` : '') || preview;
+  } catch {
+    /* 非 JSON 原样截断 */
+  }
+  return preview.slice(0, 200);
+}
+
 /**
  * 挂载反向代理路由。
  * 必须在 Express 的静态资源 / SPA 兜底之前调用，否则 /v1/* 会被 index.html 吃掉。
@@ -1063,29 +1095,53 @@ export function registerProxyRoutes(app, { port }) {
 
   app.get('/api/proxy/logs', (req, res) => res.json({ logs: state.logs.slice(0, 200) }));
 
-  /** 连通性自检：发一条极短的非流式请求，验证「Key → 账号 → 官方接口」整条链路 */
+  /**
+   * 连通性自检：发一条极短的非流式请求，验证「Key → 账号 → 官方接口」整条链路。
+   *
+   * 模型挑选见 pickTestModel——**不能用 models.ids[0]**：列表首位常是伪模型 "auto"，
+   * 上游会把它路由到不可控的模型（实测 2026-10-22 auto→hy4-preview，≈41.8 积分/次），
+   * 忙时要么挂满 60 秒超时、要么 429 "Model busy"，自检按钮看起来就是坏的。
+   */
   app.post(
     '/api/proxy/test',
     wrap(async (req, res) => {
       const pool = poolAccounts();
       if (!pool.length) return res.status(400).json({ ok: false, error: '没有可用账号' });
-      const model = String(req.body?.model || state.models.ids[0] || '').trim();
+      // 前端可能显式传来伪模型（旧版 ids[0]）；这里统一净化
+      const requested = String(req.body?.model || '').trim();
+      const model = requested && !isPseudoModel(requested) ? requested : pickTestModel(state.models.ids);
       if (!model) return res.status(400).json({ ok: false, error: '没有可用模型，请先刷新模型列表' });
       const account = pool[0];
       try {
         if (needsRefresh(account)) await refreshAccessToken(account);
-        const out = await chatComplete(
+        let out = await chatComplete(
           account,
           { model, messages: [{ role: 'user', content: 'ping' }], max_tokens: 16 },
           { timeoutMs: 60_000 }
         );
+        // 忙时 429 是常态：官方给了 retry_after 就等一次再试，别让用户手动点第二下
+        if (!out.ok && out.status === 429) {
+          let waitMs = 5_000;
+          try {
+            const ra = Number(JSON.parse(out.text)?.retry_policy?.retry_after);
+            if (Number.isFinite(ra) && ra > 0) waitMs = Math.min(ra, 15) * 1000;
+          } catch {
+            /* 响应体不是 JSON，用默认等待 */
+          }
+          await new Promise((r) => setTimeout(r, waitMs));
+          out = await chatComplete(
+            account,
+            { model, messages: [{ role: 'user', content: 'ping' }], max_tokens: 16 },
+            { timeoutMs: 60_000 }
+          );
+        }
         if (out.ok) {
           return res.json({
             ok: true,
             account: accountMeta(account).name,
             variant: variantOf(account).label,
             model,
-            preview: String(out.text || '').slice(0, 200),
+            preview: testPreview(out.text),
           });
         }
         return res.json({ ok: false, account: accountMeta(account).name, error: out.error });

@@ -10,6 +10,7 @@
  */
 const { app, BrowserWindow, Tray, Menu, dialog, shell, nativeImage } = require('electron');
 const path = require('node:path');
+const fs = require('node:fs');
 const net = require('node:net');
 
 const buildRes = (name) => path.join(__dirname, '..', 'build', name);
@@ -81,9 +82,15 @@ function showWindow() {
 function createTray() {
   // macOS 菜单栏要求模板图（仅 alpha，颜色由系统定）；Windows 用彩色小图
   const iconPath = process.platform === 'darwin' ? buildRes('trayTemplate.png') : buildRes('tray.png');
-  const icon = nativeImage.createFromPath(iconPath);
-  if (icon.isEmpty()) return; // 图标缺失时不建托盘，窗口关闭仍可正常退出
-  if (process.platform === 'darwin') icon.setTemplateImage(true);
+  // 打包后图标在 asar 内：createFromPath 读 asar 不可靠（会拿到空图），先读 buffer 再建图
+  let icon = nativeImage.createEmpty();
+  try {
+    icon = nativeImage.createFromBuffer(fs.readFileSync(iconPath));
+    if (process.platform === 'darwin') icon.setTemplateImage(true);
+  } catch {
+    /* 图标读不到就在下面直接返回，不建托盘 */
+  }
+  if (icon.isEmpty()) return; // 图标缺失时不建托盘，窗口关闭将直接退出（见 close 处理）
 
   tray = new Tray(icon);
   tray.setToolTip('workbuddy控制台');
@@ -113,7 +120,8 @@ function createTray() {
 }
 
 async function createWindow() {
-  const port = await getFreePort(57891);
+  // 与 server/index.mjs 的默认端口保持一致，避免用户同时跑开发服务时总被挤到 57891 起的空档
+  const port = await getFreePort(57911);
   process.env.PORT = String(port);
   await import('../server/index.mjs');
   await waitForServer(`http://127.0.0.1:${port}/api/platforms`);
@@ -150,6 +158,12 @@ async function createWindow() {
   // 点关闭按钮 → 缩到托盘（自动签到需要进程常驻）；真正退出走托盘菜单
   win.on('close', (e) => {
     if (quitting) return;
+    // 没有托盘就没有任何入口能把窗口找回来：此时若仍 hide，进程会变成看不见也关不掉的僵尸。
+    // 所以托盘缺失时按普通关闭处理，交给 window-all-closed 退出。
+    if (!tray) {
+      quitting = true;
+      return;
+    }
     e.preventDefault();
     win.hide();
     // Windows 用户习惯「点 X 就是关」，首次隐藏时用气泡提示一次

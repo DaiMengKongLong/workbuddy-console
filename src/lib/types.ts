@@ -384,6 +384,12 @@ export interface SessionCopyReport {
   variant: string;
   sourceUid: string;
   targetUid: string;
+  /** 搬家：直接过户的会话 */
+  moved?: { id: string; title: string; bytes?: number }[];
+  /** 搬家：内容已并集合并进目标已有副本的会话 */
+  merged?: { sourceId: string; targetId: string; title: string; bytes?: number }[];
+  /** 目标账号用户手动删过同一对话 → 跳过不搬（尊重删除） */
+  skippedDeleted?: { id: string; title: string; bytes?: number; reason?: string }[];
   copied: SessionCopyItem[];
   skipped: { id: string; reason: string; newId?: string }[];
   errors: { id: string; error: string }[];

@@ -663,7 +663,8 @@ export async function getAccountBalances({ refresh = false } = {}) {
   const rows = [];
   const errors = [];
 
-  for (const account of accounts) {
+  // 并发处理各账号：原先串行 9 个账号 × 2 个官方请求 ≈ 13 秒，并发后约 2-3 秒
+  await Promise.all(accounts.map(async (account) => {
     const variant = variantOf(account);
     const base = {
       accountId: account.id,
@@ -687,7 +688,7 @@ export async function getAccountBalances({ refresh = false } = {}) {
       });
       errors.push({ ...base, error: err?.message || '查询失败' });
     }
-  }
+  }));
 
   const payload = {
     collectedAt: now,
@@ -873,7 +874,7 @@ export async function getCreditStatistics({ days = 30, refresh = false, variant 
   const errors = [];
   let collectedAt = 0;
 
-  for (const account of accounts) {
+  await Promise.all(accounts.map(async (account) => {
     const variant = variantOf(account);
     const base = {
       accountId: account.id,
@@ -883,7 +884,7 @@ export async function getCreditStatistics({ days = 30, refresh = false, variant 
     };
     try {
       const rows = await fetchAccountUsage(account, days);
-      collectedAt = now;
+      collectedAt = Math.max(collectedAt, now);
       allRows.push(...rows.map((r) => ({ ...r, ...base })));
 
       // 余额单独查：失败不影响用量统计（降级为余额未知）
@@ -918,7 +919,7 @@ export async function getCreditStatistics({ days = 30, refresh = false, variant 
       });
       errors.push({ ...base, error: err?.message || '查询失败' });
     }
-  }
+  }));
 
   const payload = buildProjection({
     allRows,

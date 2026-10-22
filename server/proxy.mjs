@@ -114,7 +114,16 @@ function friendlyNetError(err, proxyUrl, url, hint) {
  * opts.netHint 覆盖排障提示文案（会被剥离，不会传给 fetch）。 */
 export async function proxyFetch(url, opts = {}) {
   const { systemProxy, netHint, ...fetchOpts } = opts;
-  const proxyUrl = await getProxyUrl({ systemProxy });
+  // 国内官方域名（codebuddy.cn）强制直连：它是境内站，直连 100% 可达；
+  // 走系统/环境代理反而是纯故障源——代理软件一关，全部账号「余额暂不可用」
+  // （2026-10-21 用户实测：系统代理 127.0.0.1:15715 残留在注册表，代理已关）。
+  let domestic = false;
+  try {
+    domestic = /(^|\.)codebuddy\.cn$/i.test(new URL(url).hostname);
+  } catch {
+    /* 非法 URL 交给 fetch 自己报错 */
+  }
+  const proxyUrl = domestic ? null : await getProxyUrl({ systemProxy });
   try {
     if (proxyUrl) {
       return await undiciFetch(url, { ...fetchOpts, dispatcher: agentFor(proxyUrl) });

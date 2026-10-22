@@ -132,6 +132,15 @@ process.off('SIGINT', onTerm);
 ok(r3.status === 200 && !proxyHit, '无任何配置时直连目标');
 ok((await getProxyUrl(OPTS)) === null, 'getProxyUrl 无配置时返回 null（直连）');
 
+// 场景 5：自检模型挑选（连通性自检曾盲取 ids[0]="auto" → 上游路由到 hy4-preview，
+// 忙时挂满 60 秒超时或 429 "Model busy"，且每次自检烧 ≈41.8 积分）
+const { pickTestModel, isPseudoModel } = await import('../server/proxy/index.mjs');
+ok(isPseudoModel('auto') && isPseudoModel('default') && !isPseudoModel('hy3'), '伪模型判定：auto/default 是，真实模型不是');
+ok(pickTestModel(['auto', 'hy3', 'hy4-preview']) === 'hy3', '列表含 hy3 时优先免费模型');
+ok(pickTestModel(['auto', 'deepseek-v4.1-flash', 'glm-5.3']) === 'deepseek-v4.1-flash', '无免费模型时取第一个真实模型');
+ok(pickTestModel(['auto', 'default']) === '', '全是伪模型时返回空（路由层报「没有可用模型」）');
+ok(pickTestModel(null) === '' && pickTestModel([]) === '', '空输入返回空不抛错');
+
 target.close();
 proxy.close();
 fs.rmSync(cfgDir, { recursive: true, force: true });

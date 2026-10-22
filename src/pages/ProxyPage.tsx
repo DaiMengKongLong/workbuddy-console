@@ -396,7 +396,9 @@ export default function ProxyPage() {
     setTesting(true);
     setTestResult(null);
     try {
-      const r = await post<ProxyTestResult>('/api/proxy/test', { model: data?.models.ids[0] });
+      // 不传 model：服务端自会挑（跳过 auto/default 伪模型、优先免费 hy3）。
+      // 旧版传 ids[0]="auto" 会被上游路由到不可控的模型，忙时挂 60 秒或 429，还烧积分。
+      const r = await post<ProxyTestResult>('/api/proxy/test', {});
       setTestResult(r);
       toast(r.ok ? 'ok' : 'err', r.ok ? '连通性自检通过' : `自检失败：${r.error || '未知错误'}`);
       await load();
