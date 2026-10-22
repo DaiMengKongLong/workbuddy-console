@@ -286,8 +286,16 @@ async function runPowerShell(args, timeoutMs = 15000) {
 async function listViaPowerShell(names = WORKBUDDY_PROCESS_NAMES) {
   // 不用 Sort-Object StartTime：个别进程取不到 StartTime 时会让整条管道报错，
   // 改为取回全部进程后在 JS 里排序。
+  // 旧写法（2026-10-22 弃用）：
+  //   `Get-Process -Name ${names.join(',')} -ErrorAction SilentlyContinue | ...`
+  // 弃用原因：`-Name` 对**无匹配的进程名**（机器只装了 WorkBuddy 没装 CodeBuddy 时必中）
+  // 会产生一条非终止错误——SilentlyContinue 只抑制显示，错误记录仍进 $Error；
+  // 而 PowerShell -Command 模式只要 $Error 非空，进程退出码就是 1（stdout 里 JSON 明明完整）。
+  // execFile 见到非零退出码直接 reject，PowerShell 主路径被静默降级成 tasklist，
+  // 启动时间丢失 →「配置待重启」判断永久失效。改为枚举后按名过滤：无匹配 = 空结果，不产生错误。
   const ps =
-    `Get-Process -Name ${names.join(',')} -ErrorAction SilentlyContinue | ` +
+    `Get-Process -ErrorAction SilentlyContinue | ` +
+    `Where-Object { $_.ProcessName -in @('${names.join("','")}') } | ` +
     `Select-Object Id,ProcessName,Path,StartTime | ConvertTo-Json -Compress`;
   const stdout = await runPowerShell(['-NoProfile', '-NonInteractive', '-Command', ps], 15000);
   const t = stdout.trim();
