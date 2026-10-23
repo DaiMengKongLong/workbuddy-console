@@ -318,8 +318,15 @@ export function importLocalAccount(variantId = 'cn') {
 
   const auth = doc.auth || {};
   const accessToken = auth.accessToken;
-  // 加密信封形态无法作为可切换凭据保存（没有明文），仍记录但标记为不可切换
-  const plainAccess = typeof accessToken === 'string' ? accessToken : '';
+  const refreshToken = auth.refreshToken;
+  // WorkBuddy 5.6+ 客户端把 token/昵称/手机号加密成信封（{$wbEncrypted, envelope}）存储。
+  // 信封没有明文、不能当凭据调接口，但必须**原样保留**——
+  // 之前直接降级为空串，导致「导入国内版」后卡片显示「无可用凭据」、展示名回退成 UID；
+  // 保留信封至少能标记为「加密凭据」，且切换账号时可以把信封原样写回登录态文件。
+  const plainAccess =
+    typeof accessToken === 'string' ? accessToken : isEnvelope(accessToken) ? accessToken : '';
+  const plainRefresh =
+    typeof refreshToken === 'string' ? refreshToken : isEnvelope(refreshToken) ? refreshToken : '';
 
   const now = Date.now();
   const record = {
@@ -330,7 +337,7 @@ export function importLocalAccount(variantId = 'cn') {
     domain: auth.domain || variant.apiEndpoint,
     variant: variant.id,
     access_token: plainAccess,
-    refresh_token: typeof auth.refreshToken === 'string' ? auth.refreshToken : '',
+    refresh_token: plainRefresh,
     token_type: auth.tokenType || 'Bearer',
     expiresAt: Number(auth.expiresAt) || (Number(auth.expiresIn) ? now + Number(auth.expiresIn) * 1000 : 0),
     refreshExpiresAt: Number(auth.refreshExpiresAt) || 0,
@@ -347,6 +354,29 @@ export function importLocalAccount(variantId = 'cn') {
     record.note = accounts[idx].note;
     record.displayField = accounts[idx].displayField;
     record.createdAt = accounts[idx].createdAt || now;
+    // 登录态文件里取不到明文（信封/缺失）而账号库已有可用凭据时，
+    // 不让空值把已有凭据冲掉——否则扫过码的账号再点一次「导入」就变成「无可用凭据」
+    if (!plainAccess && accounts[idx].access_token) {
+      record.access_token = accounts[idx].access_token;
+    }
+    // 信封会覆盖明文凭据：登录态文件是信封时，账号库里的明文 token 必须保留，
+    // 否则扫码得来的积分查询能力会被一次「导入」毁掉（2026-10-22 反馈）
+    if (isEnvelope(plainAccess) && typeof secretValue(accounts[idx], 'access_token') === 'string') {
+      record.access_token = accounts[idx].access_token;
+      record.expiresAt = accounts[idx].expiresAt;
+      record.refreshExpiresAt = accounts[idx].refreshExpiresAt;
+    }
+    if (!plainRefresh && accounts[idx].refresh_token) {
+      record.refresh_token = accounts[idx].refresh_token;
+    }
+    // refresh_token 同理：信封不覆盖明文
+    if (isEnvelope(plainRefresh) && typeof secretValue(accounts[idx], 'refresh_token') === 'string') {
+      record.refresh_token = accounts[idx].refresh_token;
+    }
+    // nickname 同理：登录态文件里加密了，但账号库里有明文昵称时保留
+    if (!record.nickname && accounts[idx].nickname && !isEnvelope(accounts[idx].nickname)) {
+      record.nickname = accounts[idx].nickname;
+    }
     accounts[idx] = { ...accounts[idx], ...record };
   } else {
     accounts.push(record);

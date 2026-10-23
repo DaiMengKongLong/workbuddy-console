@@ -512,7 +512,9 @@ function AccountCard({
                   ? `共 ${fmtCredits(balance.total)}，已用 ${fmtCredits(balance.used)}`
                   : account.hasPlainToken
                     ? '余额查询失败'
-                    : '该账号无可用凭据，无法查询余额'
+                    : account.hasEnvelope
+                      ? '客户端加密信封凭据，无法查询余额'
+                      : '该账号无可用凭据，无法查询余额'
             }
           >
             {balanceLoading ? <Spinner className="w-3.5 h-3.5" /> : <IconClock className="w-3.5 h-3.5 shrink-0" />}
@@ -544,7 +546,15 @@ function AccountCard({
             </>
           ) : !balance ? (
             <>
-              <StatusPackageRow text={account.hasPlainToken ? '余额暂不可用' : '无可用凭据，无法查询余额'} />
+              <StatusPackageRow
+              text={
+                account.hasPlainToken
+                  ? '余额暂不可用'
+                  : account.hasEnvelope
+                    ? '加密信封凭据，无法查询余额'
+                    : '无可用凭据，无法查询余额'
+              }
+            />
               <CreditPackageRow />
             </>
           ) : pkgTotal === 0 ? (
@@ -563,9 +573,15 @@ function AccountCard({
           variant={isCurrent ? 'subtle' : 'primary'}
           size="sm"
           className="h-7 rounded-full px-2.5 pr-3.5 text-xs"
-          disabled={isCurrent || busy || !account.hasPlainToken}
+          disabled={isCurrent || busy || (!account.hasPlainToken && !account.hasEnvelope)}
           onClick={onSwitch}
-          title={account.hasPlainToken ? '把 WorkBuddy 的登录态切换到这个账号' : '该账号没有可用的明文凭据，无法切换'}
+          title={
+            account.hasPlainToken
+              ? '把 WorkBuddy 的登录态切换到这个账号'
+              : account.hasEnvelope
+                ? '该账号只有客户端加密信封凭据：切换会把信封原样写回登录态，需由 WorkBuddy 客户端解密使用'
+                : '该账号没有可用的明文凭据，无法切换'
+          }
         >
           {isCurrent ? <IconCheck className="w-3.5 h-3.5" /> : <IconSwitch className="w-3.5 h-3.5" />}
           {isCurrent ? '使用中' : '切换账号'}
