@@ -23,6 +23,8 @@ jobs:
           - os: macos-latest
             platform: mac
     runs-on: ${{ matrix.os }}
+    # mac 构建在没有签名证书的环境里可能失败；不能让它拖垮 Windows 产物与 Release 发布
+    continue-on-error: ${{ matrix.platform == 'mac' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
