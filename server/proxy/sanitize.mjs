@@ -82,6 +82,18 @@ const BRAND_RULES = [
  */
 const TEMPLATE_RULES = [
   [/Main branch \(you will usually use this for PRs\)/g, 'Main branch'],
+  /**
+   * DeepSeek Harness 身份句（2026-10-24，社区方案 + 本机实捕双重确认）。
+   *
+   * 实捕原文（`~/.wb-switch/proxy-11128-samples.jsonl`，6 次重试全部命中）：
+   *   "You are an AI agent powered by **DeepSeek Harness**."
+   *   "You are interacting with the user through the **DeepSeek Harness** Web GUI ..."
+   * 上游把「DeepSeek Harness」这个连续串认成未授权客户端 → 11128。
+   *
+   * 处置：在 "DeepSeek" 后插一个**零宽空格**（U+200B）——逐字匹配被打断，
+   * 视觉与语义完全不变（模型照常读成 DeepSeek Harness），且比删词安全。
+   */
+  [/DeepSeek([\s-]+)Harness/gi, 'DeepSeek\u200B$1Harness'],
 ];
 
 /** 抹掉竞品系统提示词的固定模板句（只做已验证的逐字替换） */
