@@ -105,10 +105,49 @@ export function neutralizeAgentFingerprint(text) {
   return out;
 }
 
-/** system 级文本的完整净化：先去内部元数据行，再抹竞品指纹（品牌词 + 模板句） */
+/** system 级文本的完整净化：先去内部元数据行，再抹竞品指纹（品牌词 + 模板句），最后断行防指纹 */
 export function sanitizeSystemText(text) {
   if (typeof text !== 'string' || !text) return text;
-  return neutralizeInjectedTemplates(neutralizeAgentFingerprint(stripInternalHeaders(text)));
+  return breakLongFingerprint(neutralizeInjectedTemplates(neutralizeAgentFingerprint(stripInternalHeaders(text))));
+}
+
+/**
+ * 通用防指纹：长 system 文本按句断行。
+ *
+ * 11128 的判据是「**一段连续逐字文本**命中竞品系统提示词库」（2026-10-13 回放实验结论，
+ * 见文件头）。该实验同时验证：在句间插入一个换行即可打断匹配、全部放行——所以对
+ * 「不在已知规则表里」的新 harness（如 DeepSeek harness），通用解法就是断行，不需要
+ * 逐个猜品牌词。
+ *
+ * 边界（避免破坏语义/代码）：
+ *   - 只处理 ≥2KB 的长文本（用户自己写的短 system 一律不动）
+ *   - 中文句末标点（。！？；）后直接断行
+ *   - 英文 `.` 只在后接大写字母/中文时断行（"e.g. foo"、"v1.2.3" 这类不会被拆）
+ *   - 代码围栏（```）内部整段不动
+ */
+export function breakLongFingerprint(text) {
+  const s = String(text ?? '');
+  if (s.length < 2048) return s;
+  const lines = s.split('\n');
+  let inFence = false;
+  const out = [];
+  for (const line of lines) {
+    if (/^\s*```/.test(line)) {
+      inFence = !inFence;
+      out.push(line);
+      continue;
+    }
+    if (inFence) {
+      out.push(line);
+      continue;
+    }
+    // 中文句末标点后断行
+    let next = line.replace(/([。！？；])\s*/g, '$1\n');
+    // 英文句点：后接大写字母或中文才断（排除缩写、版本号、文件名）
+    next = next.replace(/\.\s+(?=[A-Z\u4e00-\u9fff])/g, '.\n');
+    out.push(next);
+  }
+  return out.join('\n');
 }
 
 /**

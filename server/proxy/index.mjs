@@ -19,8 +19,9 @@
 import { Readable } from 'node:stream';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import path from 'node:path';
 import { loadConfig, saveConfig, DEFAULT_PROXY } from '../store/config.mjs';
-import { loadAccounts, accountMeta, secretValue } from '../workbuddy/accounts.mjs';
+import { loadAccounts, accountMeta, secretValue, STORE_DIR } from '../workbuddy/accounts.mjs';
 import { variantOf, VARIANT_LIST, authFilePath } from '../workbuddy/variant.mjs';
 import { getAccountBalances } from '../workbuddy/credits.mjs';
 import { chatComplete, refreshAccessToken, fetchUpstreamModels, openUpstreamStream } from './wb.mjs';
@@ -142,6 +143,33 @@ export function currentLoginUids() {
 function log(entry) {
   state.logs.unshift(entry);
   if (state.logs.length > LOG_LIMIT) state.logs.length = LOG_LIMIT;
+}
+
+/**
+ * 11128 现场捕获：被风控拒绝时把 system 原文（截断 6KB）追加到
+ * `<存储根>/proxy-11128-samples.jsonl`。
+ *
+ * 上游判据是「连续逐字文本命中竞品系统提示词库」（见 sanitize.mjs 文件头），
+ * 没有原文就只能凭猜加规则——这个文件就是下次精准加一条规则的依据。
+ * 只记 system 级文本（不含用户消息），失败不影响响应。
+ */
+function capture11128(kind, body, errors) {
+  try {
+    const hit = (errors || []).some((e) => /11128|Illegal API invocation/i.test(String(e)));
+    if (!hit) return;
+    const sys = (body?.messages || [])
+      .filter((m) => m && (m.role === 'system' || m.role === 'developer'))
+      .map((m) => (typeof m.content === 'string' ? m.content : JSON.stringify(m.content)))
+      .join('\n---\n');
+    if (!sys) return;
+    fs.appendFileSync(
+      path.join(STORE_DIR, 'proxy-11128-samples.jsonl'),
+      JSON.stringify({ at: Date.now(), kind, model: body?.model || null, chars: sys.length, head: sys.slice(0, 6000) }) + '\n',
+      'utf8'
+    );
+  } catch {
+    /* 捕获失败不影响响应 */
+  }
 }
 
 /**
@@ -517,6 +545,7 @@ async function handleChat(req, res) {
   summarizeLog();
   state.stats.failed += 1;
   res.locals.proxyLogged = true;
+  capture11128('chat', body, errors);
   log({
     at: Date.now(),
     ok: false,
@@ -744,6 +773,7 @@ async function handleMessages(req, res) {
 
   if (!result.ok && !res.headersSent) {
     markFailed(res, { started, model: upstream.model, stream: isStream, errors: result.errors, req });
+    capture11128('anthropic', upstream, result.errors);
     return anthropicError(res, 502, `所有账号都请求失败：${briefErrors(result.errors, 3)}`);
   }
 }
@@ -821,6 +851,7 @@ async function handleResponses(req, res) {
 
   if (!result.ok && !res.headersSent) {
     markFailed(res, { started, model: upstream.model, stream: isStream, errors: result.errors, req });
+    capture11128('responses', upstream, result.errors);
     return responsesError(res, 502, `所有账号都请求失败：${briefErrors(result.errors, 3)}`);
   }
 }
@@ -914,6 +945,7 @@ async function handleGemini(req, res) {
 
   if (!result.ok && !res.headersSent) {
     markFailed(res, { started, model: upstream.model, stream: isStream, errors: result.errors, req });
+    capture11128('gemini', upstream, result.errors);
     return geminiError(res, 502, `所有账号都请求失败：${briefErrors(result.errors, 3)}`);
   }
 }
