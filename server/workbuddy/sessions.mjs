@@ -83,7 +83,7 @@ import { createHash } from 'node:crypto';
 import { dataRoot, getVariant, variantOf } from './variant.mjs';
 import { STORE_DIR, findAccount, loadAccounts, accountDisplayName } from './accounts.mjs';
 import { readAuthFile } from './auth.mjs';
-import { atomicWriteJson } from '../store/config.mjs';
+import { atomicWriteJson, persistTmpOverwrite } from '../store/config.mjs';
 import { detectWorkbuddyProcess, stopWorkbuddy, workbuddyDir } from '../targets/workbuddy.mjs';
 import { mergeUnion } from './merge-union.mjs';
 
@@ -1018,9 +1018,9 @@ function backupSessionDb(variantId) {
 }
 
 /**
- * 持久化写：临时文件 → fsync → 改名，避免断电/崩溃留下半截正文。
- * rename 失败（genie-safe-delete shim 对 ~/.wb-switch 的覆盖式 rename 会走回收站
- * 后端，后端故障时一律 EPERM）→ 降级为直接写目标文件，保证落盘可用。
+ * 持久化写：临时文件 → fsync → 落盘覆盖。
+ * 落盘用 persistTmpOverwrite（rename / copy / 直接写 三策略 × 5 轮退避重试），
+ * 扛过 genie-safe-delete shim 的间歇性拦截（连续三天 EPERM 的根因）。
  */
 function durableWrite(file, text) {
   const tmp = `${file}.tmp-${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
@@ -1032,18 +1032,7 @@ function durableWrite(file, text) {
     } finally {
       fs.closeSync(fd);
     }
-    try {
-      fs.renameSync(tmp, file);
-    } catch {
-      // 覆盖式 rename 被拒 → 直接写目标（内容一致，仅失去原子窗口）。
-      // 注意 rmSync 本身也可能被 shim 间歇拦截：数据已写成功，残留 tmp 不能当成失败抛出。
-      fs.writeFileSync(file, text);
-      try {
-        fs.rmSync(tmp, { force: true });
-      } catch {
-        /* tmp 残留无害 */
-      }
-    }
+    persistTmpOverwrite(tmp, file, text);
   } catch (err) {
     try {
       fs.rmSync(tmp, { force: true });

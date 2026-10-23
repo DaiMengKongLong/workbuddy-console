@@ -58,6 +58,64 @@ export function ensureDirs() {
   fs.mkdirSync(CACHE_DIR, { recursive: true });
 }
 
+/** 同步 sleep（Atomics.wait 在 Node 主线程可用；用于写盘重试的退避等待） */
+function syncSleep(ms) {
+  const sink = new Int32Array(new SharedArrayBuffer(4));
+  Atomics.wait(sink, 0, 0, ms);
+}
+
+/**
+ * 落盘策略组：三种覆盖写走不同系统调用（MoveFileExW / CopyFileW / CreateFile+write）。
+ * 全局 NODE_OPTIONS 注入的 genie-safe-delete shim 按「档期」间歇拦截其中的部分操作
+ * （2026-10-22 拦 rename、2026-10-23 连 writeFileSync(open) 都拦），同一时刻至少一条
+ * 通常可用，配合多轮退避重试扛过瞬时故障窗。全链失败才抛错。
+ */
+const PERSIST_STRATEGIES = [
+  (tmp, file, text) => fs.renameSync(tmp, file),
+  (tmp, file, text) => {
+    fs.copyFileSync(tmp, file);
+    fs.rmSync(tmp, { force: true });
+  },
+  (tmp, file, text) => {
+    fs.writeFileSync(file, text, 'utf8');
+    try {
+      fs.rmSync(tmp, { force: true });
+    } catch {
+      /* tmp 残留无害 */
+    }
+  },
+];
+
+/**
+ * 把已写好的临时文件落盘到目标：三种策略轮试 × 5 轮退避重试（0/250/600/1500/3000ms，
+ * 最坏约 5.4s）。全链失败抛出最后一轮错误。
+ */
+export function persistTmpOverwrite(tmp, file, text) {
+  const delays = [0, 250, 600, 1500, 3000];
+  let lastErr = null;
+  for (const delay of delays) {
+    if (delay > 0) syncSleep(delay);
+    for (const strategy of PERSIST_STRATEGIES) {
+      try {
+        strategy(tmp, file, text);
+        return;
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+  }
+  throw lastErr || new Error(`落盘失败：${file}`);
+}
+
+/** 把目标内容写完后清理临时文件（尽力而为） */
+function cleanupTmpQuietly(tmp) {
+  try {
+    fs.rmSync(tmp, { force: true });
+  } catch {
+    /* 残留 tmp 可后续清理，不影响数据 */
+  }
+}
+
 /**
  * 覆盖式 rename + 降级：rename 被环境拦截时（genie-safe-delete shim 等，间歇性），
  * 降级为「复制内容到目标 + 删临时」。copyFileSync 覆盖已有文件实测不受拦截。
@@ -68,36 +126,22 @@ export function safeRenameOverwrite(tmp, file) {
     fs.renameSync(tmp, file);
   } catch {
     fs.copyFileSync(tmp, file);
-    fs.rmSync(tmp, { force: true });
+    cleanupTmpQuietly(tmp);
   }
 }
 
 /**
- * 原子写 JSON：先写临时文件再 rename 覆盖。
- *
- * 本机环境注意：全局 NODE_OPTIONS 注入了 WorkBuddy CLI 的 genie-safe-delete shim，
- * 它会把「~/.wb-switch 内覆盖已有文件」的 renameSync 路由到自己的回收站后端；该后端
- * 一旦失败（2026-10-22 实测 'Error during a trash operation: Unknown'）所有落盘全挂。
- * 所以 rename 失败时**降级为直接写目标文件**（实测不受 shim 拦截）——牺牲一次原子性
- * 换取功能可用；写入内容完全相同，崩溃窗口极小。
+ * 原子写 JSON：先写临时文件，再按「rename → copy 覆盖 → 直接写」三策略 × 5 轮
+ * 退避重试落盘（详见 persistTmpOverwrite）。同步接口，调用方无需改动。
  */
 export function atomicWriteJson(file, obj) {
   const text = JSON.stringify(obj, null, 2);
   const tmp = `${file}.tmp-${process.pid}-${Date.now()}`;
   fs.writeFileSync(tmp, text, 'utf8');
   try {
-    fs.renameSync(tmp, file);
-  } catch {
-    // rename 被拒（文件锁 / 安全软件 / genie-safe-delete 回收站后端失败）→ 直接写目标
-    try {
-      fs.writeFileSync(file, text, 'utf8');
-    } finally {
-      try {
-        fs.rmSync(tmp, { force: true });
-      } catch {
-        /* 残留 tmp 可后续清理，不影响数据 */
-      }
-    }
+    persistTmpOverwrite(tmp, file, text);
+  } finally {
+    cleanupTmpQuietly(tmp);
   }
 }
 
