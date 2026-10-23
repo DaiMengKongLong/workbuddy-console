@@ -269,14 +269,17 @@ export async function checkinAccount(accountId, { withGrowth = true } = {}) {
  * - skipGrowthIfDoneToday：今天已跑过成长中心的账号跳过（自动巡检用，手动领取不设这道闸）。
  * 返回 { results, summary }
  */
-export async function checkinAll({ onlyPending = false, withGrowth = true, skipGrowthIfDoneToday = false } = {}) {
+export async function checkinAll({ onlyPending = false, withGrowth = true, skipGrowthIfDoneToday = false, staggerMs = 0 } = {}) {
   const accounts = loadAccounts().filter((a) => variantOf(a).id === 'cn');
   const results = [];
-  const CONCURRENCY = 3;
+  // staggerMs > 0：防风控模式——单并发顺序签到，账号间间隔 staggerMs（官方对短窗口内
+  // 多账号同 IP 操作会判定批量营销号踢下线）。= 0：保持原 3 并发（用户手动触发场景）。
+  const CONCURRENCY = staggerMs > 0 ? 1 : 3;
   let cursor = 0;
 
   async function worker() {
     while (cursor < accounts.length) {
+      if (staggerMs > 0 && cursor > 0) await new Promise((r) => setTimeout(r, staggerMs));
       const account = accounts[cursor++];
       try {
         if (onlyPending) {

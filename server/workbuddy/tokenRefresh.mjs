@@ -380,12 +380,16 @@ export async function refreshAccounts({ accountIds = null, force = false, delayM
   const results = [];
   for (const account of targets) {
     const plan = refreshPlanFor(account, { force, currentUid });
+    /** 本账号是否真的调过官方接口（验活/刷新）——没有调用的账号不占用账号间隔，
+     *  避免「跳过类账号也各等几分钟」把巡检拖得毫无意义 */
+    let didCallApi = false;
 
     // 1) 验活（加密信封账号没有明文凭据，发不出带鉴权的请求，只能跳过）
     let verify = null;
     if (!skipVerify && plain(account, 'access_token')) {
       try {
         verify = await verifyAccount(account);
+        didCallApi = true;
       } catch {
         verify = null;
       }
@@ -436,6 +440,7 @@ export async function refreshAccounts({ accountIds = null, force = false, delayM
     const before = { accessHours: plan.accessHours, refreshHours: plan.refreshHours };
     try {
       await refreshAccessToken(account);
+      didCallApi = true;
       // 重新读盘拿刷新后的有效期（refreshAccessToken 已原子写回）
       const after = loadAccounts().find((a) => a?.id === account.id || a?.uid === account.uid) || account;
       const next = refreshPlanFor(after, { now: Date.now(), currentUid });
@@ -482,7 +487,9 @@ export async function refreshAccounts({ accountIds = null, force = false, delayM
         },
       ]);
     }
-    if (delayMs > 0) await sleep(delayMs);
+    // 防风控：账号间隔只在「本账号真的调过官方接口」后才等待（delayMs 由调用方传入，
+    // 巡检场景传分钟级间隔；手动批量保持 400ms 不变）
+    if (delayMs > 0 && didCallApi) await sleep(delayMs);
   }
 
   const summary = {

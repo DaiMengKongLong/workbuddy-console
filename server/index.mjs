@@ -1377,12 +1377,19 @@ app.post(
   })
 );
 
+/**
+ * 巡检防风控：账号间隔。官方对「短窗口内多账号同 IP 操作」会判定批量营销号踢下线
+ * （2026-10-23 用户实测凭据被批量失效），巡检类自动化一律顺序执行、账号间隔分钟级；
+ * 手动单账号操作不受影响。跳过类账号（无调用）不占间隔。
+ */
+const PATROL_ACCOUNT_STAGGER_MS = 3 * 60_000;
+
 async function runTokenRefreshPatrol({ silent = false } = {}) {
   if (tokenRefreshBusy) return null;
   if (!loadConfig().settings.autoRefreshToken) return null;
   tokenRefreshBusy = true;
   try {
-    const { results, summary } = await refreshAccounts();
+    const { results, summary } = await refreshAccounts({ delayMs: PATROL_ACCOUNT_STAGGER_MS });
     // 平时（没有临期账号）完全静默：这类巡检不该在日志里刷存在感
     if (summary.refreshed || summary.failed || (!silent && summary.dead)) {
       console.log(
@@ -1472,7 +1479,12 @@ async function runCheckinPatrol({ ignoreQuietHours = false } = {}) {
   try {
     // 两道门禁：签到 + 成长中心（签到早满了也不影响成长中心的旅行/任务/补登/兑换/盲盒）
     if ((await allCheckedInToday()) && allGrowthDoneToday()) return;
-    const { summary, results } = await checkinAll({ onlyPending: true, skipGrowthIfDoneToday: true });
+    // 签到同样防风控：单并发顺序执行，账号间间隔 3 分钟（手动批量签到不传，保持原并发）
+    const { summary, results } = await checkinAll({
+      onlyPending: true,
+      skipGrowthIfDoneToday: true,
+      staggerMs: PATROL_ACCOUNT_STAGGER_MS,
+    });
     const failed = results.filter((r) => r.action === 'failed');
     console.log(
       `[checkin] 自动巡检完成：签到 ${summary.checked}、已签到 ${summary.already}、失败 ${summary.failed}` +
