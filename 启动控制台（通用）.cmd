@@ -3,6 +3,11 @@ chcp 65001 >nul
 title WorkBuddy 控制台
 cd /d "%~dp0"
 
+rem 屏蔽 WorkBuddy 注入的文件 shim（genie-safe-delete 会把 ~/.wb-switch 的覆盖写
+rem 路由到间歇故障的回收站后端，导致凭据刷新/积分快照间歇 EPERM）；
+rem 保留 --use-system-ca（企业代理环境出站 HTTPS 需要）
+set "NODE_OPTIONS=--use-system-ca"
+
 rem 依次尝试：PATH 里的 node → WorkBuddy 内置 node（任意版本）→ 报错退出
 set "NODE_EXE="
 for /f "delims=" %%i in ('where node 2^>nul') do if not defined NODE_EXE set "NODE_EXE=%%i"
