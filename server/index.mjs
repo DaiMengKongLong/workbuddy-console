@@ -1123,28 +1123,32 @@ app.get(
   '/api/accounts/daily-status',
   wrap(async (req, res) => {
     const force = req.query?.refresh === '1';
-    if (!force && dailyStatusCache.data && Date.now() - dailyStatusCache.at < 5 * 60 * 1000) {
+    // 缓存 10 分钟：这是纯展示用的状态小标，没必要 5 分钟一刷官方接口
+    if (!force && dailyStatusCache.data && Date.now() - dailyStatusCache.at < 10 * 60 * 1000) {
       res.json(dailyStatusCache.data);
       return;
     }
     const list = loadAccounts().filter((a) => a?.uid && hasPlainToken(a));
-    const entries = await Promise.all(
-      list.map(async (a) => {
-        const [c, tr] = await Promise.all([fetchCheckinStatus(a).catch(() => null), fetchTravelStatus(a).catch(() => null)]);
-        return [
-          String(a.id || a.uid),
-          {
-            checkedIn: !!c?.todayCheckedIn,
-            traveled: !!tr?.traveled,
-            travelState: tr?.state || null,
-            travelDailyLimit: !!tr?.dailyLimit,
-            travelReward: Number(tr?.reward || 0),
-            checkinError: c && c.ok === false ? String(c.error || '查询失败') : null,
-            travelError: tr && tr.ok === false ? String(tr.error || '查询失败') : null,
-          },
-        ];
-      })
-    );
+    // 防风控：原来 N 账号 × 2 接口全部 Promise.all 并发（同 IP 一波 6+ 请求，典型批量指纹），
+    // 改成逐账号串行、账号间隔 400ms；接口总数少（2/账号），串行代价可接受
+    const entries = [];
+    for (const a of list) {
+      if (entries.length > 0) await new Promise((r) => setTimeout(r, 400));
+      const c = await fetchCheckinStatus(a).catch(() => null);
+      const tr = await fetchTravelStatus(a).catch(() => null);
+      entries.push([
+        String(a.id || a.uid),
+        {
+          checkedIn: !!c?.todayCheckedIn,
+          traveled: !!tr?.traveled,
+          travelState: tr?.state || null,
+          travelDailyLimit: !!tr?.dailyLimit,
+          travelReward: Number(tr?.reward || 0),
+          checkinError: c && c.ok === false ? String(c.error || '查询失败') : null,
+          travelError: tr && tr.ok === false ? String(tr.error || '查询失败') : null,
+        },
+      ]);
+    }
     const data = { accounts: Object.fromEntries(entries), at: Date.now() };
     dailyStatusCache = { at: Date.now(), data };
     res.json(data);

@@ -17,6 +17,7 @@ import {
   useToast,
 } from '../components/ui';
 import { del, get, post } from '../lib/api';
+import { onSettingsChanged } from '../lib/appSettings';
 import type { KeyInfo, KeysResponse, PlatformInfo, SettingsInfo } from '../lib/types';
 import { fmtDate, fmtRelative, showsMask } from '../lib/format';
 
@@ -67,18 +68,36 @@ export default function PlatformKeysPanel({ active = true }: { active?: boolean 
       .catch(() => {});
   }, []);
 
-  useEffect(() => {
+  const loadPlatforms = useCallback(() => {
     get<{ platforms: PlatformInfo[] }>('/api/platforms')
       .then((r) => setPlatforms(r.platforms || []))
       .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    loadPlatforms();
     loadKeys();
     loadSettings();
-  }, [loadKeys, loadSettings]);
+  }, [loadPlatforms, loadKeys, loadSettings]);
 
-  // 页签激活时刷新：在平台页切换回来能看到最新 Key 状态
+  // 页签激活时刷新：切回来要看到最新 Key 状态**和最新的平台可选状态**
+  // （此前这里只刷 Key，平台列表是挂载时的快照——设置里打开「显示全部平台」后
+  //   API Keys 的下拉框依旧是置灰的，必须 F5 才恢复）
   useEffect(() => {
-    if (active) loadKeys();
-  }, [active, loadKeys]);
+    if (active) {
+      loadKeys();
+      loadPlatforms();
+    }
+  }, [active, loadKeys, loadPlatforms]);
+
+  // 设置页保存「显示全部平台」后广播一次：本页下拉框立刻放开，无需刷新页面
+  useEffect(
+    () =>
+      onSettingsChanged((patch) => {
+        if (patch.unlockAllPlatforms !== undefined) loadPlatforms();
+      }),
+    [loadPlatforms]
+  );
 
   const addKey = async () => {
     const key = newKey.trim();

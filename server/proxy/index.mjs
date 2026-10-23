@@ -439,6 +439,15 @@ async function handleChat(req, res) {
   } catch (err) {
     return res.status(400).json({ error: err.message });
   }
+  // 客户端默认模型名（deepseek-chat / gpt-5 / claude-* 等）→ 清单内真实模型，
+  // 避免上游 11102「模型不可用」直接拒绝（harness 不认账，用户只能改配置）
+  {
+    const aliased = applyModelAlias(body.model);
+    if (aliased !== body.model) {
+      console.log(`[proxy] 模型别名：${body.model} → ${aliased}（客户端未使用清单内模型名）`);
+      body.model = aliased;
+    }
+  }
 
   const pool = orderPool(poolAccounts(), String(body.model));
   if (!pool.length) {
@@ -682,6 +691,14 @@ async function handleMessages(req, res) {
   }
   if (!upstream.messages?.length) return anthropicError(res, 400, '缺少 messages');
   if (!upstream.model) return anthropicError(res, 400, '缺少 model');
+  // Claude Code / ZCode 默认发 claude-* 模型名 → 映射成清单内真实模型，避免上游 11102
+  {
+    const aliased = applyModelAlias(upstream.model);
+    if (aliased !== upstream.model) {
+      console.log(`[proxy] 模型别名：${upstream.model} → ${aliased}（客户端未使用清单内模型名）`);
+      upstream.model = aliased;
+    }
+  }
 
   // 按 Anthropic 规范：只有显式 stream:true 才流式，否则返回完整 message
   const isStream = req.body?.stream === true;
@@ -751,6 +768,14 @@ async function handleResponses(req, res) {
   const upstream = responsesToOpenAi(req.body || {});
   if (!upstream.messages?.length) return responsesError(res, 400, '缺少 input');
   if (!upstream.model) return responsesError(res, 400, '缺少 model');
+  // 客户端默认模型名（gpt-5.x 等）→ 清单内真实模型，避免上游 11102 直接拒绝
+  {
+    const aliased = applyModelAlias(upstream.model);
+    if (aliased !== upstream.model) {
+      console.log(`[proxy] 模型别名：${upstream.model} → ${aliased}（客户端未使用清单内模型名）`);
+      upstream.model = aliased;
+    }
+  }
 
   // 按 Responses 规范：只有显式 stream:true 才流式
   const isStream = req.body?.stream === true;
@@ -1005,6 +1030,52 @@ const PSEUDO_MODELS = new Set(['auto', 'default']);
 
 export function isPseudoModel(model) {
   return PSEUDO_MODELS.has(String(model || '').trim());
+}
+
+/**
+ * harness 常见模型名 → 本清单内真实模型。
+ *
+ * 「反代经常被拒绝」最主要的来源：客户端带着自己的默认模型名（DeepSeek harness 的
+ * deepseek-chat / deepseek-reasoner、Claude Code 的 claude-sonnet-*、Codex/SDK 的
+ * gpt-5.x）发请求，反代原样转发 → 上游 11102「模型不可用」直接拒绝。
+ * 这里做别名兼容：命中就静默替换成清单内等价模型，用户不用改 harness 配置。
+ */
+const MODEL_ALIASES = new Map([
+  // DeepSeek harness / OpenAI 兼容客户端
+  ['deepseek-chat', 'deepseek-v4.1-flash'],
+  ['deepseek-reasoner', 'deepseek-v4-pro'],
+  ['deepseek-coder', 'deepseek-v4-pro'],
+  ['deepseek-v3', 'deepseek-v3-2-volc'],
+  ['deepseek-v3.2', 'deepseek-v3-2-volc'],
+  ['deepseek-v2.5', 'deepseek-v4.1-flash'],
+  // OpenAI 风格客户端（Codex CLI / 通用 SDK）
+  ['gpt-4o', 'hy3'],
+  ['gpt-4o-mini', 'hy3'],
+  ['gpt-4.1', 'hy3'],
+  ['gpt-4', 'hy3'],
+  ['gpt-5', 'hy4-preview'],
+  ['gpt-5.1', 'hy4-preview'],
+  ['o3', 'hy4-preview'],
+  ['o4-mini', 'hy3'],
+  // Anthropic 风格客户端（Claude Code / ZCode 等）
+  ['claude-sonnet-4-5', 'glm-5.3'],
+  ['claude-sonnet-4-20250514', 'glm-5.3'],
+  ['claude-3-5-sonnet', 'glm-5.3'],
+  ['claude-3-7-sonnet', 'glm-5.3'],
+  ['claude-opus-4-1', 'glm-5.3'],
+  ['claude-haiku-3-5', 'glm-5.3-flash'],
+]);
+
+/**
+ * 把客户端请求的模型名换成上游能认的 id（纯函数，供测试）。
+ * 命中别名返回真实模型；否则原样返回（含清单内真实模型与伪模型）——是否拒绝未知
+ * 模型仍交给上游判断，避免本地模型清单未加载时误拒合法模型。
+ */
+export function applyModelAlias(model) {
+  const raw = String(model || '').trim();
+  if (!raw) return raw;
+  const hit = MODEL_ALIASES.get(raw.toLowerCase());
+  return hit || raw;
 }
 
 /**
