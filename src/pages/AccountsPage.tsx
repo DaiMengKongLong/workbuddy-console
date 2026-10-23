@@ -196,7 +196,14 @@ function ModelIcon({ model, className, mono = false }: { model: string; classNam
  * 鼠标悬停显示「何时恢复」。数据来自会话日志里的官方 429 报错。
  */
 function ModelLimitBadges({ limits }: { limits?: { model: string; resetAt: number }[] }) {
-  if (!limits || !limits.length) return null;
+  // 恢复时间一到就自动消失：每分钟刷新一次当前时间，顺手过滤掉已过期的条目
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 60_000);
+    return () => window.clearInterval(timer);
+  }, []);
+  const live = (limits || []).filter((x) => !x.resetAt || x.resetAt > now);
+  if (!live.length) return null;
   const fmt = (ts: number) => {
     const d = new Date(ts);
     const p = (n: number) => String(n).padStart(2, '0');
@@ -204,7 +211,7 @@ function ModelLimitBadges({ limits }: { limits?: { model: string; resetAt: numbe
   };
   return (
     <span className="inline-flex items-center gap-1.5">
-      {limits.slice(0, 4).map((x) => (
+      {live.slice(0, 4).map((x) => (
         <span
           key={x.model}
           className="inline-flex h-6 items-center justify-center rounded-md bg-rose-50 px-1"

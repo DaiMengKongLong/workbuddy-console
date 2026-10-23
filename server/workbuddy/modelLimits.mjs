@@ -120,8 +120,19 @@ async function probeOne(account, variantId, model) {
   }
 }
 
+/** 缓存里可能残留「恢复时间已过」的条目，返回前统一剔掉 */
+function dropExpired(data) {
+  const now = Date.now();
+  const accs = {};
+  for (const [uid, list] of Object.entries(data?.accounts || {})) {
+    const keep = (Array.isArray(list) ? list : []).filter((x) => x && x.resetAt > now);
+    if (keep.length) accs[uid] = keep;
+  }
+  return { ...data, accounts: accs };
+}
+
 export async function probeAllModelLimits({ refresh = false } = {}) {
-  if (!refresh && cache.data && Date.now() - cache.at < TTL) return { ...cache.data, cached: true };
+  if (!refresh && cache.data && Date.now() - cache.at < TTL) return { ...dropExpired(cache.data), cached: true };
 
   const accs = loadAccounts().filter((a) => a?.uid);
   const out = {};
