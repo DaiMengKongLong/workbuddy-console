@@ -370,7 +370,11 @@ export default function ProxyPage() {
   const rotateKey = async () => {
     setBusy(true);
     try {
-      setData(await post<ProxyStatus>('/api/proxy/key/rotate'));
+      const next = await post<ProxyStatus>('/api/proxy/key/rotate');
+      setData(next);
+      // 关键：plainKey 里可能残留旧 key（用户之前点过「显示」），不覆盖就会一直
+      // 显示旧值，看起来像「重新生成没生效」。服务端现在会带回新明文。
+      setPlainKey(next.apiKey || '');
       toast('ok', '已生成新的 API Key，请同步更新各 agent 的配置');
     } catch (e: any) {
       toast('err', e?.message || '生成失败');

@@ -1190,7 +1190,9 @@ export function registerProxyRoutes(app, { port }) {
       const cfg = loadConfig();
       cfg.proxy = { ...DEFAULT_PROXY, ...cfg.proxy, apiKey: `sk-wb-${crypto.randomBytes(16).toString('hex')}` };
       saveConfig(cfg);
-      res.json(publicStatus(port));
+      // reveal：刚生成的 Key 必须随响应带回明文。否则前端只拿到掩码预览，
+      // 而界面里残留的旧明文（用户点过「显示」）会继续显示 → 看起来"没刷新"。
+      res.json(publicStatus(port, { reveal: true }));
     })
   );
 
