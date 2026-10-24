@@ -87,13 +87,33 @@ const PERSIST_STRATEGIES = [
 ];
 
 /**
- * 把已写好的临时文件落盘到目标：三种策略轮试 × 5 轮退避重试（0/250/600/1500/3000ms，
- * 最坏约 5.4s）。全链失败抛出最后一轮错误。
+ * 把已写好的临时文件落盘到目标：三种策略轮试 × 8 轮退避重试。
+ *
+ * 退避序列 0/250/600/1500/3000/6000/10000/15000 ≈ 最坏 36 秒 —— 本机存在「外部进程
+ * 瞬时锁定/扫描用户目录」的现象（2026-10-24 实测 config.json 的 EPERM 持续超过
+ * 原来的 5.4 秒窗口），用户点一次按钮等几十秒也比直接报错好。
+ * 全链失败才抛最后一轮错误。
  */
-export function persistTmpOverwrite(tmp, file, text) {
-  const delays = [0, 250, 600, 1500, 3000];
+const PERSIST_DELAYS = [0, 250, 600, 1500, 3000, 6000, 10000, 15000];
+
+/** 写临时文件本身也可能被拦（新建文件同样会 EPERM）：单独带重试 */
+function writeTmpWithRetry(tmp, text) {
   let lastErr = null;
-  for (const delay of delays) {
+  for (let i = 0; i < 5; i++) {
+    if (i > 0) syncSleep(200 * i);
+    try {
+      fs.writeFileSync(tmp, text, 'utf8');
+      return;
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr || new Error(`写临时文件失败：${tmp}`);
+}
+
+export function persistTmpOverwrite(tmp, file, text) {
+  let lastErr = null;
+  for (const delay of PERSIST_DELAYS) {
     if (delay > 0) syncSleep(delay);
     for (const strategy of PERSIST_STRATEGIES) {
       try {
@@ -137,7 +157,7 @@ export function safeRenameOverwrite(tmp, file) {
 export function atomicWriteJson(file, obj) {
   const text = JSON.stringify(obj, null, 2);
   const tmp = `${file}.tmp-${process.pid}-${Date.now()}`;
-  fs.writeFileSync(tmp, text, 'utf8');
+  writeTmpWithRetry(tmp, text);
   try {
     persistTmpOverwrite(tmp, file, text);
   } finally {
