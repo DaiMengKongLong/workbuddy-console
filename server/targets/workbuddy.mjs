@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { execFile, execFileSync, spawn } from 'node:child_process';
-import { loadConfig, durableWriteText } from '../store/config.mjs';
+import { loadConfig, durableWriteText, durableWriteTextAsync } from '../store/config.mjs';
 import { matchPlatformUrl } from '../providers/registry.mjs';
 
 /** 检查目录是否具备 WorkBuddy 数据目录的特征文件 */
@@ -111,6 +111,11 @@ function atomicWriteJson(file, obj) {
   durableWriteText(file, JSON.stringify(obj, null, 2));
 }
 
+/** 同上的异步版：跑在请求路径上，同步写撞上 EPERM 锁窗会把整个服务冻住 */
+async function atomicWriteJsonAsync(file, obj) {
+  await durableWriteTextAsync(file, JSON.stringify(obj, null, 2));
+}
+
 function verifyEntries(ids, apiKey) {
   const check = JSON.parse(fs.readFileSync(modelsJsonPath(), 'utf8'));
   if (!Array.isArray(check)) throw new Error('回读校验失败：models.json 不是数组');
@@ -124,7 +129,7 @@ function verifyEntries(ids, apiKey) {
 /**
  * 批量载入模型到 WorkBuddy：备份 -> 按 id 合并（已存在则更新）-> 原子写 -> 回读校验 -> 失败回滚
  */
-export function loadModels(entries) {
+export async function loadModels(entries) {
   if (!entries?.length) throw new Error('没有可载入的模型');
   if (!fs.existsSync(workbuddyDir())) {
     throw new Error(`WorkBuddy 数据目录不存在：${workbuddyDir()}（请先安装并运行一次 WorkBuddy）`);
@@ -148,7 +153,7 @@ export function loadModels(entries) {
     }
   }
   try {
-    atomicWriteJson(modelsJsonPath(), current);
+    await atomicWriteJsonAsync(modelsJsonPath(), current);
     verifyEntries(entries.map((e) => e.id), entries[0]?.apiKey);
     return { added, updated, backup, total: current.length };
   } catch (err) {
@@ -158,7 +163,7 @@ export function loadModels(entries) {
 }
 
 /** 从 models.json 移除本工具载入的条目（任何平台的；用户手动加的其他条目永不触碰） */
-export function removeModels(ids) {
+export async function removeModels(ids) {
   const { entries, invalid } = readModelsJson();
   if (invalid) return { invalid: true, removed: 0 };
   const idSet = new Set(ids);
@@ -166,7 +171,7 @@ export function removeModels(ids) {
   const removed = entries.length - kept.length;
   const backup = backupModelsJson();
   try {
-    atomicWriteJson(modelsJsonPath(), kept);
+    await atomicWriteJsonAsync(modelsJsonPath(), kept);
     return { removed, backup, total: kept.length };
   } catch (err) {
     if (backup && fs.existsSync(backup)) fs.copyFileSync(backup, modelsJsonPath());

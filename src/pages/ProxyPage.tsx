@@ -329,15 +329,28 @@ export default function ProxyPage() {
     void load();
   }, [load]);
 
-  // 开启后每 8 秒轻刷一次状态（统计与日志才会动起来）；关闭时不需要轮询
+  // 开启后每 8 秒轻刷一次状态（统计与日志才会动起来）；关闭时不需要轮询。
+  // 串行 setTimeout：请求超时（25s）大于轮询间隔（8s），setInterval 在服务慢时
+  // 会叠加并发请求，抢光浏览器同源连接
   useEffect(() => {
     if (!data?.enabled) return;
-    const t = setInterval(() => {
+    let stopped = false;
+    let timer: number | undefined;
+    const tick = () => {
       get<ProxyStatus>('/api/proxy/status')
-        .then(setData)
-        .catch(() => {});
-    }, 8000);
-    return () => clearInterval(t);
+        .then((d) => {
+          if (!stopped) setData(d);
+        })
+        .catch(() => {})
+        .finally(() => {
+          if (!stopped) timer = window.setTimeout(tick, 8000);
+        });
+    };
+    timer = window.setTimeout(tick, 8000);
+    return () => {
+      stopped = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
   }, [data?.enabled]);
 
   const toggleEnabled = async (on: boolean) => {
@@ -387,7 +400,7 @@ export default function ProxyPage() {
   const refreshModels = async () => {
     setBusy(true);
     try {
-      await post('/api/proxy/models/refresh');
+      await post('/api/proxy/models/refresh', undefined, { timeoutMs: TIMEOUT.models });
       await load();
       toast('ok', '模型列表已刷新');
     } catch (e: any) {
@@ -403,7 +416,7 @@ export default function ProxyPage() {
     try {
       // 不传 model：服务端自会挑（跳过 auto/default 伪模型、优先免费 hy3）。
       // 旧版传 ids[0]="auto" 会被上游路由到不可控的模型，忙时挂 60 秒或 429，还烧积分。
-      const r = await post<ProxyTestResult>('/api/proxy/test', {});
+      const r = await post<ProxyTestResult>('/api/proxy/test', {}, { timeoutMs: TIMEOUT.quota });
       setTestResult(r);
       toast(r.ok ? 'ok' : 'err', r.ok ? '连通性自检通过' : `自检失败：${r.error || '未知错误'}`);
       await load();

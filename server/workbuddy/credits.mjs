@@ -22,7 +22,7 @@ import {
   OFFICIAL_USAGE_CACHE_FILE,
   readJsonFile,
 } from './accounts.mjs';
-import { atomicWriteJson } from '../store/config.mjs';
+import { atomicWriteJson, atomicWriteJsonAsync } from '../store/config.mjs';
 
 /** 单次查询最多返回条数；超过时靠推进起点反复扫描 */
 const PAGE_SIZE = 3000;
@@ -289,7 +289,7 @@ export function loadSnapshots() {
 }
 
 /** 记录一次余额观察；5 分钟内的重复快照不重复落盘（去重窗口） */
-export function recordSnapshot(account, total, remaining) {
+export async function recordSnapshot(account, total, remaining) {
   const snapshots = loadSnapshots();
   const now = Date.now();
   const last = snapshots
@@ -312,7 +312,8 @@ export function recordSnapshot(account, total, remaining) {
     .filter((s) => num(s?.ts) >= cutoff)
     .sort((a, b) => a.ts - b.ts)
     .slice(-SNAPSHOT_MAX_RECORDS);
-  atomicWriteJson(CREDIT_SNAPSHOTS_FILE, kept);
+  // 异步落盘：余额查询跑在请求路径上，同步写撞上 EPERM 锁窗会把整个服务冻住
+  await atomicWriteJsonAsync(CREDIT_SNAPSHOTS_FILE, kept);
 }
 
 /**
@@ -692,7 +693,7 @@ export async function getAccountBalances({ refresh = false } = {}) {
     };
     try {
       const b = await fetchBalance(account);
-      recordSnapshot(account, b.total, b.remaining);
+      await recordSnapshot(account, b.total, b.remaining);
       rows.push({ ...base, balance: { ...b, updatedAt: now }, balanceError: null, error: null, authInvalid: false });
     } catch (err) {
       // unauthorized = 官方明确拒绝这个 token（过期/被轮换/吊销）。界面据此把
@@ -971,7 +972,7 @@ export async function getCreditStatistics({ days = 30, refresh = false, variant 
       try {
         const b = await fetchBalance(account);
         balance = { ...b, updatedAt: now };
-        recordSnapshot(account, b.total, b.remaining);
+        await recordSnapshot(account, b.total, b.remaining);
       } catch (err) {
         balanceError = err?.message || '余额查询失败';
       }
@@ -1029,7 +1030,7 @@ export async function getCreditStatistics({ days = 30, refresh = false, variant 
   // 只有真的取到数据才覆盖缓存，避免一次网络抖动把好缓存冲掉
   if (collectedAt) {
     try {
-      atomicWriteJson(OFFICIAL_USAGE_CACHE_FILE, { payload });
+      await atomicWriteJsonAsync(OFFICIAL_USAGE_CACHE_FILE, { payload });
     } catch {
       /* 缓存写失败不影响本次返回 */
     }

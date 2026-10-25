@@ -227,7 +227,7 @@ export default function SettingsPage() {
   const runTokenRefresh = async () => {
     setRefreshingTokens(true);
     try {
-      const r = await post<AccountRefreshRunResponse>('/api/accounts/refresh', {});
+      const r = await post<AccountRefreshRunResponse>('/api/accounts/refresh', {}, { timeoutMs: TIMEOUT.quota });
       const { summary } = r;
       const failed = r.results.find((x) => x.action === 'failed');
       const dead = r.results.filter((x) => x.action === 'dead');
@@ -412,11 +412,12 @@ export default function SettingsPage() {
       if (accountId) {
         const r = await post<{ ok: boolean; action: string; message: string; growth?: { report: string } }>(
           '/api/workbuddy/checkin',
-          { accountId }
+          { accountId },
+          { timeoutMs: TIMEOUT.write }
         );
         toast(r.ok ? 'ok' : 'err', r.growth?.report ? `${r.message}；${r.growth.report}` : r.message);
       } else {
-        const r = await post<CheckinAllResult>('/api/workbuddy/checkin', { onlyPending: true });
+        const r = await post<CheckinAllResult>('/api/workbuddy/checkin', { onlyPending: true }, { timeoutMs: TIMEOUT.quota });
         const { summary } = r;
         const parts = [`新签到 ${summary.checked} 个`];
         if (summary.already) parts.push(`已签到 ${summary.already} 个`);
@@ -449,7 +450,7 @@ export default function SettingsPage() {
     if (!ok) return;
     setRestarting(true);
     try {
-      const r = await post<{ restarted: boolean; exePath?: string }>('/api/workbuddy/restart');
+      const r = await post<{ restarted: boolean; exePath?: string }>('/api/workbuddy/restart', undefined, { timeoutMs: TIMEOUT.write });
       toast('ok', `WorkBuddy 已重启${r.exePath ? `（${r.exePath}）` : ''}`);
       setTimeout(loadStatus, 2500);
     } catch (e: any) {
@@ -476,7 +477,12 @@ export default function SettingsPage() {
     if (!ok) return;
     setBackupBusy(b.name);
     try {
-      const r = await post<{ authFilePath: string; safetyBackup: string | null }>('/api/workbuddy/backups/restore', { name: b.name });
+      // 服务端写登录态文件带约 3 分钟重试窗口，前端必须比它更能等
+      const r = await post<{ authFilePath: string; safetyBackup: string | null }>(
+        '/api/workbuddy/backups/restore',
+        { name: b.name },
+        { timeoutMs: TIMEOUT.switch }
+      );
       toast('ok', `已恢复登录态到 ${r.authFilePath}${r.safetyBackup ? '（原文件已另存备份）' : ''}`);
       await loadBackups();
       await loadPerm(true);

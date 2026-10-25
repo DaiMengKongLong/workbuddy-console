@@ -679,7 +679,7 @@ function RenameDialog({
   const save = async () => {
     setSaving(true);
     try {
-      await patch(`/api/accounts/${account.id}`, { note, displayField });
+      await patch(`/api/accounts/${account.id}`, { note, displayField }, { timeoutMs: TIMEOUT.write });
       toast('ok', '已保存');
       onSaved();
       onClose();
@@ -2110,12 +2110,10 @@ export default function AccountsPage() {
   const refreshAll = useCallback(async () => {
     setRefreshingAll(true);
     try {
-      load();
-      void loadBalances(true);
-      void loadLimitStates(true);
+      // 限流徽标/签到状态已有各自的 90s 轮询，这里不再手动逐个刷新
       const r = await post<{
         summary: { checked: number; already: number; skipped: number; failed: number; growthCredits?: number };
-      }>('/api/workbuddy/checkin', { onlyPending: true });
+      }>('/api/workbuddy/checkin', { onlyPending: true }, { timeoutMs: TIMEOUT.quota });
       const s = r.summary;
       const parts: string[] = [];
       if (s.checked) parts.push(`新签到 ${s.checked} 个`);
@@ -2126,6 +2124,8 @@ export default function AccountsPage() {
       toast('err', `刷新完成，但领取失败：${e?.message || '未知错误'}`);
     } finally {
       setRefreshingAll(false);
+      // 开头不再预拉：load/loadBalances 都在收尾拉一次即可，开头那次纯属双倍开销
+      // （loadBalances(true) 是 90 秒超时的官方额度全量扫描，每次刷新双倍打上游）
       load();
       void loadBalances(true);
     }
@@ -2291,10 +2291,14 @@ export default function AccountsPage() {
   const doRefreshToken = async (account: AccountInfo) => {
     setBusyId(account.id);
     try {
-      const r = await post<AccountRefreshRunResponse>('/api/accounts/refresh', {
-        accountId: account.id,
-        force: true,
-      });
+      const r = await post<AccountRefreshRunResponse>(
+        '/api/accounts/refresh',
+        {
+          accountId: account.id,
+          force: true,
+        },
+        { timeoutMs: TIMEOUT.oauth }
+      );
       const row = r.results[0];
       if (row?.ok && row.action === 'refreshed') {
         toast('ok', `「${account.name}」凭据已刷新，有效期已顺延`);
@@ -2361,7 +2365,7 @@ export default function AccountsPage() {
     if (!ok) return;
     setBusyId(account.id);
     try {
-      await del(`/api/accounts/${account.id}`);
+      await del(`/api/accounts/${account.id}`, { timeoutMs: TIMEOUT.write });
       toast('ok', '已删除');
       load();
     } catch (e: any) {
@@ -2374,7 +2378,7 @@ export default function AccountsPage() {
   const doImport = async (v: VariantInfo) => {
     setImporting(v.id);
     try {
-      const acc = await post<AccountInfo>('/api/accounts/import', { variant: v.id });
+      const acc = await post<AccountInfo>('/api/accounts/import', { variant: v.id }, { timeoutMs: TIMEOUT.oauth });
       toast('ok', `已导入「${acc.name}」`);
       load();
       void loadBalances(true);
@@ -2442,8 +2446,15 @@ export default function AccountsPage() {
       }
     };
     load();
+    // 签到/旅行状态会被服务端巡检和「一键领取」随时改变，只在挂载拉一次
+    // 会永远显示旧的「今日未签到」——与限流徽标同款轮询模式（90s + focus 刷新）
+    const timer = window.setInterval(() => void load(), 90_000);
+    const onFocus = () => void load();
+    window.addEventListener('focus', onFocus);
     return () => {
       cancelled = true;
+      window.clearInterval(timer);
+      window.removeEventListener('focus', onFocus);
     };
   }, []);
 

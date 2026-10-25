@@ -23,7 +23,7 @@ import {
   CHECKIN_LOGS_FILE,
   readJsonFile,
 } from './accounts.mjs';
-import { atomicWriteJson } from '../store/config.mjs';
+import { atomicWriteJson, atomicWriteJsonAsync } from '../store/config.mjs';
 
 /** 签到相关接口前缀（国内版专有，与 workbuddy-switch 的 CHECKIN_API_PREFIX 一致） */
 const CHECKIN_BASE = '/v2/billing/meter';
@@ -176,12 +176,13 @@ export function loadCheckinLogs() {
   return Array.isArray(rows) ? rows : [];
 }
 
-function appendCheckinLogs(entries) {
+async function appendCheckinLogs(entries) {
   const rows = loadCheckinLogs();
   const stamped = entries.map((e) => ({ ...e, at: Date.now() }));
   const next = [...rows, ...stamped].slice(-LOG_LIMIT);
   try {
-    atomicWriteJson(CHECKIN_LOGS_FILE, next);
+    // 异步落盘：巡检撞上 EPERM 锁窗时不能把整个服务冻住 36 秒
+    await atomicWriteJsonAsync(CHECKIN_LOGS_FILE, next);
   } catch {
     /* 日志写失败不影响签到结果 */
   }
@@ -238,7 +239,7 @@ export async function checkinAccount(accountId, { withGrowth = true } = {}) {
     const growth = withGrowth ? await growthSafe(account) : null;
     const result = { ok: true, action: 'already', message: '今日已签到', account: accountMeta(account) };
     if (growth) result.growth = growth;
-    appendCheckinLogs([logEntry(account, { ok: true, alreadyCheckedIn: true, message: result.message }, growth)]);
+    await appendCheckinLogs([logEntry(account, { ok: true, alreadyCheckedIn: true, message: result.message }, growth)]);
     return result;
   }
   if (!state.ok && state.unsupported) {
@@ -255,11 +256,11 @@ export async function checkinAccount(accountId, { withGrowth = true } = {}) {
       account: accountMeta(account),
     };
     if (growth) result.growth = growth;
-    appendCheckinLogs([logEntry(account, done, growth)]);
+    await appendCheckinLogs([logEntry(account, done, growth)]);
     return result;
   }
   const reason = done.message || state.error || '签到失败';
-  appendCheckinLogs([logEntry(account, { ok: false, message: reason })]);
+  await appendCheckinLogs([logEntry(account, { ok: false, message: reason })]);
   return { ok: false, action: 'failed', message: reason, account: accountMeta(account) };
 }
 

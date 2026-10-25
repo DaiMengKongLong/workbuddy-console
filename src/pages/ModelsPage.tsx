@@ -155,6 +155,7 @@ export default function ModelsPage({ active = true, onGoKeys }: { active?: boole
   const [loadOpen, setLoadOpen] = useState(false);
   const [loadResult, setLoadResult] = useState<LoadResult | null>(null);
   const [loadLoading, setLoadLoading] = useState(false);
+  const [restarting, setRestarting] = useState(false);
   const [showLoadedPanel, setShowLoadedPanel] = useState(false);
   const [restartPrompt, setRestartPrompt] = useState(false);
   const [bannerDismissedAt, setBannerDismissedAt] = useState<number | null>(null);
@@ -351,7 +352,7 @@ export default function ModelsPage({ active = true, onGoKeys }: { active?: boole
   const doLoad = async () => {
     setLoadLoading(true);
     try {
-      const r = await post<LoadResult>('/api/workbuddy/load', { platform, modelIds: [...selected], keyId: loadKey || undefined });
+      const r = await post<LoadResult>('/api/workbuddy/load', { platform, modelIds: [...selected], keyId: loadKey || undefined }, { timeoutMs: TIMEOUT.write });
       setLoadResult(r);
       setLoadOpen(false);
       setSelected(new Set());
@@ -425,7 +426,7 @@ export default function ModelsPage({ active = true, onGoKeys }: { active?: boole
     });
     if (!ok) return;
     try {
-      const r = await post<{ removed: number; backup: string | null }>('/api/workbuddy/remove', { modelIds: [id] });
+      const r = await post<{ removed: number; backup: string | null }>('/api/workbuddy/remove', { modelIds: [id] }, { timeoutMs: TIMEOUT.write });
       toast('ok', `已移除 ${r.removed} 个模型` + (r.backup ? `，备份：${r.backup.split(/[\\/]/).pop()}` : ''));
       loadSideData();
     } catch (e: any) {
@@ -434,12 +435,16 @@ export default function ModelsPage({ active = true, onGoKeys }: { active?: boole
   };
 
   const doRestart = async () => {
+    if (restarting) return;
+    setRestarting(true);
     try {
-      await post('/api/workbuddy/restart');
+      await post('/api/workbuddy/restart', undefined, { timeoutMs: TIMEOUT.write });
       toast('ok', 'WorkBuddy 已重启，模型配置生效');
       loadSideData();
     } catch (e: any) {
       toast('err', e?.message || '重启失败，请手动重启 WorkBuddy');
+    } finally {
+      setRestarting(false);
     }
   };
 

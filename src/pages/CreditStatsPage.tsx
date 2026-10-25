@@ -286,6 +286,26 @@ export default function CreditStatsPage() {
     );
   }
 
+  // 首次加载失败（data 为空且不在加载中）：之前直接 return null 整页空白，
+  // 只剩一个转瞬即逝的 toast，用户没有任何重试入口
+  if (!data && !loading) {
+    return (
+      <Card className="p-4">
+        <EmptyState
+          icon={<IconWallet />}
+          title="积分统计加载失败"
+          desc="本地服务可能繁忙或官方接口暂时不可用，请稍后重试。"
+          action={
+            <Button variant="primary" onClick={() => load(true)}>
+              <IconRefresh className="w-3.5 h-3.5" />
+              重新加载
+            </Button>
+          }
+        />
+      </Card>
+    );
+  }
+
   // 走到这里 data 一定存在：上面只有「有数据但为空」才提前 return
   if (!data) return null;
 

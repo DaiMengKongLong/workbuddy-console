@@ -83,7 +83,7 @@ import { createHash } from 'node:crypto';
 import { dataRoot, getVariant, variantOf } from './variant.mjs';
 import { STORE_DIR, findAccount, loadAccounts, accountDisplayName } from './accounts.mjs';
 import { readAuthFile } from './auth.mjs';
-import { atomicWriteJson, persistTmpOverwrite } from '../store/config.mjs';
+import { atomicWriteJson, atomicWriteJsonAsync, persistTmpOverwrite } from '../store/config.mjs';
 import { detectWorkbuddyProcess, stopWorkbuddy, workbuddyDir } from '../targets/workbuddy.mjs';
 import { mergeUnion } from './merge-union.mjs';
 
@@ -1045,7 +1045,7 @@ function copyFamilyMap() {
 }
 
 /** 记录复制结果到账本（业务完成之后才落盘：写失败只会让下次重复复制） */
-function recordCopies(variantId, sourceUid, targetUid, pairs) {
+async function recordCopies(variantId, sourceUid, targetUid, pairs) {
   if (!pairs.length) return;
   const ledger = loadCopies();
   const key = pairKey(variantId, sourceUid, targetUid);
@@ -1054,7 +1054,8 @@ function recordCopies(variantId, sourceUid, targetUid, pairs) {
   ledger.pairs[key] = table;
   ledger.version = 1;
   fs.mkdirSync(STORE_DIR, { recursive: true });
-  atomicWriteJson(SESSION_COPIES_FILE, ledger);
+  // 异步落盘：这条路径跑在切号/复制请求里，同步写撞上 EPERM 锁窗会把整个服务冻住
+  await atomicWriteJsonAsync(SESSION_COPIES_FILE, ledger);
 }
 
 /** 会话备份保留期：session-copy / merge / replace 三类目录各自只留最近 N 份（备份无清理会持续吃磁盘） */
@@ -1554,7 +1555,7 @@ export async function copySessions({ targetAccountId, ids, stopApp = false, skip
   // 账本在业务完成之后才落盘：写失败只会让下次重复复制（用户能看到重复会话），
   // 而提前记账会让失败的会话被永久跳过（用户看不到副本还以为成功了）。
   try {
-    recordCopies(variantId, sourceUid, targetUid, ledgerAdds);
+    await recordCopies(variantId, sourceUid, targetUid, ledgerAdds);
   } catch (err) {
     errors.push({ id: '(账本)', error: `复制账本写入失败（下次可能重复复制）：${err?.message || err}` });
   }
@@ -1985,7 +1986,7 @@ export async function syncAllAccounts({ stopApp = false, fillMissing = false, dr
           ledger.pairs[key] = table;
           ledger.version = 1;
           fs.mkdirSync(STORE_DIR, { recursive: true });
-          atomicWriteJson(SESSION_COPIES_FILE, ledger);
+          await atomicWriteJsonAsync(SESSION_COPIES_FILE, ledger);
         }
       } catch (err) {
         report.errors.push({ id: '(账本)', error: `复制账本写入失败：${err?.message || err}` });
@@ -2269,7 +2270,7 @@ export async function dedupeSessions({ dryRun = false } = {}) {
                 if (changed) {
                   ledger.version = 1;
                   fs.mkdirSync(STORE_DIR, { recursive: true });
-                  atomicWriteJson(SESSION_COPIES_FILE, ledger);
+                  await atomicWriteJsonAsync(SESSION_COPIES_FILE, ledger);
                 }
               }
               report.removed.push(...g.removed.map((r) => ({ ...r, account: uid })));
@@ -2525,7 +2526,7 @@ export async function moveSessionsToAccount({ targetAccountId, ids = null, dryRu
     }
 
     if (!dryRun && ledgerAdds.length) {
-      recordCopies(variantId, sourceUid, targetUid, ledgerAdds);
+      await recordCopies(variantId, sourceUid, targetUid, ledgerAdds);
     }
   } finally {
     db.close();

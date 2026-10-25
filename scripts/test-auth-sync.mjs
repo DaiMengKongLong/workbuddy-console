@@ -87,7 +87,7 @@ section('1. 当前登录账号：刷新后的新凭据写回登录态文件');
 {
   const file = path.join(tmp, 'desktop.info');
   writeAuthFile(file);
-  const r = syncTokensToAuthFile(account(), { authPath: file });
+  const r = await syncTokensToAuthFile(account(), { authPath: file });
   check('返回 synced: true', r.synced === true, r);
   check('留了备份', !!r.backupPath && fs.existsSync(r.backupPath), r.backupPath);
   const doc = JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -105,7 +105,7 @@ section('2. 不是当前登录账号：一个字节都不动');
 {
   const file = path.join(tmp, 'desktop-other.info');
   const before = JSON.stringify(writeAuthFile(file, { uid: 'someone-else' }));
-  const r = syncTokensToAuthFile(account(), { authPath: file });
+  const r = await syncTokensToAuthFile(account(), { authPath: file });
   check('返回 synced: false', r.synced === false, r);
   check('原因是 not-current-account', r.reason === 'not-current-account', r.reason);
   check('文件内容未变', JSON.stringify(JSON.parse(fs.readFileSync(file, 'utf8'))) === JSON.stringify(JSON.parse(before)));
@@ -113,7 +113,7 @@ section('2. 不是当前登录账号：一个字节都不动');
 
 section('3. 登录态文件不存在：静默返回，不抛错（不能把刷新本身搞失败）');
 {
-  const r = syncTokensToAuthFile(account(), { authPath: path.join(tmp, 'nope.info') });
+  const r = await syncTokensToAuthFile(account(), { authPath: path.join(tmp, 'nope.info') });
   check('返回 synced: false', r.synced === false, r);
   check('原因是 no-auth-file', r.reason === 'no-auth-file', r.reason);
 }
@@ -122,7 +122,7 @@ section('4. 没有明文 access_token（加密信封账号）：不写');
 {
   const file = path.join(tmp, 'desktop-env.info');
   const before = JSON.stringify(writeAuthFile(file));
-  const r = syncTokensToAuthFile(account({ access_token: { $wbEncrypted: 1, envelope: 'X' } }), { authPath: file });
+  const r = await syncTokensToAuthFile(account({ access_token: { $wbEncrypted: 1, envelope: 'X' } }), { authPath: file });
   check('返回 synced: false', r.synced === false, r);
   check('原因是 no-plain-access-token', r.reason === 'no-plain-access-token', r.reason);
   check('文件内容未变', JSON.stringify(JSON.parse(fs.readFileSync(file, 'utf8'))) === JSON.stringify(JSON.parse(before)));

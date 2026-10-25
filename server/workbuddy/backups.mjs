@@ -14,7 +14,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { BACKUP_DIR, backupAuthFile } from './accounts.mjs';
 import { VARIANT_LIST, getVariant, authFilePath } from './variant.mjs';
-import { durableWriteText } from '../store/config.mjs';
+import { durableWriteTextAsync, CRITICAL_WRITE_DELAYS } from '../store/config.mjs';
 
 /** 备份文件名可能来自本工具（-cn / -ai 后缀）或 workbuddy-switch（无 cn 后缀） */
 const TAG_TO_VARIANT = [
@@ -112,7 +112,7 @@ function readAuthContent(full) {
  * 恢复某个备份到对应档位的登录态文件。
  * 返回 { ok, restored, authFilePath, safetyBackup, variant }
  */
-export function restoreBackup(name) {
+export async function restoreBackup(name) {
   const { base, full } = resolveBackup(name);
   const meta = parseName(base);
   const variantId = meta.variant || 'cn';
@@ -126,8 +126,8 @@ export function restoreBackup(name) {
   const safety = backupAuthFile(target, `workbuddy-desktop-${variant.id}`);
 
   try {
-    // 与切号同一条写盘路径：带退避重试，避免一次瞬时 EPERM 就让恢复失败
-    durableWriteText(target, raw);
+    // 与切号同一条写盘路径：登录态文件同款的加长重试窗口（约 3 分钟），异步不冻结服务
+    await durableWriteTextAsync(target, raw, { delays: CRITICAL_WRITE_DELAYS });
   } catch (e) {
     throw new Error(`写入登录态文件失败：${e?.message || e}`);
   }

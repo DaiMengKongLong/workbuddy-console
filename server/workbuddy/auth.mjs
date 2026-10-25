@@ -13,12 +13,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { authFilePath, getVariant, variantOf } from './variant.mjs';
-import { durableWriteText, durableWriteTextAsync, CRITICAL_WRITE_DELAYS } from '../store/config.mjs';
+import { durableWriteTextAsync, CRITICAL_WRITE_DELAYS } from '../store/config.mjs';
 import { detectWorkbuddyProcess, killWorkbuddy, waitForWorkbuddyGone } from '../targets/workbuddy.mjs';
 import {
   findAccount,
   loadAccounts,
-  saveAccounts,
+  saveAccountsAsync,
   secretValue,
   backupAuthFile,
   isEnvelope,
@@ -126,7 +126,7 @@ export function buildAuthObject(account) {
  *
  * 非当前账号（或登录态文件不存在/uid 对不上）时不做任何事，返回 `{ synced: false }`。
  */
-export function syncTokensToAuthFile(account, { authPath: overridePath = null } = {}) {
+export async function syncTokensToAuthFile(account, { authPath: overridePath = null } = {}) {
   const variant = variantOf(account);
   const authPath = overridePath || authFilePath(variant);
   let doc;
@@ -164,8 +164,9 @@ export function syncTokensToAuthFile(account, { authPath: overridePath = null } 
 
   const backup = backupAuthFile(authPath, `authsync-${variant.id}`);
   try {
-    // 带退避重试的持久写：本机写盘会被间歇拦截（EPERM），裸写一次失败就整条链路放弃
-    durableWriteText(authPath, JSON.stringify(doc, null, 2));
+    // 带退避重试的持久写（异步，不冻结事件循环）：本机写盘会被间歇拦截（EPERM），
+    // 裸写一次失败就整条链路放弃。巡检路径不用复活守卫——不能杀用户正在用的 WorkBuddy
+    await durableWriteTextAsync(authPath, JSON.stringify(doc, null, 2));
   } catch (err) {
     return { synced: false, reason: `write-failed: ${err?.message || err}` };
   }
@@ -337,7 +338,7 @@ export function detectCurrentAccount() {
 /**
  * 从登录态文件导入本机当前账号到账号库（去重：uid 已存在则覆盖 token）。
  */
-export function importLocalAccount(variantId = 'cn') {
+export async function importLocalAccount(variantId = 'cn') {
   const variant = getVariant(variantId);
   const doc = readAuthFile(variant.id);
   if (!doc) throw new Error('未读取到本地 WorkBuddy 登录信息（登录态文件不存在或已损坏）');
@@ -410,12 +411,12 @@ export function importLocalAccount(variantId = 'cn') {
   } else {
     accounts.push(record);
   }
-  saveAccounts(accounts);
+  await saveAccountsAsync(accounts);
   return accountMeta(record);
 }
 
 /** 删除账号（按 id）。当前登录中的账号不允许删，避免把用户锁在门外。 */
-export function deleteAccount(accountId) {
+export async function deleteAccount(accountId) {
   const accounts = loadAccounts();
   const target = accounts.find((a) => a?.id === accountId);
   if (!target) throw new Error('账号不存在');
@@ -423,12 +424,12 @@ export function deleteAccount(accountId) {
   if (current.account?.id === target.id) {
     throw new Error('这是当前正在使用的账号，删除后 WorkBuddy 会失去登录态。请先切换到其他账号再删除');
   }
-  saveAccounts(accounts.filter((a) => a?.id !== accountId));
+  await saveAccountsAsync(accounts.filter((a) => a?.id !== accountId));
   return { ok: true };
 }
 
 /** 修改账号本地备注（不触碰任何凭据） */
-export function updateAccountDisplay(accountId, patch = {}) {
+export async function updateAccountDisplay(accountId, patch = {}) {
   const accounts = loadAccounts();
   const idx = accounts.findIndex((a) => a?.id === accountId);
   if (idx < 0) throw new Error('账号不存在');
@@ -439,6 +440,6 @@ export function updateAccountDisplay(accountId, patch = {}) {
       ? patch.displayField
       : 'auto';
   }
-  saveAccounts(accounts);
+  await saveAccountsAsync(accounts);
   return accountMeta(accounts[idx]);
 }

@@ -40,7 +40,7 @@ import { variantOf } from './variant.mjs';
 import { detectCurrentAccount } from './auth.mjs';
 import { verifyAccountCredential } from './credits.mjs';
 import { refreshAccessToken } from '../proxy/wb.mjs';
-import { atomicWriteJson } from '../store/config.mjs';
+import { atomicWriteJsonAsync } from '../store/config.mjs';
 
 /** access_token 剩余不足这个小时数就刷新 */
 export const ACCESS_MIN_HOURS = 24;
@@ -153,12 +153,13 @@ export function lastRefreshRun() {
   return { at: lastAt, refreshed: sameRun.filter((r) => r.ok && r.action === 'refreshed').length };
 }
 
-function appendRefreshLogs(entries) {
+async function appendRefreshLogs(entries) {
   const rows = readJsonFile(REFRESH_LOGS_FILE, []);
   const list = Array.isArray(rows) ? rows : [];
   const stamped = entries.map((e) => ({ ...e, at: Date.now() }));
   try {
-    atomicWriteJson(REFRESH_LOGS_FILE, [...list, ...stamped].slice(-LOG_LIMIT));
+    // 异步落盘：巡检撞上 EPERM 锁窗时不能把整个服务冻住 36 秒
+    await atomicWriteJsonAsync(REFRESH_LOGS_FILE, [...list, ...stamped].slice(-LOG_LIMIT));
   } catch {
     /* 日志写失败不影响刷新结果 */
   }
@@ -197,16 +198,16 @@ export function loadCredentialStatus() {
   return raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
 }
 
-function saveCredentialStatus(state) {
+async function saveCredentialStatus(state) {
   try {
-    atomicWriteJson(CREDENTIAL_STATUS_FILE, state);
+    await atomicWriteJsonAsync(CREDENTIAL_STATUS_FILE, state);
   } catch {
     /* 状态写失败不影响刷新结果 */
   }
 }
 
 /** 记录单个账号的验活结论 */
-function recordVerify(accountId, state) {
+async function recordVerify(accountId, state) {
   if (!accountId) return;
   const all = loadCredentialStatus();
   all[accountId] = state;
@@ -215,7 +216,7 @@ function recordVerify(accountId, state) {
   if (keys.length > STATUS_LIMIT) {
     for (const k of keys.sort((a, b) => (all[a]?.at || 0) - (all[b]?.at || 0)).slice(0, keys.length - STATUS_LIMIT)) delete all[k];
   }
-  saveCredentialStatus(all);
+  await saveCredentialStatus(all);
 }
 
 /**
@@ -225,7 +226,7 @@ function recordVerify(accountId, state) {
 export async function verifyAccount(account) {
   const r = await verifyAccountCredential(account);
   const state = { at: Date.now(), valid: !!r.valid, unauthorized: !!r.unauthorized, message: r.message || '' };
-  recordVerify(account?.id || account?.uid || '', state);
+  await recordVerify(account?.id || account?.uid || '', state);
   return state;
 }
 
@@ -421,7 +422,7 @@ export async function refreshAccounts({ accountIds = null, force = false, delayM
       const ok = decision.action !== 'dead';
       results.push({ ok, action: decision.action, reason: decision.reason, message: decision.message, verify, ...metaOf(plan) });
       if (!ok) {
-        appendRefreshLogs([
+        await appendRefreshLogs([
           {
             ts: Date.now(),
             accountId: plan.id,
@@ -446,7 +447,7 @@ export async function refreshAccounts({ accountIds = null, force = false, delayM
       const next = refreshPlanFor(after, { now: Date.now(), currentUid });
       // 刷新成功即视为服务端认可（refresh 端点本身就是一次带凭据的调用），更新验活结论
       const verifyAfter = skipVerify ? verify : { at: Date.now(), valid: true, unauthorized: false, message: '' };
-      if (verifyAfter) recordVerify(plan.id || account?.id || '', verifyAfter);
+      if (verifyAfter) await recordVerify(plan.id || account?.id || '', verifyAfter);
       results.push({
         ok: true,
         action: 'refreshed',
@@ -456,7 +457,7 @@ export async function refreshAccounts({ accountIds = null, force = false, delayM
         ...metaOf(next),
         before,
       });
-      appendRefreshLogs([
+      await appendRefreshLogs([
         {
           ts: Date.now(),
           accountId: plan.id,
@@ -474,7 +475,7 @@ export async function refreshAccounts({ accountIds = null, force = false, delayM
       // 刷新失败且验活本来就被拒 → 结论是"确实失效"；否则只是这次刷新没成功
       const deadNow = !!(verify && verify.unauthorized);
       results.push({ ok: false, action: deadNow ? 'dead' : 'failed', reason: plan.reason, message, verify, ...metaOf(plan) });
-      appendRefreshLogs([
+      await appendRefreshLogs([
         {
           ts: Date.now(),
           accountId: plan.id,

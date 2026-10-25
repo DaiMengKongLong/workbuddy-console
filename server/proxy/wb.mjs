@@ -10,7 +10,7 @@
  * - 绝不跨档位请求：国内版只打 copilot.tencent.com，国际版只打 www.workbuddy.ai。
  */
 import crypto from 'node:crypto';
-import { loadAccounts, saveAccounts, secretValue } from '../workbuddy/accounts.mjs';
+import { loadAccounts, saveAccountsAsync, secretValue } from '../workbuddy/accounts.mjs';
 import { variantOf } from '../workbuddy/variant.mjs';
 import { syncTokensToAuthFile } from '../workbuddy/auth.mjs';
 
@@ -190,13 +190,15 @@ export async function refreshAccessToken(account, { timeoutMs = 30_000 } = {}) {
     if (Number.isFinite(expiresIn) && expiresIn > 0) target.expiresAt = now + expiresIn * 1000;
     const refreshExpiresIn = Number(data?.refreshExpiresIn ?? data?.refresh_expires_in);
     if (Number.isFinite(refreshExpiresIn) && refreshExpiresIn > 0) target.refreshExpiresAt = now + refreshExpiresIn * 1000;
-    saveAccounts(accounts);
+    // 异步落盘：刷新常发生在代理请求路径上，同步写撞上 EPERM 锁窗会把整个服务
+    // （含正在流式输出的请求）冻住 36 秒（2026-10-26 全面体检）
+    await saveAccountsAsync(accounts);
     // 官方刷新是轮换式的：旧 refresh_token 已在服务端作废。如果刷新的正是**当前登录账号**，
     // 必须把新凭据写回登录态文件，否则 WorkBuddy 还攥着作废的旧 token，
     // 它下一次自己刷新就会失败 → 用户看到「登录状态莫名失效」（2026-10-18 用户反馈）。
     // 不是当前账号时该函数自己返回 synced:false，什么也不做；同步失败不影响刷新结果。
     try {
-      syncTokensToAuthFile(target);
+      await syncTokensToAuthFile(target);
     } catch {
       /* 同步是尽力而为：账号库已更新，登录态文件下次切号时会重写 */
     }

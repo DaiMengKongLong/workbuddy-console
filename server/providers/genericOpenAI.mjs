@@ -1,5 +1,5 @@
 import fs from 'node:fs';
-import { atomicWriteJson, cachePath } from '../store/config.mjs';
+import { atomicWriteJsonAsync, cachePath } from '../store/config.mjs';
 import { proxyFetch } from '../proxy.mjs';
 
 /**
@@ -84,7 +84,7 @@ export async function getModelsCached({ platform, refresh = false, fetcher }) {
     const payload = { fetchedAt: Date.now(), platform, count: models.length, models };
     memCache.set(platform, payload);
     try {
-      atomicWriteJson(modelsCacheFile(platform), payload);
+      await atomicWriteJsonAsync(modelsCacheFile(platform), payload);
     } catch {
       /* 缓存写失败不影响返回 */
     }

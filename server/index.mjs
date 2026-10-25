@@ -584,7 +584,7 @@ app.post(
     if (!entries.length) {
       return res.status(400).json({ error: '没有可载入的模型', skipped });
     }
-    const result = loadModels(entries);
+    const result = await loadModels(entries);
     res.json({ ...result, keyUsed: maskKey(target.key), skipped });
   })
 );
@@ -650,11 +650,14 @@ app.post(
   })
 );
 
-app.post('/api/workbuddy/remove', (req, res) => {
-  const ids = Array.isArray(req.body?.modelIds) ? req.body.modelIds.filter(Boolean) : [];
-  if (!ids.length) return res.status(400).json({ error: '请选择要移除的模型' });
-  res.json(removeModels(ids));
-});
+app.post(
+  '/api/workbuddy/remove',
+  wrap(async (req, res) => {
+    const ids = Array.isArray(req.body?.modelIds) ? req.body.modelIds.filter(Boolean) : [];
+    if (!ids.length) return res.status(400).json({ error: '请选择要移除的模型' });
+    res.json(await removeModels(ids));
+  })
+);
 
 app.post(
   '/api/workbuddy/restart',
@@ -719,7 +722,7 @@ app.post(
   wrap(async (req, res) => {
     const name = String(req.body?.name || '');
     if (!name) return res.status(400).json({ error: '缺少备份文件名' });
-    res.json(restoreBackup(name));
+    res.json(await restoreBackup(name));
   })
 );
 
@@ -849,89 +852,99 @@ app.post(
       }
     }
 
-    // 1) 关闭 WorkBuddy（全自动切换的第一步）。
-    //    关键机制：WorkBuddy 被关闭后会被 Windows 的崩溃自动恢复拉起来，而**新实例
-    //    读取的是磁盘上当前的登录态**——所以只要在「重开」发生前写好新登录态，
-    //    重开出来的就是切换后账号的 WorkBuddy。这就是自动关 + 自动开成新账号。
-    let appStop = null;
-    let wasRunning = false;
-    if (stopApp) {
-      try {
-        const proc = await detectWorkbuddyProcess();
-        wasRunning = proc.running;
-        // 把杀之前读到的真实路径传下去：进程一死就再也读不到它装在哪，
-        // 后面「关掉重开」和「杀完再写库」都依赖这个路径
-        if (wasRunning) appStop = await killWorkbuddy(proc.exePath);
-      } catch (err) {
-        return res.status(400).json({ error: `退出 WorkBuddy 失败，已中止切换：${err?.message || err}` });
-      }
-      if (wasRunning) {
-        const gone = await waitForWorkbuddyGone(4000);
-        if (!gone) {
-          // 4 秒没死透或已被崩溃自动恢复拉起：再杀一轮（写盘重试里还有复活守卫兜底）。
-          // 之前这里对返回值看都不看，杀失败也径直往下写，登录态文件被启动中的
-          // 新实例锁住，写盘重试全灭（2026-10-25 用户切号报 38 秒 EPERM 即此）
-          console.log('[switch] 4 秒内 WorkBuddy 仍有进程，再结束一轮后继续');
-          try {
-            await killWorkbuddy(appStop?.exePath || null);
-          } catch {
-            /* 复活守卫还会兜底 */
-          }
-          await waitForWorkbuddyGone(4000);
-        }
-      }
-    }
-
     /**
-     * 1.5) 自动增量同步：把「此前复制过、目标账号里副本仍存在」的会话自动并入本次切换，
-     *      与用户手动勾选的会话**合并**（不是二选一——2026-10-21 用户实测：手动勾了 4 个，
-     *      其余 38 个已复制会话全被跳过，改名与内容都没跟过去）。只补已有副本，绝不产生新会话。
+     * 1)~4) 全程占会话操作互斥锁。切号里含「搬家（改会话库 + 复制账本）」与「杀/重启
+     * WorkBuddy」，和 sync-all / dedupe / move 属同一类重操作——此前只有 sessions 系端点
+     * 占锁，切号这条最重的写路径反而没占：切号撞上整理、或双击切号，两边会互踩
+     * （重复备份、撞 SQLite 写锁、交错重启），2026-10-26 全面体检发现。
      */
-    if (req.body?.autoSync !== false) {
-      try {
-        for (const sid of await sessionIdsNeedingSync({ targetAccountId: id })) {
-          if (!ids.includes(sid)) ids.push(sid);
+    const { appStop, sessionCopy, result, killed, relaunch } = await withSessionOpLock(async () => {
+      // 1) 关闭 WorkBuddy（全自动切换的第一步）。
+      //    关键机制：WorkBuddy 被关闭后会被 Windows 的崩溃自动恢复拉起来，而**新实例
+      //    读取的是磁盘上当前的登录态**——所以只要在「重开」发生前写好新登录态，
+      //    重开出来的就是切换后账号的 WorkBuddy。这就是自动关 + 自动开成新账号。
+      let appStop = null;
+      let wasRunning = false;
+      if (stopApp) {
+        try {
+          const proc = await detectWorkbuddyProcess();
+          wasRunning = proc.running;
+          // 把杀之前读到的真实路径传下去：进程一死就再也读不到它装在哪，
+          // 后面「关掉重开」和「杀完再写库」都依赖这个路径
+          if (wasRunning) appStop = await killWorkbuddy(proc.exePath);
+        } catch (err) {
+          throw Object.assign(new Error(`退出 WorkBuddy 失败，已中止切换：${err?.message || err}`), { status: 400 });
         }
-      } catch {
-        /* 源目标相同、档位不支持等：安静跳过，按「无会话需同步」处理 */
+        if (wasRunning) {
+          const gone = await waitForWorkbuddyGone(4000);
+          if (!gone) {
+            // 4 秒没死透或已被崩溃自动恢复拉起：再杀一轮（写盘重试里还有复活守卫兜底）。
+            // 之前这里对返回值看都不看，杀失败也径直往下写，登录态文件被启动中的
+            // 新实例锁住，写盘重试全灭（2026-10-25 用户切号报 38 秒 EPERM 即此）
+            console.log('[switch] 4 秒内 WorkBuddy 仍有进程，再结束一轮后继续');
+            try {
+              await killWorkbuddy(appStop?.exePath || null);
+            } catch {
+              /* 复活守卫还会兜底 */
+            }
+            await waitForWorkbuddyGone(4000);
+          }
+        }
       }
-    }
 
-    // 2) 搬家：勾了「同时复制会话」就只搬勾选的（含此前已同步过的），没勾才整包搬
-    let sessionCopy = null;
-    try {
-      sessionCopy = await moveSessionsToAccount({
-        targetAccountId: id,
-        ids: ids.length ? ids : null,
-        sourceVariant: ['cn', 'ai'].includes(String(req.body?.sourceVariant)) ? String(req.body.sourceVariant) : null,
-      });
-    } catch (err) {
-      return res.status(400).json({ error: `会话搬家失败，已中止切换：${err?.message || err}` });
-    }
+      /**
+       * 1.5) 自动增量同步：把「此前复制过、目标账号里副本仍存在」的会话自动并入本次切换，
+       *      与用户手动勾选的会话**合并**（不是二选一——2026-10-21 用户实测：手动勾了 4 个，
+       *      其余 38 个已复制会话全被跳过，改名与内容都没跟过去）。只补已有副本，绝不产生新会话。
+       */
+      if (req.body?.autoSync !== false) {
+        try {
+          for (const sid of await sessionIdsNeedingSync({ targetAccountId: id })) {
+            if (!ids.includes(sid)) ids.push(sid);
+          }
+        } catch {
+          /* 源目标相同、档位不支持等：安静跳过，按「无会话需同步」处理 */
+        }
+      }
 
-    // 3) 写登录态；无论成败都不把用户的应用留在"被关掉"的状态
-    let result;
-    try {
-      result = await switchAccount(id); // 异步：~3 分钟重试窗口，期间服务保持响应
-    } catch (err) {
-      await relaunchIfStopped(appStop);
-      throw err;
-    }
-
-    // 4) 收尾：把「登录态切换前就已自动重开」的旧账号实例再关一次，让下一次重开
-    //    读到已切换的登录态——重开出来的就是新账号的 WorkBuddy。
-    //    不再固定等 8 秒再探测（探测本身也要 4~7 秒），改为直接后台拉起：
-    //    已有实例时 launchWorkbuddy 会自动激活窗口而不会重复开。
-    let killed = null;
-    let relaunch = null;
-    if (wasRunning) {
+      // 2) 搬家：勾了「同时复制会话」就只搬勾选的（含此前已同步过的），没勾才整包搬
+      let sessionCopy = null;
       try {
-        killed = await killWorkbuddy(appStop?.exePath || null);
+        sessionCopy = await moveSessionsToAccount({
+          targetAccountId: id,
+          ids: ids.length ? ids : null,
+          sourceVariant: ['cn', 'ai'].includes(String(req.body?.sourceVariant)) ? String(req.body.sourceVariant) : null,
+        });
       } catch (err) {
-        killed = { stopped: false, error: err?.message || String(err) };
+        throw Object.assign(new Error(`会话搬家失败，已中止切换：${err?.message || err}`), { status: 400 });
       }
-      relaunch = launchWorkbuddyInBackground(killed?.exePath || appStop?.exePath || null, '-switch');
-    }
+
+      // 3) 写登录态；无论成败都不把用户的应用留在"被关掉"的状态
+      let result;
+      try {
+        result = await switchAccount(id); // 异步：~3 分钟重试窗口，期间服务保持响应
+      } catch (err) {
+        await relaunchIfStopped(appStop);
+        throw err;
+      }
+
+      // 4) 收尾：把「登录态切换前就已自动重开」的旧账号实例再关一次，让下一次重开
+      //    读到已切换的登录态——重开出来的就是新账号的 WorkBuddy。
+      //    不再固定等 8 秒再探测（探测本身也要 4~7 秒），改为直接后台拉起：
+      //    已有实例时 launchWorkbuddy 会自动激活窗口而不会重复开。
+      let killed = null;
+      let relaunch = null;
+      if (wasRunning) {
+        try {
+          killed = await killWorkbuddy(appStop?.exePath || null);
+        } catch (err) {
+          killed = { stopped: false, error: err?.message || String(err) };
+        }
+        relaunch = launchWorkbuddyInBackground(killed?.exePath || appStop?.exePath || null, '-switch');
+      }
+      return { appStop, sessionCopy, result, killed, relaunch };
+    });
+
     console.log(
       `[switch] → ${String(target.uid || '').slice(0, 8)} 搬家 ${sessionCopy?.moved?.length || 0} 个 / 合并 ${sessionCopy?.merged?.length || 0} 个 / 失败 ${sessionCopy?.errors?.length || 0} 个` +
         ` / 登录态已写 = ${result?.ok ? 'ok' : 'fail'}` +
@@ -957,7 +970,7 @@ app.post(
   '/api/accounts/import',
   wrap(async (req, res) => {
     const variant = String(req.body?.variant || 'cn');
-    const added = importLocalAccount(variant);
+    const added = await importLocalAccount(variant);
     // 入库即验活：否则新账号要等 6 小时巡检才脱离「待验活」（2026-10-20 反馈）
     const verify = await verifyNewAccount(added?.uid || added?.id);
     res.json(verify ? { ...added, verify } : added);
@@ -987,20 +1000,19 @@ app.post(
 );
 
 /** 删除账号（当前登录中的账号会被拒绝） */
-app.delete('/api/accounts/:id', (req, res) => {
-  try {
-    res.json(deleteAccount(String(req.params.id)));
-  } catch (err) {
-    res.status(400).json({ error: err?.message || '删除失败' });
-  }
-});
+app.delete(
+  '/api/accounts/:id',
+  wrap(async (req, res) => {
+    res.json(await deleteAccount(String(req.params.id)));
+  })
+);
 
 /** 修改账号本地备注 / 展示名来源 */
 app.patch(
   '/api/accounts/:id',
   wrap(async (req, res) => {
     try {
-      res.json(updateAccountDisplay(String(req.params.id), req.body || {}));
+      res.json(await updateAccountDisplay(String(req.params.id), req.body || {}));
     } catch (err) {
       res.status(400).json({ error: err?.message || '保存失败' });
     }

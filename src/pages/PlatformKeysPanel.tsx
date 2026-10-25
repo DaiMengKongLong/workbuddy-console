@@ -16,7 +16,7 @@ import {
   useConfirm,
   useToast,
 } from '../components/ui';
-import { del, get, post } from '../lib/api';
+import { del, get, post, TIMEOUT } from '../lib/api';
 import { onSettingsChanged } from '../lib/appSettings';
 import type { KeyInfo, KeysResponse, PlatformInfo, SettingsInfo } from '../lib/types';
 import { fmtDate, fmtRelative, showsMask } from '../lib/format';
@@ -104,11 +104,15 @@ export default function PlatformKeysPanel({ active = true }: { active?: boolean 
     if (!key) return;
     setAdding(true);
     try {
-      const r = await post<{ id: string; label: string; platform: string; warn?: string | null }>('/api/keys', {
-        platform: newPlatform,
-        key,
-        label: newLabel.trim() || undefined,
-      });
+      const r = await post<{ id: string; label: string; platform: string; warn?: string | null }>(
+        '/api/keys',
+        {
+          platform: newPlatform,
+          key,
+          label: newLabel.trim() || undefined,
+        },
+        { timeoutMs: TIMEOUT.write }
+      );
       // warn：鉴权已通过、但平台的探测模型不接受试探请求（如魔搭首项模型不支持 chat）。
       // 这时 Key 是有效的，只是没能"完整"验证，如实告诉用户而不是报错拦下。
       if (r.warn) toast('info', `${platformMeta?.name || r.platform} 的 Key「${r.label}」已添加。${r.warn}`);
@@ -139,7 +143,7 @@ export default function PlatformKeysPanel({ active = true }: { active?: boolean 
     });
     if (!ok) return;
     try {
-      await del(`/api/keys/${k.id}`);
+      await del(`/api/keys/${k.id}`, { timeoutMs: TIMEOUT.write });
       toast('ok', '已删除');
       loadKeys();
     } catch (e: any) {
@@ -149,7 +153,7 @@ export default function PlatformKeysPanel({ active = true }: { active?: boolean 
 
   const activateKey = async (k: KeyInfo) => {
     try {
-      await post(`/api/keys/${k.id}/activate`);
+      await post(`/api/keys/${k.id}/activate`, undefined, { timeoutMs: TIMEOUT.write });
       toast('ok', `已将「${k.label}」设为该平台活跃 Key，新载入的模型默认使用它`);
       loadKeys();
     } catch (e: any) {
@@ -160,7 +164,7 @@ export default function PlatformKeysPanel({ active = true }: { active?: boolean 
   const testKey = async (k: KeyInfo) => {
     setTestingId(k.id);
     try {
-      const r = await post<{ ok: boolean; error?: string; baseUrl?: string | null; warn?: string | null }>(`/api/keys/${k.id}/test`);
+      const r = await post<{ ok: boolean; error?: string; baseUrl?: string | null; warn?: string | null }>(`/api/keys/${k.id}/test`, undefined, { timeoutMs: TIMEOUT.quota });
       if (r.ok) {
         const node = hostOf(r.baseUrl) ? `（生效节点：${hostOf(r.baseUrl)}）` : '';
         if (r.warn) toast('info', `「${k.label}」鉴权有效${node}。${r.warn}`);

@@ -18,7 +18,7 @@
 import fs from 'node:fs';
 import { proxyFetch } from './proxy.mjs';
 import { readJsonFile } from './workbuddy/accounts.mjs';
-import { atomicWriteJson, cachePath } from './store/config.mjs';
+import { atomicWriteJsonAsync, cachePath } from './store/config.mjs';
 
 /** 本机版本：唯一事实来源就是 package.json，界面不再硬编码版本号 */
 const PKG = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
@@ -201,7 +201,7 @@ export async function checkForUpdate({ force = false } = {}) {
   const fresh = await fetchLatest();
   if (fresh.ok) {
     try {
-      atomicWriteJson(cacheFile(), fresh);
+      await atomicWriteJsonAsync(cacheFile(), fresh);
     } catch {
       /* 缓存写失败不影响本次结果 */
     }
