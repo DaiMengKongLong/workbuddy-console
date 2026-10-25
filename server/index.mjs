@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import {
   loadConfig,
-  saveConfig,
+  saveConfigAsync,
   newId,
   maskKey,
   CONFIG_FILE,
@@ -425,12 +425,13 @@ app.post(
     cfg.activeKeys = { ...(cfg.activeKeys || {}) };
     if (!cfg.activeKeys[provider.id]) cfg.activeKeys[provider.id] = item.id;
     if (provider.id === 'openrouter') cfg.activeKeyId = item.id;
-    saveConfig(cfg);
+    // 异步落盘：写盘重试最坏 36 秒，同步版会冻住整个服务 → 前端 25 秒默认超时误报失败
+    await saveConfigAsync(cfg);
     res.json({ id: item.id, platform: provider.id, label: item.label, masked: maskKey(key), isFreeTier: t.isFreeTier, warn: t.warn || null });
   })
 );
 
-app.delete('/api/keys/:id', (req, res) => {
+app.delete('/api/keys/:id', async (req, res) => {
   const cfg = loadConfig();
   const target = cfg.keys.find((k) => k.id === req.params.id);
   if (!target) return res.status(404).json({ error: 'Key 不存在' });
@@ -439,17 +440,25 @@ app.delete('/api/keys/:id', (req, res) => {
     cfg.activeKeys[target.platform] = cfg.keys.find((k) => k.platform === target.platform)?.id || null;
   }
   if (cfg.activeKeyId === req.params.id) cfg.activeKeyId = cfg.keys.find((k) => k.platform === 'openrouter')?.id || null;
-  saveConfig(cfg);
+  try {
+    await saveConfigAsync(cfg);
+  } catch (err) {
+    return res.status(500).json({ error: `删除失败：${err?.message || err}` });
+  }
   res.json({ ok: true });
 });
 
-app.post('/api/keys/:id/activate', (req, res) => {
+app.post('/api/keys/:id/activate', async (req, res) => {
   const cfg = loadConfig();
   const target = cfg.keys.find((k) => k.id === req.params.id);
   if (!target) return res.status(404).json({ error: 'Key 不存在' });
   cfg.activeKeys = { ...(cfg.activeKeys || {}), [target.platform]: target.id };
   if (target.platform === 'openrouter') cfg.activeKeyId = target.id;
-  saveConfig(cfg);
+  try {
+    await saveConfigAsync(cfg);
+  } catch (err) {
+    return res.status(500).json({ error: `切换失败：${err?.message || err}` });
+  }
   res.json({ ok: true });
 });
 
@@ -464,7 +473,8 @@ app.post(
       k.lastStatus = t.ok ? 'ok' : 'invalid';
       // 多节点平台：key 可能被删后换站点重建，重测时同步纠正生效节点
       k.baseUrl = t.baseUrl || null;
-      saveConfig(cfg);
+      // 探测结果只是元数据：落盘失败不该让「测试通过」变成 502，故单独兜住
+      await saveConfigAsync(cfg).catch(() => {});
       res.json(
         t.ok
           ? { ok: true, isFreeTier: t.isFreeTier, baseUrl: t.baseUrl || null, warn: t.warn || null }
@@ -1315,7 +1325,9 @@ app.put(
     if (typeof req.body?.unlockAllPlatforms === 'boolean') {
       cfg.settings.unlockAllPlatforms = req.body.unlockAllPlatforms;
     }
-    saveConfig(cfg);
+    // 设置页每次切换开关都会走这里：必须异步落盘，否则写盘卡顿期间整个界面都超时
+    const saveMs = await saveConfigAsync(cfg);
+    if (saveMs > 2000) console.log(`[settings] 保存设置耗时 ${saveMs}ms`);
     res.json({
       ok: true,
       workbuddyDir: cfg.settings.workbuddyDir,

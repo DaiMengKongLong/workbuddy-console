@@ -276,6 +276,18 @@ export function saveConfig(cfg) {
   atomicWriteJson(CONFIG_FILE, cfg);
 }
 
+/**
+ * 异步保存配置（不阻塞事件循环）。返回落盘耗时（毫秒）。
+ *
+ * 用户点一下就要等结果的接口（重新生成 Key、切换代理开关、保存设置）必须用它：
+ * 同步版在 EPERM 窗口内会把整个 HTTP 服务冻住 36 秒，前端 25 秒默认超时一到就报
+ * 「本地服务响应超时」，而配置其实可能已经写进去了（2026-10-25 两次反馈）。
+ */
+export async function saveConfigAsync(cfg) {
+  ensureDirs();
+  return atomicWriteJsonAsync(CONFIG_FILE, cfg);
+}
+
 export function newId(prefix) {
   return `${prefix}-${crypto.randomBytes(4).toString('hex')}`;
 }

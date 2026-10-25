@@ -20,7 +20,7 @@ import { Readable } from 'node:stream';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { loadConfig, saveConfig, DEFAULT_PROXY } from '../store/config.mjs';
+import { loadConfig, saveConfigAsync, DEFAULT_PROXY } from '../store/config.mjs';
 import { loadAccounts, accountMeta, secretValue, STORE_DIR } from '../workbuddy/accounts.mjs';
 import { variantOf, VARIANT_LIST, authFilePath } from '../workbuddy/variant.mjs';
 import { getAccountBalances } from '../workbuddy/credits.mjs';
@@ -68,13 +68,19 @@ const state = {
   expiry: { at: 0, map: new Map() },
 };
 
+/**
+ * 生成一把新的代理 Key（**不落盘**）。
+ * 落盘交给调用方用 saveConfigAsync：这里是请求路径，同步写盘会冻住整个服务。
+ */
+function newProxyKey() {
+  return `sk-wb-${crypto.randomBytes(16).toString('hex')}`;
+}
+
 function ensureKey() {
   const cfg = loadConfig();
   if (cfg.proxy?.apiKey) return cfg.proxy.apiKey;
-  const key = `sk-wb-${crypto.randomBytes(16).toString('hex')}`;
-  cfg.proxy = { ...DEFAULT_PROXY, ...cfg.proxy, apiKey: key };
-  saveConfig(cfg);
-  return key;
+  // 返回新 key 但不在这里写配置：PUT /api/proxy/config 随后会用异步方式统一落盘
+  return newProxyKey();
 }
 
 /** 出站可用的明文 access_token（空值或加密信封对象都不算） */
@@ -1179,7 +1185,10 @@ export function registerProxyRoutes(app, { port }) {
       if (typeof req.body?.enabled === 'boolean') cfg.proxy.enabled = req.body.enabled;
       if (Array.isArray(req.body?.accountIds)) cfg.proxy.accountIds = req.body.accountIds.filter((x) => typeof x === 'string');
       if (cfg.proxy.enabled && !cfg.proxy.apiKey) cfg.proxy.apiKey = ensureKey();
-      saveConfig(cfg);
+      // 异步落盘：本机写盘可能被外部进程拦几十秒，同步版会把整个事件循环冻住，
+      // 前端 25 秒默认超时就把「其实已经保存成功」误报成失败
+      const ms = await saveConfigAsync(cfg);
+      if (ms > 2000) console.log(`[proxy] 保存代理开关耗时 ${ms}ms`);
       res.json(publicStatus(port));
     })
   );
@@ -1188,8 +1197,10 @@ export function registerProxyRoutes(app, { port }) {
     '/api/proxy/key/rotate',
     wrap(async (req, res) => {
       const cfg = loadConfig();
-      cfg.proxy = { ...DEFAULT_PROXY, ...cfg.proxy, apiKey: `sk-wb-${crypto.randomBytes(16).toString('hex')}` };
-      saveConfig(cfg);
+      cfg.proxy = { ...DEFAULT_PROXY, ...cfg.proxy, apiKey: newProxyKey() };
+      // 同上：用户点「重新生成 Key」正在等结果，不能同步写盘（2026-10-25 25 秒超时反馈）
+      const ms = await saveConfigAsync(cfg);
+      console.log(`[proxy] 已重新生成 API Key，落盘 ${ms}ms`);
       // reveal：刚生成的 Key 必须随响应带回明文。否则前端只拿到掩码预览，
       // 而界面里残留的旧明文（用户点过「显示」）会继续显示 → 看起来"没刷新"。
       res.json(publicStatus(port, { reveal: true }));

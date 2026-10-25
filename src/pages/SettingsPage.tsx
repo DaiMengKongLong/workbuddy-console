@@ -20,7 +20,7 @@ import {
   useConfirm,
   useToast,
 } from '../components/ui';
-import { del, get, post, put } from '../lib/api';
+import { del, get, post, put, TIMEOUT } from '../lib/api';
 import { emitUpdateChecked } from '../lib/appUpdate';
 import { emitSettingsChanged } from '../lib/appSettings';
 import type {
@@ -307,7 +307,7 @@ export default function SettingsPage() {
   const saveDir = async (dir: string) => {
     setSavingDir(true);
     try {
-      const r = await put<{ workbuddyDir: string; detected: SettingsInfo['detected'] }>('/api/settings', { workbuddyDir: dir });
+      const r = await put<{ workbuddyDir: string; detected: SettingsInfo['detected'] }>('/api/settings', { workbuddyDir: dir }, { timeoutMs: TIMEOUT.write });
       setSettings((prev) => (prev ? { ...prev, workbuddyDir: r.workbuddyDir, detected: r.detected } : prev));
       setWbDir(r.workbuddyDir);
       if (r.detected.valid) {
@@ -326,7 +326,7 @@ export default function SettingsPage() {
   const saveProxy = async (url: string) => {
     setSavingProxy(true);
     try {
-      const r = await put<{ ok: boolean; proxyUrl: string; effectiveProxy: string | null }>('/api/settings', { proxyUrl: url });
+      const r = await put<{ ok: boolean; proxyUrl: string; effectiveProxy: string | null }>('/api/settings', { proxyUrl: url }, { timeoutMs: TIMEOUT.write });
       setSettings((prev) => (prev ? { ...prev, proxyUrl: r.proxyUrl, effectiveProxy: r.effectiveProxy } : prev));
       setProxyInput(r.proxyUrl);
       toast('ok', r.proxyUrl ? `代理已保存，出站请求将走 ${r.effectiveProxy || r.proxyUrl}` : '代理已清空，恢复自动探测（环境变量 / 系统代理）');
@@ -342,7 +342,7 @@ export default function SettingsPage() {
     // 乐观更新：勾选立即响应，失败再回滚（否则要等一次本机请求往返，点上去像没反应）
     setSettings((p) => (p ? { ...p, autoCheckin: next } : p));
     try {
-      const r = await put<{ autoCheckin: boolean }>('/api/settings', { autoCheckin: next });
+      const r = await put<{ autoCheckin: boolean }>('/api/settings', { autoCheckin: next }, { timeoutMs: TIMEOUT.write });
       setSettings((p) => (p ? { ...p, autoCheckin: r.autoCheckin } : p));
       toast('ok', r.autoCheckin ? '已开启自动领取：服务端每小时巡检一次，自动补签并领取成长中心奖励' : '已关闭自动领取');
     } catch (e: any) {
@@ -361,7 +361,7 @@ export default function SettingsPage() {
     const prev = !!settings[key];
     setSettings((p) => (p ? { ...p, [key]: next } : p));
     try {
-      const r = await put<Partial<SettingsInfo>>('/api/settings', { [key]: next });
+      const r = await put<Partial<SettingsInfo>>('/api/settings', { [key]: next }, { timeoutMs: TIMEOUT.write });
       setSettings((p) => (p ? { ...p, [key]: !!r[key] } : p));
       // 常驻挂载的其它页面不会因为"切回来"重新取数：把变更广播出去（如免费模型页的平台列表）
       emitSettingsChanged({ [key]: !!r[key] });

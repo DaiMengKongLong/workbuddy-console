@@ -23,7 +23,7 @@ import {
   Toolbar,
   useToast,
 } from '../components/ui';
-import { get, post, put } from '../lib/api';
+import { get, post, put, TIMEOUT } from '../lib/api';
 import { fmtDateTime, fmtNumber, fmtRelative } from '../lib/format';
 import type { ProxyStatus, ProxyTestResult } from '../lib/types';
 
@@ -345,7 +345,7 @@ export default function ProxyPage() {
     // 乐观更新：开关是高频操作，等 PUT 往返会明显"点了没反应"
     setData({ ...data, enabled: on });
     try {
-      setData(await put<ProxyStatus>('/api/proxy/config', { enabled: on }));
+      setData(await put<ProxyStatus>('/api/proxy/config', { enabled: on }, { timeoutMs: TIMEOUT.write }));
       toast('ok', on ? '反向代理已开启' : '反向代理已关闭');
     } catch (e: any) {
       setData({ ...data, enabled: !on });
@@ -360,7 +360,7 @@ export default function ProxyPage() {
     const next = on ? [...new Set([...base, id])] : base.filter((x) => x !== id);
     setData({ ...data, accountIds: next, accounts: data.accounts.map((a) => (a.id === id ? { ...a, selected: on } : a)) });
     try {
-      setData(await put<ProxyStatus>('/api/proxy/config', { accountIds: next }));
+      setData(await put<ProxyStatus>('/api/proxy/config', { accountIds: next }, { timeoutMs: TIMEOUT.write }));
     } catch (e: any) {
       toast('err', e?.message || '保存失败');
       void load();
@@ -370,7 +370,8 @@ export default function ProxyPage() {
   const rotateKey = async () => {
     setBusy(true);
     try {
-      const next = await post<ProxyStatus>('/api/proxy/key/rotate');
+      // 服务端要落盘 config.json，写盘重试最坏 36 秒 → 必须给足超时，否则「其实已生成」会被报成超时
+      const next = await post<ProxyStatus>('/api/proxy/key/rotate', undefined, { timeoutMs: TIMEOUT.write });
       setData(next);
       // 关键：plainKey 里可能残留旧 key（用户之前点过「显示」），不覆盖就会一直
       // 显示旧值，看起来像「重新生成没生效」。服务端现在会带回新明文。
