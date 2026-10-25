@@ -140,7 +140,7 @@ function refreshHeaders(account) {
  * 用 refresh_token 换新的 access_token，成功后原子写回账号库。
  * 返回新的 access_token；失败抛错（调用方决定是否换下一个账号）。
  */
-export async function refreshAccessToken(account, { timeoutMs = 30_000 } = {}) {
+async function doRefreshAccessToken(account, { timeoutMs = 30_000 } = {}) {
   const refreshToken = secretValue(account, 'refresh_token');
   if (typeof refreshToken !== 'string' || !refreshToken.trim()) {
     throw new Error('该账号没有可用的 refresh_token，需重新扫码登录');
@@ -178,21 +178,40 @@ export async function refreshAccessToken(account, { timeoutMs = 30_000 } = {}) {
   const access = data?.accessToken || data?.access_token;
   if (!access) throw new Error('刷新失败：响应里没有 accessToken，需重新扫码登录');
 
-  const accounts = loadAccounts();
-  const idx = accounts.findIndex((a) => a?.id === account.id || (account.uid && a?.uid === account.uid));
-  if (idx >= 0) {
+  // H2：把新凭据同步写回调用方传入的 account 对象。loadAccounts() 每次返回全新对象，
+  // 调用方（代理请求路径）之后仍用传入的 account 出站——不回写的话「先刷新再发」发的
+  // 还是旧 access_token，401 重试还会拿已被轮换作废的旧 refresh_token 再刷（必败）
+  const now = Date.now();
+  const newRefresh = data?.refreshToken || data?.refresh_token || null;
+  account.access_token = access;
+  if (newRefresh) account.refresh_token = newRefresh;
+  account.refreshedAt = now;
+  const expiresIn2 = Number(data?.expiresIn ?? data?.expires_in);
+  if (Number.isFinite(expiresIn2) && expiresIn2 > 0) account.expiresAt = now + expiresIn2 * 1000;
+  const refreshExpiresIn2 = Number(data?.refreshExpiresIn ?? data?.refresh_expires_in);
+  if (Number.isFinite(refreshExpiresIn2) && refreshExpiresIn2 > 0) account.refreshExpiresAt = now + refreshExpiresIn2 * 1000;
+
+  // H4：落库必须「重读→按 id 合并→写」，且不同账号的保存互相串行。
+  // 官方刷新是轮换式的（旧 refresh_token 立即作废），并发刷新两个账号时如果各自
+  // 拿旧快照整表覆盖，后写者会把先写者刚轮换出的新 token 抹回已作废的旧值——账号报废
+  const applyAndSave = async () => {
+    const accounts = loadAccounts();
+    const idx = accounts.findIndex((a) => a?.id === account.id || (account.uid && a?.uid === account.uid));
+    if (idx < 0) return null; // 账号已被删除：放弃落库，不凭内存对象凭空造库
     const target = accounts[idx];
     target.access_token = access;
-    if (data?.refreshToken || data?.refresh_token) target.refresh_token = data.refreshToken || data.refresh_token;
-    const now = Date.now();
+    if (newRefresh) target.refresh_token = newRefresh;
     target.refreshedAt = now;
-    const expiresIn = Number(data?.expiresIn ?? data?.expires_in);
-    if (Number.isFinite(expiresIn) && expiresIn > 0) target.expiresAt = now + expiresIn * 1000;
-    const refreshExpiresIn = Number(data?.refreshExpiresIn ?? data?.refresh_expires_in);
-    if (Number.isFinite(refreshExpiresIn) && refreshExpiresIn > 0) target.refreshExpiresAt = now + refreshExpiresIn * 1000;
+    if (Number.isFinite(expiresIn2) && expiresIn2 > 0) target.expiresAt = now + expiresIn2 * 1000;
+    if (Number.isFinite(refreshExpiresIn2) && refreshExpiresIn2 > 0) target.refreshExpiresAt = now + refreshExpiresIn2 * 1000;
     // 异步落盘：刷新常发生在代理请求路径上，同步写撞上 EPERM 锁窗会把整个服务
     // （含正在流式输出的请求）冻住 36 秒（2026-10-26 全面体检）
     await saveAccountsAsync(accounts);
+    return target;
+  };
+  refreshSaveChain = refreshSaveChain.then(applyAndSave, applyAndSave);
+  const target = await refreshSaveChain;
+  if (target) {
     // 官方刷新是轮换式的：旧 refresh_token 已在服务端作废。如果刷新的正是**当前登录账号**，
     // 必须把新凭据写回登录态文件，否则 WorkBuddy 还攥着作废的旧 token，
     // 它下一次自己刷新就会失败 → 用户看到「登录状态莫名失效」（2026-10-18 用户反馈）。
@@ -204,6 +223,25 @@ export async function refreshAccessToken(account, { timeoutMs = 30_000 } = {}) {
     }
   }
   return access;
+}
+
+/** 同一账号的并发刷新去重：轮换式刷新下，同一账号同时刷两次必有一胜一败（败者报废） */
+const refreshInFlight = new Map();
+
+/** 账号库保存串行链：保证「重读→合并→写」不与其它刷新交错 */
+let refreshSaveChain = Promise.resolve();
+
+/**
+ * 刷新 access_token（带并发去重）。
+ * 同一账号并发调用复用同一次网络请求；不同账号的落库按序执行（见 refreshSaveChain）。
+ */
+export function refreshAccessToken(account, opts = {}) {
+  const key = String(account?.id || account?.uid || '');
+  const prev = refreshInFlight.get(key);
+  if (prev) return prev;
+  const p = doRefreshAccessToken(account, opts).finally(() => refreshInFlight.delete(key));
+  refreshInFlight.set(key, p);
+  return p;
 }
 
 /**

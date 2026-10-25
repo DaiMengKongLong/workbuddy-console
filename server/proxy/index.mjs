@@ -168,10 +168,11 @@ function capture11128(kind, body, errors) {
       .map((m) => (typeof m.content === 'string' ? m.content : JSON.stringify(m.content)))
       .join('\n---\n');
     if (!sys) return;
-    fs.appendFileSync(
+    fs.appendFile(
       path.join(STORE_DIR, 'proxy-11128-samples.jsonl'),
       JSON.stringify({ at: Date.now(), kind, model: body?.model || null, chars: sys.length, head: sys.slice(0, 6000) }) + '\n',
-      'utf8'
+      'utf8',
+      () => {}
     );
   } catch {
     /* 捕获失败不影响响应 */
@@ -329,9 +330,11 @@ export function authMode(req) {
   return null;
 }
 
-/** 鉴权：见 authMode。认不出携带方式即为不通过。 */
+/** 鉴权：见 authMode。认不出携带方式即为不通过；未配置 Key（'none'）同样不放行——
+ * /v1 的 CORS 是 *，空口令等于任何本地网页都能跨域静默烧积分（2026-10-26 审查 M8）。 */
 function authorized(req) {
-  return !!authMode(req);
+  const mode = authMode(req);
+  return mode !== null && mode !== 'none';
 }
 
 /**
@@ -446,15 +449,27 @@ function watchRejections(req, res, next) {
 function pipeStream(webStream, res) {
   return new Promise((resolve, reject) => {
     const nodeStream = Readable.fromWeb(webStream);
+    let settled = false;
+    const settle = (err) => {
+      if (settled) return;
+      settled = true;
+      err ? reject(err) : resolve();
+    };
     let clientGone = false;
     res.on('close', () => {
       if (!res.writableFinished) {
         clientGone = true;
         nodeStream.destroy();
+        // destroy() 不触发 error 也到不了 end——必须在 close 里直接落定，
+        // 否则每次客户端中断都泄漏一个永久挂起的 handler（2026-10-26 审查 H3）
+        settle();
       }
     });
-    nodeStream.on('error', (err) => (clientGone ? resolve() : reject(err)));
-    nodeStream.on('end', resolve);
+    nodeStream.on('error', (err) => settle(clientGone ? undefined : err));
+    nodeStream.on('end', () => settle());
+    nodeStream.on('close', () => {
+      if (clientGone) settle();
+    });
     nodeStream.pipe(res);
   });
 }
@@ -1148,6 +1163,21 @@ function testPreview(text) {
 export function registerProxyRoutes(app, { port }) {
   const wrap = (fn) => (req, res) => Promise.resolve(fn(req, res)).catch((err) => {
     res.status(500).json({ error: err?.message || '服务器内部错误' });
+  });
+
+  /**
+   * 本机访问防护（DNS rebinding / 管理端点裸奔）：本服务的 /api/proxy/* 管理端点
+   * （含 status?reveal=1 返回**明文 apiKey**、PUT config、key/rotate）此前完全无鉴权，
+   * 任何能解析到 127.0.0.1 的域名都能直接调用（2026-10-26 审查 H1）。
+   * 浏览器/HTTP 客户端直连本机时 Host 头必是本机地址；被恶意域名 rebinding 过来时
+   * Host 是该域名 → 一刀切拒绝。必须在所有路由之前挂。
+   */
+  const LOCAL_HOST_RE = /^(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/i;
+  app.use((req, res, next) => {
+    if (!LOCAL_HOST_RE.test(String(req.headers.host || ''))) {
+      return res.status(403).json({ error: '仅允许本机访问' });
+    }
+    next();
   });
 
   /**
