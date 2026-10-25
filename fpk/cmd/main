@@ -56,7 +56,19 @@ start_process() {
         return 0
     fi
 
-    # 端口被占用时顺延，避免启动失败
+    # 端口被占用：先尝试清掉占着这个端口的残留进程再降级顺延。
+    # 为什么会有残留：异常退出/重装时 PID 文件丢失，stop 只认 PID 文件就杀不到旧进程，
+    # 应用中心「启用」就会报「端口被占用」（checkport=true）。应用中心以 root 跑这里，fuser 一定可用；
+    # 普通用户手动跑时 fuser 杀不动别人的进程，静默失败走顺延，不影响启动。
+    if (command -v ss >/dev/null 2>&1 && ss -ltn | grep -q ":${PORT} ") ; then
+        if command -v fuser >/dev/null 2>&1; then
+            log_msg "port ${PORT} busy, try fuser -k first"
+            fuser -k "${PORT}/tcp" 2>/dev/null || true
+            sleep 1
+        fi
+    fi
+
+    # 端口仍被占用时顺延，避免启动失败
     if (command -v ss >/dev/null 2>&1 && ss -ltn | grep -q ":${PORT} ") ; then
         log_msg "port ${PORT} busy, fallback to 57892"
         PORT=57892
@@ -104,6 +116,13 @@ stop_process() {
             sleep 1
         fi
         rm -f "${PID_FILE}"
+    fi
+    # 兜底：PID 文件丢失/过期时按端口清残留。没有这一步，重装/异常退出后旧进程会一直
+    # 占着 57891，应用中心「启用」永远报「端口被占用」。以 root 运行（应用中心升级时）必然能杀掉；
+    # 普通用户手动执行杀不动别人的进程，静默失败即可。
+    if command -v fuser >/dev/null 2>&1; then
+        fuser -k "${PORT}/tcp" 2>/dev/null || true
+        sleep 1
     fi
     log_msg "stopped"
     return 0
