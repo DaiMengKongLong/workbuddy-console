@@ -1,0 +1,15 @@
+appname               = wbconsole
+version               = 0.2.33
+display_name          = WorkBuddy控制台
+desc                  = WorkBuddy 账号管理 · 免费模型广场 · 反向代理 · 积分统计 · 每日签到与成长中心（飞牛 fnOS 版）
+platform              = x86
+source                = thirdparty
+maintainer            = workbuddy-console-fnos
+distributor           = workbuddy-console-fnos
+os_min_version        = 1.0.0
+install_dep_apps      =
+service_port          = 57891
+checkport             = true
+ctl_stop              = true
+desktop_uidir         = ui
+desktop_applaunchname = wbconsole.Application

@@ -1,0 +1,5 @@
+#!/bin/bash
+### 安装后：准备数据目录
+mkdir -p "${TRIM_PKGVAR}/data" "${TRIM_PKGVAR}/run" "${TRIM_PKGVAR}/logs" "${TRIM_PKGVAR}/data/cache" "${TRIM_PKGVAR}/data/updates"
+chmod -R 0770 "${TRIM_PKGVAR}" 2>/dev/null
+exit 0

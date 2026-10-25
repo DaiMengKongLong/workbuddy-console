@@ -1,0 +1,7 @@
+node_modules/
+dist/
+dist-fpk/
+fpk/app/
+fpk/.trash/
+tools/node-runtime/
+.DS_Store
