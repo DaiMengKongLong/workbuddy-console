@@ -393,7 +393,7 @@ export async function pipeResponsesStream(frames, res, { model, signal } = {}) {
       response: { ...envelope('failed', [], usageToResponses(usage)), error: { code: 'upstream_error', message: upstreamError } },
     });
     res.end();
-    return;
+    return upstreamError; // 调用方按失败记账/冷却/采样
   }
 
   // 按 output_index 排序，保证 output 数组顺序与事件一致
@@ -405,6 +405,7 @@ export async function pipeResponsesStream(frames, res, { model, signal } = {}) {
     response: envelope(stopReason(finishReason), finalOutput, usageToResponses(usage)),
   });
   res.end();
+  return null;
 }
 
 export { UpstreamError };

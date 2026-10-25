@@ -367,10 +367,11 @@ export async function pipeAnthropicStream(frames, res, { model, signal } = {}) {
   }
 
   if (upstreamError) {
-    // 已经写出部分内容：用 error 事件收尾更符合 Anthropic 习惯
+    // 已经写出部分内容：用 error 事件收尾更符合 Anthropic 习惯。
+    // 返回错误文本：调用方据此按失败记账/冷却/采样（此前返回 undefined 被记成成功）
     sse(res, 'error', { type: 'error', error: { type: 'api_error', message: upstreamError } });
     res.end();
-    return;
+    return upstreamError;
   }
 
   sse(res, 'message_delta', {
@@ -380,6 +381,7 @@ export async function pipeAnthropicStream(frames, res, { model, signal } = {}) {
   });
   sse(res, 'message_stop', { type: 'message_stop' });
   res.end();
+  return null;
 }
 
 export { UpstreamError };

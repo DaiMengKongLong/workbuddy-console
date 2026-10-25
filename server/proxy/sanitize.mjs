@@ -159,6 +159,14 @@ export function breakLongFingerprint(text) {
     next = next.replace(/\.\s+(?=[A-Z\u4e00-\u9fff])/g, '.\n');
     out.push(next);
   }
+  if (inFence) {
+    // 围栏没闭合（agent 提示词里「示例代码块只开不关」或外层四反引号内嵌三反引号
+    // 都很常见）：翻转后后半段整段被跳过断行 → 防指纹全部失效、11128 复发。
+    // 宁可全断（围栏本来就残缺），不可漏断
+    return lines
+      .map((line) => line.replace(/([。！？；])\s*/g, '$1\n').replace(/\.\s+(?=[A-Z\u4e00-\u9fff])/g, '.\n'))
+      .join('\n');
+  }
   return out.join('\n');
 }
 

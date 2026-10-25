@@ -448,9 +448,24 @@ export async function openUpstreamStream(account, body, { headerTimeoutMs = 60_0
     throw new UpstreamError(`HTTP ${res.status}: ${text.slice(0, 200)}`, res.status);
   }
   const frames = (async function* run() {
+    // 帧间空闲看门狗（H5）：拿到响应头之后流主体此前不受任何超时管，上游僵死时
+    // 消费方（各协议适配器）会永久挂起。每产出一帧重置一次计时
+    let idle = null;
+    const armIdle = () => {
+      clearTimeout(idle);
+      idle = setTimeout(
+        () => ctrl.abort(new UpstreamError(`上游 ${STREAM_IDLE_TIMEOUT_MS / 1000} 秒无新数据`, 504)),
+        STREAM_IDLE_TIMEOUT_MS
+      );
+    };
     try {
-      yield* parseSseStream(res.body);
+      armIdle();
+      for await (const ev of parseSseStream(res.body)) {
+        armIdle();
+        yield ev;
+      }
     } finally {
+      clearTimeout(idle);
       if (signal) signal.removeEventListener('abort', onAbort);
     }
   })();
@@ -466,12 +481,24 @@ export async function openUpstreamStream(account, body, { headerTimeoutMs = 60_0
  *   10 分钟；非流式用调用方给的值（默认 120s）。
  * 之前只用一个总超时，流式长响应会在中途被 AbortSignal 掐断，客户端拿到半截 SSE。
  */
-export async function chatComplete(account, body, { timeoutMs = 120_000, headerTimeoutMs = 60_000 } = {}) {
+/**
+ * 流式帧间空闲上限：响应头到达之后、流结束之前，上游连接活着但不吐任何字节的
+ * 「僵死」状态此前不受任何超时管——客户端会永久挂起（2026-10-26 审查 H5）。
+ */
+const STREAM_IDLE_TIMEOUT_MS = 120_000;
+
+export async function chatComplete(account, body, { timeoutMs = 120_000, headerTimeoutMs = 60_000, signal } = {}) {
   const variant = variantOf(account).id;
   const wantStream = !!body?.stream;
   const upstreamBody = { ...body, stream: true };
 
   const ctrl = new AbortController();
+  // 客户端断开传导到上游：此前非流式没有 signal，客户端取消后上游照跑、积分照烧
+  const onClientAbort = () => ctrl.abort(new Error('客户端已断开'));
+  if (signal) {
+    if (signal.aborted) throw new Error('客户端已断开');
+    signal.addEventListener('abort', onClientAbort, { once: true });
+  }
   const headerTimer = setTimeout(() => ctrl.abort(new Error('上游 60 秒未返回响应头')), headerTimeoutMs);
   let res;
   try {
@@ -487,11 +514,30 @@ export async function chatComplete(account, body, { timeoutMs = 120_000, headerT
 
   if (!res.ok) {
     const text = await res.text().catch(() => '');
+    if (signal) signal.removeEventListener('abort', onClientAbort);
     return { ok: false, status: res.status, text, error: `HTTP ${res.status}: ${text.slice(0, 200)}` };
   }
 
   if (wantStream) {
-    return { ok: true, status: res.status, stream: res.body, headers: res.headers };
+    // 帧间空闲看门狗（见 STREAM_IDLE_TIMEOUT_MS 注释）：透传字节流不变，只加超时
+    let idle = setTimeout(() => ctrl.abort(new Error(`上游 ${STREAM_IDLE_TIMEOUT_MS / 1000} 秒无新数据`)), STREAM_IDLE_TIMEOUT_MS);
+    const rearm = () => {
+      clearTimeout(idle);
+      idle = setTimeout(() => ctrl.abort(new Error(`上游 ${STREAM_IDLE_TIMEOUT_MS / 1000} 秒无新数据`)), STREAM_IDLE_TIMEOUT_MS);
+    };
+    const watched = res.body.pipeThrough(
+      new TransformStream({
+        transform(chunk, c) {
+          rearm();
+          c.enqueue(chunk);
+        },
+        flush() {
+          clearTimeout(idle);
+          if (signal) signal.removeEventListener('abort', onClientAbort);
+        },
+      })
+    );
+    return { ok: true, status: res.status, stream: watched, headers: res.headers };
   }
 
   // 非流式：读完整个流再聚合；整段受 timeoutMs 约束（超时就取消上游流）
@@ -501,6 +547,7 @@ export async function chatComplete(account, body, { timeoutMs = 120_000, headerT
     raw = await res.text();
   } finally {
     clearTimeout(bodyTimer);
+    if (signal) signal.removeEventListener('abort', onClientAbort);
   }
 
   // 上游在流式模式下也可能直接回一段错误 JSON（非 SSE），这时把错误抬出去

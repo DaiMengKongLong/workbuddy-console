@@ -329,7 +329,7 @@ export async function pipeGeminiStream(frames, res, { model, signal } = {}) {
   if (upstreamError) {
     sse(res, { error: { code: 502, message: upstreamError, status: 'INTERNAL' } });
     res.end();
-    return;
+    return upstreamError; // 调用方按失败记账/冷却/采样
   }
 
   sse(res, {
@@ -338,6 +338,7 @@ export async function pipeGeminiStream(frames, res, { model, signal } = {}) {
     modelVersion,
   });
   res.end();
+  return null;
 }
 
 export { UpstreamError };

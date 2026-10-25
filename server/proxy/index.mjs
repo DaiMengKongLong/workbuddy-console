@@ -163,7 +163,8 @@ function capture11128(kind, body, errors) {
   try {
     const hit = (errors || []).some((e) => /11128|Illegal API invocation/i.test(String(e)));
     if (!hit) return;
-    const sys = (body?.messages || [])
+    // 优先用净化前的原文（L2）：净化会就地改写 messages，采样改写版排不了障
+    const sys = rawSystemOf(body) || (body?.messages || [])
       .filter((m) => m && (m.role === 'system' || m.role === 'developer'))
       .map((m) => (typeof m.content === 'string' ? m.content : JSON.stringify(m.content)))
       .join('\n---\n');
@@ -186,7 +187,9 @@ function capture11128(kind, body, errors) {
  * 避免后续每个请求都先来撞一下。
  */
 export function isQuotaError(text) {
-  return /(^|[^0-9])429([^0-9]|$)|insufficient|exhaust|rate.?limit|积分不足|余额不足|额度(不足|用尽|已用完)|限额|配额/i.test(
+  // 只认明确的配额语义。此前正则还裸匹 rate.?limit / insufficient：上游 5xx 的
+  // 文案里常带这些词，会把好账号误记 10 分钟冷却，池小时等于自废（2026-10-26 L1）
+  return /(^|[^0-9])429([^0-9]|$)|insufficient\s+(credits?|quota|balance)|积分不足|余额不足|额度(不足|用尽|已用完)|限额|配额/i.test(
     String(text ?? '')
   );
 }
@@ -286,6 +289,76 @@ export function needsRefresh(account) {
   return Number.isFinite(exp) && exp > 0 && exp - Date.now() < 60_000;
 }
 
+/** 单次客户端请求的总时间预算：账号池逐个试、每个最长 60s 响应头 + 30s 刷新，
+ * 不设上限时池大的客户端要干等数分钟（M4）。超预算返回已收集的错误 */
+const REQUEST_BUDGET_MS = 240_000;
+
+/**
+ * 流式透传时顺带扫描上游 in-band 错误帧（11128/11102/14003…）：
+ * 不改变字节流，只把命中的错误文本记到 scan.error。此前 handleChat 的流式是纯透传，
+ * 上游 200+SSE 内夹错误帧时被记成成功、不冷却、不采样，多数 SDK 静默丢弃后
+ * 用户只见「空回复」（M1/M3）
+ */
+function scanUpstreamErrors(webStream, scan) {
+  const decoder = new TextDecoder();
+  let tail = '';
+  return webStream.pipeThrough(
+    new TransformStream({
+      transform(chunk, c) {
+        c.enqueue(chunk);
+        tail = (tail + decoder.decode(chunk, { stream: true })).slice(-4096);
+        if (scan.error) return;
+        const m = tail.match(/"code"\s*:\s*(111\d\d|14003)\b/);
+        if (m) {
+          const mm = tail.match(/"message"\s*:\s*"([^"]{0,200})"/);
+          scan.error = `上游错误 code=${m[1]}${mm ? `：${mm[1]}` : ''}`;
+        }
+      },
+      flush() {
+        try {
+          const rest = decoder.decode();
+          if (rest && !scan.error) {
+            const m = (tail + rest).match(/"code"\s*:\s*(111\d\d|14003)\b/);
+            if (m) scan.error = `上游错误 code=${m[1]}`;
+          }
+        } catch {
+          /* 解码尾包失败无所谓 */
+        }
+      },
+    })
+  );
+}
+
+/**
+ * 模型名统一兜底（四协议入口共用）：
+ * 1. 命中别名表 → 替换（harness 默认名直传会撞上游 11102）；
+ * 2. 在清单内 → 原样；
+ * 3. 其它（harness 新版本的新默认名，别名表来不及覆盖）→ 记日志并回落到清单推荐模型，
+ *    原样转发等于必败（L3/M6：Gemini 端点此前连别名都没有）。
+ */
+function resolveModel(model) {
+  const m = String(model || '').trim();
+  const aliased = applyModelAlias(m);
+  if (aliased !== m) {
+    console.log(`[proxy] 模型别名：${m} → ${aliased}（客户端未使用清单内模型名）`);
+    return aliased;
+  }
+  if (!m || state.models.ids.includes(m)) return m;
+  const fallback = pickTestModel(state.models.ids);
+  if (fallback) {
+    console.log(`[proxy] 未识别模型 ${m}，回落到 ${fallback}（如需指定请用清单内模型名）`);
+    return fallback;
+  }
+  return m;
+}
+
+/** 原始 system 文本（净化前）——capture11128 采样要的是「上游看到什么」之外的原文，
+ * 此前 messages 被就地净化后采样到的已是改写版，失去排障价值（L2） */
+const RAW_SYSTEM = new WeakMap();
+export function rawSystemOf(body) {
+  return RAW_SYSTEM.get(body) || null;
+}
+
 /** OpenAI 入站 body → 上游 body：白名单过滤 + system 文本净化（导出供协议测试直接断言） */
 export function buildUpstreamBody(inbound) {
   const out = {};
@@ -294,6 +367,12 @@ export function buildUpstreamBody(inbound) {
   }
   if (!Array.isArray(out.messages) || !out.messages.length) throw new Error('缺少 messages');
   if (!out.model) throw new Error('缺少 model');
+  // 先留一份净化前的 system 原文给 11128 采样（WeakMap 不进上游请求体）
+  const rawSys = out.messages
+    .filter((m) => m && (m.role === 'system' || m.role === 'developer'))
+    .map((m) => (typeof m.content === 'string' ? m.content : JSON.stringify(m.content)))
+    .join('\n---\n');
+  if (rawSys) RAW_SYSTEM.set(out, rawSys);
   // system 级文本出站前净化（竞品系统提示词逐字命中上游风控会被 11128 拦截）；
   // 用户消息不受影响。理由与实证见 sanitize.mjs。
   sanitizeMessages(out.messages);
@@ -489,14 +568,8 @@ async function handleChat(req, res) {
     return res.status(400).json({ error: err.message });
   }
   // 客户端默认模型名（deepseek-chat / gpt-5 / claude-* 等）→ 清单内真实模型，
-  // 避免上游 11102「模型不可用」直接拒绝（harness 不认账，用户只能改配置）
-  {
-    const aliased = applyModelAlias(body.model);
-    if (aliased !== body.model) {
-      console.log(`[proxy] 模型别名：${body.model} → ${aliased}（客户端未使用清单内模型名）`);
-      body.model = aliased;
-    }
-  }
+  // 未识别的新默认名回落到清单推荐模型，避免上游 11102「模型不可用」（harness 不认账）
+  body.model = resolveModel(body.model);
 
   const pool = orderPool(poolAccounts(), String(body.model));
   if (!pool.length) {
@@ -507,17 +580,81 @@ async function handleChat(req, res) {
 
   const timeoutMs = Number(cfg.proxy?.timeoutMs) || DEFAULT_PROXY.timeoutMs;
   const isStream = !!body.stream;
+  const signal = clientAbort(res); // 客户端断开传导到上游（M2），此前本端点根本没建
+  const deadline = Date.now() + REQUEST_BUDGET_MS;
   const errors = [];
 
   // 按出站顺序逐个账号试：每个账号最多两轮（一轮直发，401/403 时刷新后重试一轮），
   // 撞限额的「账号×模型」记 10 分钟冷却，全部失败才放弃
   for (let i = 0; i < pool.length; i++) {
     const account = pool[i];
+    if (Date.now() > deadline) {
+      errors.push(`单请求总时间预算（${REQUEST_BUDGET_MS / 1000} 秒）耗尽，停止尝试剩余账号`);
+      break;
+    }
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
         if (attempt === 0 && needsRefresh(account)) await refreshAccessToken(account);
-        const out = await chatComplete(account, body, { timeoutMs });
+        const out = await chatComplete(account, body, { timeoutMs, signal });
         if (out.ok) {
+          if (isStream) {
+            // 流式的成败要等流走完才知道（断流 / 中途错误帧），不能上来就记成功（M1）
+            const scan = { error: null };
+            res.status(out.status);
+            res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+            res.setHeader('Cache-Control', 'no-cache');
+            res.setHeader('Connection', 'keep-alive');
+            res.setHeader('X-Accel-Buffering', 'no');
+            try {
+              await pipeStream(scanUpstreamErrors(out.stream, scan), res);
+            } catch (pipeErr) {
+              // 头已发出：必须写一帧 OpenAI 形状的错误再收尾（H5 后半）——此前异常
+              // 冒泡到 wrap，res.status(500).json() 的裸 JSON 被 end 进 SSE 流，
+              // 客户端既看不到错误帧也等不到 [DONE]
+              if (!res.writableEnded) {
+                res.write(
+                  `data: ${JSON.stringify({
+                    error: { message: `上游流中断：${String(pipeErr?.message || pipeErr)}`, type: 'upstream_error', code: 502 },
+                  })}\n\n`
+                );
+                res.write('data: [DONE]\n\n');
+                res.end();
+              }
+              summarizeLog();
+              state.stats.failed += 1;
+              res.locals.proxyLogged = true;
+              const msg = `上游流中断：${pipeErr?.message || pipeErr}`;
+              if (isQuotaError(msg)) markCooldown(account.id, String(body.model));
+              capture11128('chat', body, [msg]);
+              log({ at: Date.now(), ok: false, status: 502, model: String(body.model), stream: true, account: accountMeta(account).name, ms: Date.now() - started, error: msg.slice(0, 300), ua: uaOf(req), auth: authLabel(req), path: pathOf(req) });
+              return; // 响应已终止，绝不能再换下一个账号
+            }
+            if (scan.error) {
+              // 上游 200 但 SSE 里夹了错误帧：此前被记成功、不冷却、不采样（M1/M3）
+              summarizeLog();
+              state.stats.failed += 1;
+              res.locals.proxyLogged = true;
+              if (isQuotaError(scan.error)) markCooldown(account.id, String(body.model));
+              capture11128('chat', body, [scan.error]);
+              log({ at: Date.now(), ok: false, status: 200, model: String(body.model), stream: true, account: accountMeta(account).name, ms: Date.now() - started, error: scan.error.slice(0, 300), ua: uaOf(req), auth: authLabel(req), path: pathOf(req) });
+              return;
+            }
+            summarizeLog();
+            state.stats.ok += 1;
+            log({
+              at: Date.now(),
+              ok: true,
+              status: out.status,
+              model: String(body.model),
+              stream: true,
+              account: accountMeta(account).name,
+              ms: Date.now() - started,
+              ua: uaOf(req),
+              auth: authLabel(req),
+              path: pathOf(req),
+            });
+            return;
+          }
           summarizeLog();
           state.stats.ok += 1;
           log({
@@ -525,22 +662,13 @@ async function handleChat(req, res) {
             ok: true,
             status: out.status,
             model: String(body.model),
-            stream: isStream,
+            stream: false,
             account: accountMeta(account).name,
             ms: Date.now() - started,
             ua: uaOf(req),
             auth: authLabel(req),
             path: pathOf(req),
           });
-          if (isStream) {
-            res.status(out.status);
-            res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-            res.setHeader('Cache-Control', 'no-cache');
-            res.setHeader('Connection', 'keep-alive');
-            res.setHeader('X-Accel-Buffering', 'no');
-            await pipeStream(out.stream, res);
-            return;
-          }
           res.status(out.status);
           res.setHeader('Content-Type', 'application/json; charset=utf-8');
           res.end(out.text);
@@ -590,7 +718,9 @@ async function handleModels(req, res) {
   if (!authorized(req)) return res.status(401).json({ error: 'API Key 无效' });
 
   const refresh = req.query.refresh === '1' || req.query.refresh === 'true';
-  if (refresh || !state.models.ids.length) await refreshModelsCache().catch(() => {});
+  const emptyRecentlyFailed =
+    !state.models.ids.length && Date.now() - Number(state.models.fetchedAt || 0) < 60_000; // 拉取失败会写入空清单，失败结果也要有短 TTL，否则轮询型客户端每次请求都全池撞上游
+  if (refresh || (!state.models.ids.length && !emptyRecentlyFailed)) await refreshModelsCache().catch(() => {});
 
   const now = Math.floor(Date.now() / 1000);
   // Anthropic 客户端（Claude Code / ZCode）按 Anthropic 的模型列表形状解析
@@ -691,8 +821,14 @@ function markFailed(res, { started, model, stream, errors }) {
  */
 async function runAcrossPool(pool, task, model) {
   const errors = [];
+  // 端到端预算：池大时逐账号串行最坏 60s×N，客户端干等数分钟（M4）
+  const deadline = Date.now() + REQUEST_BUDGET_MS;
   for (let i = 0; i < pool.length; i++) {
     const account = pool[i];
+    if (Date.now() > deadline) {
+      errors.push(`单请求总时间预算（${REQUEST_BUDGET_MS / 1000} 秒）耗尽，停止尝试剩余账号`);
+      break;
+    }
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
         if (attempt === 0 && needsRefresh(account)) await refreshAccessToken(account).catch(() => {});
@@ -741,14 +877,9 @@ async function handleMessages(req, res) {
   }
   if (!upstream.messages?.length) return anthropicError(res, 400, '缺少 messages');
   if (!upstream.model) return anthropicError(res, 400, '缺少 model');
-  // Claude Code / ZCode 默认发 claude-* 模型名 → 映射成清单内真实模型，避免上游 11102
-  {
-    const aliased = applyModelAlias(upstream.model);
-    if (aliased !== upstream.model) {
-      console.log(`[proxy] 模型别名：${upstream.model} → ${aliased}（客户端未使用清单内模型名）`);
-      upstream.model = aliased;
-    }
-  }
+  // Claude Code / ZCode 默认发 claude-* 模型名 → 映射成清单内真实模型，避免上游 11102；
+  // 未识别的新默认名回落清单推荐模型（resolveModel）
+  upstream.model = resolveModel(upstream.model);
 
   // 按 Anthropic 规范：只有显式 stream:true 才流式，否则返回完整 message
   const isStream = req.body?.stream === true;
@@ -759,8 +890,9 @@ async function handleMessages(req, res) {
     if (isStream) {
       const up = await openUpstreamStream(account, upstream, { signal });
       sseHeaders(res);
+      let upErr = null;
       try {
-        await pipeAnthropicStream(up.frames, res, { model: upstream.model, signal });
+        upErr = await pipeAnthropicStream(up.frames, res, { model: upstream.model, signal });
       } catch (pipeErr) {
         if (!signal.aborted && !res.writableEnded) {
           res.write(
@@ -771,12 +903,20 @@ async function handleMessages(req, res) {
           );
           res.end();
         }
+        upErr = String(pipeErr?.message || pipeErr); // 传输中断也按失败记账
       }
-      markOk({ started, model: upstream.model, stream: true, account, req });
+      if (upErr) {
+        // 上游 in-band 错误帧或断流：此前无条件 markOk，失败被记成功、不冷却、不采样（M1）
+        markFailed(res, { started, model: upstream.model, stream: true, errors: [upErr] });
+        if (isQuotaError(upErr)) markCooldown(account.id, upstream.model);
+        capture11128('messages', upstream, [upErr]);
+      } else {
+        markOk({ started, model: upstream.model, stream: true, account, req });
+      }
       return 'done';
     }
 
-    const out = await chatComplete(account, upstream, { timeoutMs });
+    const out = await chatComplete(account, upstream, { timeoutMs, signal });
     if (out.ok) {
       let parsed;
       try {
@@ -819,14 +959,8 @@ async function handleResponses(req, res) {
   const upstream = responsesToOpenAi(req.body || {});
   if (!upstream.messages?.length) return responsesError(res, 400, '缺少 input');
   if (!upstream.model) return responsesError(res, 400, '缺少 model');
-  // 客户端默认模型名（gpt-5.x 等）→ 清单内真实模型，避免上游 11102 直接拒绝
-  {
-    const aliased = applyModelAlias(upstream.model);
-    if (aliased !== upstream.model) {
-      console.log(`[proxy] 模型别名：${upstream.model} → ${aliased}（客户端未使用清单内模型名）`);
-      upstream.model = aliased;
-    }
-  }
+  // 客户端默认模型名（gpt-5.x 等）→ 清单内真实模型；未识别的新默认名回落清单推荐模型
+  upstream.model = resolveModel(upstream.model);
 
   // 按 Responses 规范：只有显式 stream:true 才流式
   const isStream = req.body?.stream === true;
@@ -837,8 +971,9 @@ async function handleResponses(req, res) {
     if (isStream) {
       const up = await openUpstreamStream(account, upstream, { signal });
       sseHeaders(res);
+      let upErr = null;
       try {
-        await pipeResponsesStream(up.frames, res, { model: upstream.model, signal });
+        upErr = await pipeResponsesStream(up.frames, res, { model: upstream.model, signal });
       } catch (pipeErr) {
         if (!signal.aborted && !res.writableEnded) {
           res.write(
@@ -849,12 +984,19 @@ async function handleResponses(req, res) {
           );
           res.end();
         }
+        upErr = String(pipeErr?.message || pipeErr); // 传输中断也按失败记账
       }
-      markOk({ started, model: upstream.model, stream: true, account, req });
+      if (upErr) {
+        markFailed(res, { started, model: upstream.model, stream: true, errors: [upErr] });
+        if (isQuotaError(upErr)) markCooldown(account.id, upstream.model);
+        capture11128('responses', upstream, [upErr]);
+      } else {
+        markOk({ started, model: upstream.model, stream: true, account, req });
+      }
       return 'done';
     }
 
-    const out = await chatComplete(account, upstream, { timeoutMs });
+    const out = await chatComplete(account, upstream, { timeoutMs, signal });
     if (out.ok) {
       let parsed;
       try {
@@ -904,7 +1046,7 @@ async function handleGemini(req, res) {
   const started = Date.now();
   const endpoint = String(req.params?.[1] || 'generateContent');
   const rawModel = decodeURIComponent(String(req.params?.[0] || ''));
-  const model = rawModel.replace(/^models\//, '');
+  const model = resolveModel(rawModel.replace(/^models\//, '')); // Gemini CLI 默认名（gemini-*）此前无别名兜底，直传必撞 11102（M6）
 
   const cfg = loadConfig();
   if (!cfg.proxy?.enabled) return geminiError(res, 403, '反向代理未开启，请在控制台「反向代理」页面开启');
@@ -932,8 +1074,9 @@ async function handleGemini(req, res) {
     if (isStream) {
       const up = await openUpstreamStream(account, upstream, { signal });
       sseHeaders(res);
+      let upErr = null;
       try {
-        await pipeGeminiStream(up.frames, res, { model: upstream.model, signal });
+        upErr = await pipeGeminiStream(up.frames, res, { model: upstream.model, signal });
       } catch (pipeErr) {
         if (!signal.aborted && !res.writableEnded) {
           res.write(
@@ -943,12 +1086,19 @@ async function handleGemini(req, res) {
           );
           res.end();
         }
+        upErr = String(pipeErr?.message || pipeErr); // 传输中断也按失败记账
       }
-      markOk({ started, model: upstream.model, stream: true, account, req });
+      if (upErr) {
+        markFailed(res, { started, model: upstream.model, stream: true, errors: [upErr] });
+        if (isQuotaError(upErr)) markCooldown(account.id, upstream.model);
+        capture11128('gemini', upstream, [upErr]);
+      } else {
+        markOk({ started, model: upstream.model, stream: true, account, req });
+      }
       return 'done';
     }
 
-    const out = await chatComplete(account, upstream, { timeoutMs });
+    const out = await chatComplete(account, upstream, { timeoutMs, signal });
     if (out.ok) {
       let parsed;
       try {
@@ -978,7 +1128,9 @@ async function handleGeminiModels(req, res) {
   if (!authorized(req)) return geminiError(res, 401, 'API Key 无效');
 
   const refresh = req.query.refresh === '1' || req.query.refresh === 'true';
-  if (refresh || !state.models.ids.length) await refreshModelsCache().catch(() => {});
+  const emptyRecentlyFailed =
+    !state.models.ids.length && Date.now() - Number(state.models.fetchedAt || 0) < 60_000; // 拉取失败会写入空清单，失败结果也要有短 TTL，否则轮询型客户端每次请求都全池撞上游
+  if (refresh || (!state.models.ids.length && !emptyRecentlyFailed)) await refreshModelsCache().catch(() => {});
   res.json(geminiModelsPayload(state.models.ids));
 }
 
