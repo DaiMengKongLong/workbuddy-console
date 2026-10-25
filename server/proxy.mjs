@@ -111,9 +111,11 @@ function friendlyNetError(err, proxyUrl, url, hint) {
 
 /** 统一出站请求入口：自动带代理；网络层失败时给出可排障的错误信息。
  * opts 透传给 fetch；内部解析代理时同样支持 { systemProxy } 透传（测试用）。
- * opts.netHint 覆盖排障提示文案（会被剥离，不会传给 fetch）。 */
+ * opts.netHint 覆盖排障提示文案（会被剥离，不会传给 fetch）。
+ * opts.timeoutMs 默认 120s：调用方没自建 AbortSignal 时兜底——此前无任何超时，
+ * 挂起只能等 undici 默认 300 秒，扫码轮询/用量采集会同时占住多个并发槽。 */
 export async function proxyFetch(url, opts = {}) {
-  const { systemProxy, netHint, ...fetchOpts } = opts;
+  const { systemProxy, netHint, timeoutMs = 120_000, ...fetchOpts } = opts;
   // 国内官方域名（codebuddy.cn）强制直连：它是境内站，直连 100% 可达；
   // 走系统/环境代理反而是纯故障源——代理软件一关，全部账号「余额暂不可用」
   // （2026-10-21 用户实测：系统代理 127.0.0.1:15715 残留在注册表，代理已关）。
@@ -124,12 +126,23 @@ export async function proxyFetch(url, opts = {}) {
     /* 非法 URL 交给 fetch 自己报错 */
   }
   const proxyUrl = domestic ? null : await getProxyUrl({ systemProxy });
+  // 调用方已带 signal 就不叠加（abort 优先级由调用方语义决定）；否则挂默认超时
+  const withTimeout = fetchOpts.signal
+    ? fetchOpts
+    : (() => {
+        const ctrl = new AbortController();
+        const t = setTimeout(() => ctrl.abort(new Error(`请求超过 ${timeoutMs / 1000} 秒未完成`)), timeoutMs);
+        return { ...fetchOpts, signal: ctrl.signal, __timer: t };
+      })();
+  const { __timer: timer, ...fetchInit } = withTimeout;
   try {
     if (proxyUrl) {
-      return await undiciFetch(url, { ...fetchOpts, dispatcher: agentFor(proxyUrl) });
+      return await undiciFetch(url, { ...fetchInit, dispatcher: agentFor(proxyUrl) });
     }
-    return await fetch(url, fetchOpts);
+    return await fetch(url, fetchInit);
   } catch (err) {
     throw new Error(friendlyNetError(err, proxyUrl, url, netHint));
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }

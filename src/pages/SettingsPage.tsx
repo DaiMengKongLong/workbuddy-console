@@ -129,6 +129,8 @@ export default function SettingsPage() {
   const [checkin, setCheckin] = useState<CheckinStatusResponse | null>(null);
   const [checkinLoading, setCheckinLoading] = useState(false);
   const [checkingIn, setCheckingIn] = useState(false);
+  /** 单账号领取的 busy（按账号 id 区分，避免全部行一起转圈） */
+  const [checkingInId, setCheckingInId] = useState<string | null>(null);
 
   /* ---------------- 凭据自动刷新 ---------------- */
   const [refreshInfo, setRefreshInfo] = useState<AccountRefreshResponse | null>(null);
@@ -284,6 +286,17 @@ export default function SettingsPage() {
     void loadCheckin(true);
     void loadRefreshInfo();
     void loadUpdateInfo(false);
+    // 「运行状态」卡此前只在挂载拉一次；页面常驻挂载，切回来显示的是旧快照。
+    // 跟 30s 一次（与顶栏 chip 同节奏），页面不可见时暂停
+    let timer: number | undefined;
+    const tick = () => {
+      if (!document.hidden) loadStatus();
+      timer = window.setTimeout(tick, 30_000);
+    };
+    timer = window.setTimeout(tick, 30_000);
+    return () => {
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
   }, [loadSettings, loadStatus, loadBackups, loadLocalLogs, loadPerm, loadCheckin, loadRefreshInfo, loadUpdateInfo]);
 
   /** 重新检测数据目录与运行状态 */
@@ -407,7 +420,12 @@ export default function SettingsPage() {
   };
 
   const runCheckin = async (accountId?: string) => {
-    setCheckingIn(true);
+    // 按账号 id 记 busy：此前共用一个 checkingIn，任一行领取时全部行一起转圈
+    if (accountId) {
+      setCheckingInId(accountId);
+    } else {
+      setCheckingIn(true);
+    }
     try {
       if (accountId) {
         const r = await post<{ ok: boolean; action: string; message: string; growth?: { report: string } }>(
@@ -430,7 +448,8 @@ export default function SettingsPage() {
     } catch (e: any) {
       toast('err', e?.message || '领取失败');
     } finally {
-      setCheckingIn(false);
+      if (accountId) setCheckingInId(null);
+      else setCheckingIn(false);
     }
   };
 
@@ -705,8 +724,8 @@ export default function SettingsPage() {
                     <Button
                       size="sm"
                       variant="subtle"
-                      loading={checkingIn}
-                      disabled={!s.ok}
+                      loading={checkingInId === s.account.id}
+                      disabled={!s.ok || (!!checkingInId && checkingInId !== s.account.id)}
                       onClick={() => runCheckin(s.account.id)}
                       title="签到（未签时）+ 领取成长中心全部可领奖励"
                     >

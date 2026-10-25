@@ -463,7 +463,8 @@ export async function runGrowthForAccount(account, options = {}) {
           }
         }
       }
-      await claimCompleted(tasks);
+      const claimAbort = await claimCompleted(tasks);
+      if (claimAbort) return claimAbort; // 401/403：中止本轮，后续模块别再空打接口
     }
   } catch (e) {
     parts.push(`任务模块异常（${e?.message || e}）`);
@@ -499,7 +500,8 @@ export async function runGrowthForAccount(account, options = {}) {
             if (authAbort(t3.status) || noteHttp(t3, '复查任务')) break;
             const fresh = dig(t3.json, 'tasks') || [];
             for (const x of fresh) if (!titles.has(x?.task_code)) titles.set(x?.task_code, x?.title || x?.task_code);
-            await claimCompleted(fresh);
+            const ca = await claimCompleted(fresh);
+            if (ca) return ca;
             const stillPending = fresh.some((x) => pendingCodes.has(x?.task_code) && x?.accept_status !== 'claimed');
             if (!stillPending) break;
             await new Promise((r) => setTimeout(r, CLAIM_RECHECK_DELAY_MS));

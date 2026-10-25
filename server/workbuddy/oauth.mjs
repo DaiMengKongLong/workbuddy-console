@@ -198,9 +198,11 @@ export async function oauthStart(variantId = 'cn') {
     failures: 0,
   });
 
-  // 顺手清理过期记录，避免长时间不关弹窗时 Map 无限增长
+  // 顺手清理过期记录，避免长时间不关弹窗时 Map 无限增长：
+  // 未完成的到期即删；已完成的保留 1 小时供前端收尾查询，之后同样释放（含 auth_raw 引用）
   for (const [id, info] of OAUTH_STATES) {
     if (!info.done && info.expiresAt < Date.now()) OAUTH_STATES.delete(id);
+    else if (info.done && Date.now() - Number(info.doneAt || 0) > 3600_000) OAUTH_STATES.delete(id);
   }
 
   // 后台常驻采集：前端关弹窗/刷新页面都不影响账号入库
@@ -212,7 +214,7 @@ export async function oauthStart(variantId = 'cn') {
 function failOAuth(loginId, error) {
   const info = OAUTH_STATES.get(loginId);
   if (info) {
-    info.done = true;
+    info.done = true; info.doneAt = Date.now();
     info.error = error;
   }
   oauthLog('fail', { loginId, variant: info?.variant?.id, code: info?.lastCode ?? null, error });
@@ -228,7 +230,7 @@ async function pollOnce(loginId) {
   if (!info) return { done: true, error: '登录请求不存在' };
   if (info.done) return { done: true, result: info.result, error: info.error };
   if (Date.now() > info.expiresAt) {
-    info.done = true;
+    info.done = true; info.doneAt = Date.now();
     info.error = '登录超时，请重新发起扫码';
     return { done: true, error: info.error };
   }
@@ -311,7 +313,7 @@ async function pollOnce(loginId) {
    */
   const saveMs = await saveAccountsAsync(saved.accounts);
   const result = accountMeta(saved.record);
-  info.done = true;
+  info.done = true; info.doneAt = Date.now();
   info.result = result;
   info.error = null;
   oauthLog('saved', {
@@ -368,7 +370,7 @@ function startBackgroundCollect() {
       for (const [loginId, info] of OAUTH_STATES) {
         if (info.done) continue;
         if (Date.now() > info.expiresAt) {
-          info.done = true;
+          info.done = true; info.doneAt = Date.now();
           info.error = '登录超时，请重新发起扫码';
           oauthLog('expire', {
             loginId,
@@ -388,7 +390,7 @@ function startBackgroundCollect() {
           }
           // 网络持续失败时不要一直傻等，给出可读原因
           if (info.failures >= MAX_CONSECUTIVE_FAILURES) {
-            info.done = true;
+            info.done = true; info.doneAt = Date.now();
             info.error = `轮询失败：${info.lastMessage}`;
             oauthLog('fail', {
               loginId,

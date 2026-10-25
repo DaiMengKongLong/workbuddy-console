@@ -131,73 +131,90 @@ export function mergeUnion(parts, keeperId, outFile) {
     return fds.get(f);
   };
 
-  const picked = new Map(); // key -> {file, off, len, ts, src, idx}
-  const perFile = new Map();
-  let dup = 0;
-
-  for (let s = 0; s < infos.length; s++) {
-    const it = infos[s];
-    const fd = getFd(it.file);
-    const keys = [];
-    let lastTs = 0;
-    for (let i = 0; i < it.ranges.length; i++) {
-      const [off, len] = it.ranges[i];
-      const h = readLineHead(fd, off, len);
-      const ts = h.ts || lastTs;
-      lastTs = ts;
-      const key = lineKey(h, fd, off, len);
-      keys.push(key);
-      const prev = picked.get(key);
-      if (prev) {
-        dup++;
-        if (len > prev.len) picked.set(key, { file: it.file, off, len, ts, src: s, idx: i });
-        continue;
-      }
-      picked.set(key, { file: it.file, off, len, ts, src: s, idx: i });
-    }
-    perFile.set(it.id, keys);
-  }
-
-  const items = [...picked.entries()].map(([k, v]) => ({ key: k, ...v }));
-  items.sort((a, b) => a.ts - b.ts || a.src - b.src || a.idx - b.idx);
-
-  const allIds = parts.map((p) => p.id);
+  // 整段 try/finally 兜底：此前扫描/写出/校验任一步抛错（IO 错误等）都会泄漏
+  // 已打开的输入 fd 并残留 .merging 临时文件（2026-10-26 体检 M5）
   const tmp = outFile + '.merging';
-  const outFd = fs.openSync(tmp, 'w');
   try {
-    for (const it of items) {
+    const picked = new Map(); // key -> {file, off, len, ts, src, idx}
+    const perFile = new Map();
+    let dup = 0;
+
+    for (let s = 0; s < infos.length; s++) {
+      const it = infos[s];
       const fd = getFd(it.file);
-      const h = readLineHead(fd, it.off, it.len);
-      const ids = h.sid && !allIds.includes(h.sid) ? [...allIds, h.sid] : allIds;
-      copyLine(fd, outFd, it.off, it.len, ids, keeperId);
+      const keys = [];
+      let lastTs = 0;
+      for (let i = 0; i < it.ranges.length; i++) {
+        const [off, len] = it.ranges[i];
+        const h = readLineHead(fd, off, len);
+        const ts = h.ts || lastTs;
+        lastTs = ts;
+        const key = lineKey(h, fd, off, len);
+        keys.push(key);
+        const prev = picked.get(key);
+        if (prev) {
+          dup++;
+          if (len > prev.len) picked.set(key, { file: it.file, off, len, ts, src: s, idx: i });
+          continue;
+        }
+        picked.set(key, { file: it.file, off, len, ts, src: s, idx: i });
+      }
+      perFile.set(it.id, keys);
     }
+
+    const items = [...picked.entries()].map(([k, v]) => ({ key: k, ...v }));
+    items.sort((a, b) => a.ts - b.ts || a.src - b.src || a.idx - b.idx);
+
+    const allIds = parts.map((p) => p.id);
+    const outFd = fs.openSync(tmp, 'w');
+    try {
+      for (const it of items) {
+        const fd = getFd(it.file);
+        const h = readLineHead(fd, it.off, it.len);
+        const ids = h.sid && !allIds.includes(h.sid) ? [...allIds, h.sid] : allIds;
+        copyLine(fd, outFd, it.off, it.len, ids, keeperId);
+      }
+    } finally {
+      fs.closeSync(outFd);
+    }
+
+    const check = scanLineRanges(tmp);
+    if (check.ranges.length !== items.length) {
+      return { ok: false, error: `写出 ${items.length} 行，实际 ${check.ranges.length} 行` };
+    }
+    const outKeys = new Set();
+    {
+      const fd = fs.openSync(tmp, 'r');
+      try {
+        for (const [off, len] of check.ranges) outKeys.add(lineKey(readLineHead(fd, off, len), fd, off, len));
+      } finally {
+        fs.closeSync(fd);
+      }
+    }
+    for (const [fid, keys] of perFile) {
+      const miss = keys.filter((k) => !outKeys.has(k)).length;
+      if (miss) {
+        return { ok: false, error: `副本 ${String(fid).slice(0, 8)} 有 ${miss} 行未进入结果` };
+      }
+    }
+
+    const lastTs = items.length ? items[items.length - 1].ts : 0;
+    safeRenameOverwrite(tmp, outFile);
+    return { ok: true, lines: check.ranges.length, dup, bytes: fs.statSync(outFile).size, lastTs };
+  } catch (e) {
+    return { ok: false, error: `合并过程失败：${e?.message || e}` };
   } finally {
-    fs.closeSync(outFd);
-  }
-
-  const check = scanLineRanges(tmp);
-  if (check.ranges.length !== items.length) {
-    fs.rmSync(tmp, { force: true });
-    for (const fd of fds.values()) fs.closeSync(fd);
-    return { ok: false, error: `写出 ${items.length} 行，实际 ${check.ranges.length} 行` };
-  }
-  const outKeys = new Set();
-  {
-    const fd = fs.openSync(tmp, 'r');
-    for (const [off, len] of check.ranges) outKeys.add(lineKey(readLineHead(fd, off, len), fd, off, len));
-    fs.closeSync(fd);
-  }
-  for (const [fid, keys] of perFile) {
-    const miss = keys.filter((k) => !outKeys.has(k)).length;
-    if (miss) {
-      fs.rmSync(tmp, { force: true });
-      for (const fd of fds.values()) fs.closeSync(fd);
-      return { ok: false, error: `副本 ${String(fid).slice(0, 8)} 有 ${miss} 行未进入结果` };
+    for (const fd of fds.values()) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        /* 成功路径已关过，重复关闭无害 */
+      }
+    }
+    try {
+      fs.rmSync(tmp, { force: true }); // 成功路径 tmp 已被 rename 走，force 静默
+    } catch {
+      /* 残留 tmp 无害，下次合并会覆盖 */
     }
   }
-  for (const fd of fds.values()) fs.closeSync(fd);
-
-  const lastTs = items.length ? items[items.length - 1].ts : 0;
-  safeRenameOverwrite(tmp, outFile);
-  return { ok: true, lines: check.ranges.length, dup, bytes: fs.statSync(outFile).size, lastTs };
 }

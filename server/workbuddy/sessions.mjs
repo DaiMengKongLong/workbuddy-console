@@ -7,18 +7,21 @@
 function findNormCommonPrefixFull(aPath, aId, bPath, bId) {
   const CHUNK = 64 * 1024 * 1024;
   const OV = aId.length - 1;
-  const fa = fs.openSync(aPath, 'r');
-  const fb = fs.openSync(bPath, 'r');
-  const sizeA = fs.fstatSync(fa).size;
-  const sizeB = fs.fstatSync(fb).size;
-  const limit = Math.min(sizeA, sizeB);
-  const ba = Buffer.alloc(CHUNK + OV + 1);
-  const bb = Buffer.alloc(CHUNK + OV + 1);
-  const pa = Buffer.from(aId);
-  const pb = Buffer.from(bId);
-  const ph = Buffer.alloc(aId.length, 0x58);
-  let off = 0;
+  // 两个 fd 都在 try 内取得：第二个 open 或 fstat 抛错时第一个不能泄漏（L15）
+  let fa = null;
+  let fb = null;
   try {
+    fa = fs.openSync(aPath, 'r');
+    fb = fs.openSync(bPath, 'r');
+    const sizeA = fs.fstatSync(fa).size;
+    const sizeB = fs.fstatSync(fb).size;
+    const limit = Math.min(sizeA, sizeB);
+    const ba = Buffer.alloc(CHUNK + OV + 1);
+    const bb = Buffer.alloc(CHUNK + OV + 1);
+    const pa = Buffer.from(aId);
+    const pb = Buffer.from(bId);
+    const ph = Buffer.alloc(aId.length, 0x58);
+    let off = 0;
     while (off < limit) {
       const n = Math.min(CHUNK + OV, limit - off);
       fs.readSync(fa, ba, 0, n, off);
@@ -37,11 +40,11 @@ function findNormCommonPrefixFull(aPath, aId, bPath, bId) {
       off += cmp;
       if (valid <= cmp) break;
     }
+    return { prefix: limit };
   } finally {
-    fs.closeSync(fa);
-    fs.closeSync(fb);
+    if (fa !== null) fs.closeSync(fa);
+    if (fb !== null) fs.closeSync(fb);
   }
-  return { prefix: limit };
 }
 
 /**
@@ -110,33 +113,6 @@ export const APP_RUNNING_MESSAGE =
 
 const MERGE_CHUNK = 64 * 1024 * 1024;
 const MERGE_MIN_PREFIX = 64 * 1024;
-
-/** 分块比对两个文件，返回 { prefix } —— 第一个差异字节的偏移（文件较短者的长度封顶） */
-function findCommonPrefixLen(aPath, bPath) {
-  const fa = fs.openSync(aPath, 'r');
-  const fb = fs.openSync(bPath, 'r');
-  const sizeA = fs.fstatSync(fa).size;
-  const sizeB = fs.fstatSync(fb).size;
-  const limit = Math.min(sizeA, sizeB);
-  const ba = Buffer.alloc(MERGE_CHUNK);
-  const bb = Buffer.alloc(MERGE_CHUNK);
-  let off = 0;
-  try {
-    while (off < limit) {
-      const n = Math.min(MERGE_CHUNK, limit - off);
-      fs.readSync(fa, ba, 0, n, off);
-      fs.readSync(fb, bb, 0, n, off);
-      for (let i = 0; i < n; i++) {
-        if (ba[i] !== bb[i]) return { prefix: off + i };
-      }
-      off += n;
-    }
-  } finally {
-    fs.closeSync(fa);
-    fs.closeSync(fb);
-  }
-  return { prefix: limit };
-}
 
 /**
  * id 归一化版前缀比对：把两文件头部的各自会话 id 替换成等长占位符后，
@@ -1133,45 +1109,6 @@ function backupSessionDb(variantId) {
 }
 
 /**
- * 持久化写：临时文件 → fsync → 落盘覆盖。
- * 落盘用 persistTmpOverwrite（rename / copy / 直接写 三策略 × 5 轮退避重试），
- * 扛过 genie-safe-delete shim 的间歇性拦截（连续三天 EPERM 的根因）。
- */
-function durableWrite(file, text) {
-  const tmp = `${file}.tmp-${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
-  try {
-    const fd = fs.openSync(tmp, 'wx');
-    try {
-      fs.writeFileSync(fd, text);
-      fs.fsyncSync(fd);
-    } finally {
-      fs.closeSync(fd);
-    }
-    persistTmpOverwrite(tmp, file, text);
-  } catch (err) {
-    try {
-      fs.rmSync(tmp, { force: true });
-    } catch {
-      /* ignore */
-    }
-    throw err;
-  }
-}
-
-/** 持久化追加：append 模式打开 + fsync，用于把副本的增量行写回原会话正文 */
-function durableAppend(file, currentText, lines) {
-  // 原正文若不以换行结尾，先补一个，避免把新行拼到最后一行半截上
-  const add = (currentText.length && !currentText.endsWith('\n') ? '\n' : '') + lines.join('\n') + '\n';
-  const fd = fs.openSync(file, 'a');
-  try {
-    fs.writeSync(fd, add, null, 'utf8');
-    fs.fsyncSync(fd);
-  } finally {
-    fs.closeSync(fd);
-  }
-}
-
-/**
  * 目标正文路径：沿用源文件在 `projects/` 下的相对目录。
  *
  * 客户端按会话行的 `cwd` 推导工作区目录名，而 `cwd` 复制时原样保留，
@@ -1182,43 +1119,6 @@ function targetBodyPath(sourcePath, root, newId) {
   const base = path.join(root, 'projects');
   const dir = relativeDir && !relativeDir.startsWith('..') ? path.join(base, relativeDir) : base;
   return path.join(dir, `${newId}.jsonl`);
-}
-
-/** 回读校验：旧 id 不得残留；行内 sessionId 必须全是新 id；行数不变 */
-function verifyCopiedBody(file, sourceText, oldId, newId) {
-  let text;
-  try {
-    text = fs.readFileSync(file, 'utf8');
-  } catch (err) {
-    throw new Error(`复制后的正文读取失败：${err?.message || err}`);
-  }
-  if (text.includes(oldId)) throw new Error('复制后的正文仍残留旧会话 id，未按成功处理');
-  const srcLines = sourceText.split('\n').filter((l) => l.trim()).length;
-  const lines = text.split('\n').filter((l) => l.trim());
-  if (lines.length !== srcLines) {
-    throw new Error(`复制后的正文行数不一致（期望 ${srcLines}，实际 ${lines.length}），未按成功处理`);
-  }
-  // 大文件跳过逐行解析：解析一整份 75MB 的 JSONL 要好几秒，而「旧 id 不残留」
-  // 已经足以证明替换是完整的（替换只改 id，不改结构）。
-  if (text.length <= JSONL_PARSE_LIMIT) {
-    let seen = 0;
-    for (const line of lines) {
-      let obj;
-      try {
-        obj = JSON.parse(line);
-      } catch {
-        throw new Error('复制后的正文存在无法解析的行，未按成功处理');
-      }
-      if (obj && typeof obj === 'object' && obj.sessionId !== undefined) {
-        if (String(obj.sessionId) !== newId) {
-          throw new Error('复制后的正文里有 sessionId 未指向副本，未按成功处理');
-        }
-        seen++;
-      }
-    }
-    if (seen === 0) throw new Error('复制后的正文里没有任何 sessionId 字段，未按成功处理');
-  }
-  return fs.statSync(file).size;
 }
 
 /** 复制时清空的列：云端同步痕迹（副本是新起点，不能带着旧账号的同步状态） */
@@ -2210,8 +2110,21 @@ export async function dedupeSessions({ dryRun = false } = {}) {
               }
             }
           }
-          // 同一内容指纹 = 同一个对话：不论内容多少，一律按并集合并成一份
-          const clusters = new Map([['ALL', group]]);
+          // 按并查集的连通分量分簇处理：只有「id 归一化后逐字节全等」的会话才是
+          // 同一份的副本。⚠️ 此前这里写的是 `new Map([['ALL', group]])`——把整个
+          // 指纹组当一簇合并，上面 O(n²) 全等比对的结果算完即弃（死代码）：两个
+          // **不同对话**只要前 20 条消息文本相同（同模板/同开场白极常见）就会被
+          // 并集合并成一份再软删其余，内容混串（2026-10-26 体检 M8）。内容有多有少
+          // 但确属同一对话的场景由「同步」功能（syncContentBetween）负责，去重只删
+          // 真正的全等副本——宁可少删，不可错并
+          const rowOf = new Map(group.map((r) => [String(r.id), r]));
+          const byRoot = new Map();
+          for (const id of ids) {
+            const root = fnd(id);
+            if (!byRoot.has(root)) byRoot.set(root, []);
+            byRoot.get(root).push(rowOf.get(id));
+          }
+          const clusters = byRoot;
           for (const [, cluster] of clusters) {
             if (cluster.length < 2) continue;
             const sized = cluster
@@ -2234,6 +2147,17 @@ export async function dedupeSessions({ dryRun = false } = {}) {
                   .filter((x) => x.file);
                 const keeperPath = index.get(keeper.id);
                 if (keeperPath && parts.length > 1) {
+                  // keeper 正文合并前先备份（db 备份不含正文；与 moveSessionsToAccount 的
+                  // before-merge 备份对齐——此前这里合并坏了没有任何还原点）
+                  if (backupPath) {
+                    try {
+                      const bd = path.join(backupPath, 'bodies');
+                      fs.mkdirSync(bd, { recursive: true });
+                      fs.copyFileSync(keeperPath, path.join(bd, keeper.id + '.before-merge.jsonl'));
+                    } catch {
+                      /* 备份失败不阻断合并（mergeUnion 自带校验，失败不落地） */
+                    }
+                  }
                   const mr = mergeUnion(parts, keeper.id, keeperPath);
                   if (!mr.ok) {
                     report.errors.push({ account: uid, error: `合并失败，已跳过该组：${mr.error}`, keeper: keeper.id });
@@ -2685,6 +2609,16 @@ async function moveAcrossVariants({ sourceVariant, targetVariant, sourceUid, tar
               const tmp = path.join(tmpDir, cid + '.jsonl');
               fs.copyFileSync(fromPath, tmp);
               const peerId = String(peer.row.id);
+              // 目标（peer）正文合并前先备份到搬家备份目录（此前跨档位合并无正文还原点）
+              if (dstBackup) {
+                try {
+                  const bd = path.join(dstBackup, 'bodies');
+                  fs.mkdirSync(bd, { recursive: true });
+                  fs.copyFileSync(peer.path, path.join(bd, peerId + '.before-merge.jsonl'));
+                } catch {
+                  /* 备份失败不阻断合并 */
+                }
+              }
               let mr;
               try {
                 mr = mergeUnion(
@@ -3030,6 +2964,16 @@ export async function mergeWithinAccount({ uid = null, variantId = 'cn', dryRun 
         if (!dryRun && keeper.path) {
           const parts = sized.map((x) => ({ id: x.id, file: x.path })).filter((x) => x.file);
           if (parts.length > 1) {
+            // keeper 正文合并前先备份（db 备份不含正文；2026-10-26 体检 M6）
+            if (backupPath) {
+              try {
+                const bd = path.join(backupPath, 'bodies');
+                fs.mkdirSync(bd, { recursive: true });
+                fs.copyFileSync(keeper.path, path.join(bd, keeper.id + '.before-merge.jsonl'));
+              } catch {
+                /* 备份失败不阻断合并 */
+              }
+            }
             const mr = mergeUnion(parts, keeper.id, keeper.path);
             if (!mr.ok) {
               report.errors.push({ id: keeper.id, error: `合并失败，已跳过该组：${mr.error}` });

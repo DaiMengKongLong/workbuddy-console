@@ -10,6 +10,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { VARIANT_LIST, authFilePath, dataRoot } from './variant.mjs';
+import { sessionDataRoot } from './sessions.mjs';
 import { STORE_DIR, ACCOUNTS_FILE, BACKUP_DIR } from './accounts.mjs';
 import { CONFIG_DIR, CONFIG_FILE } from '../store/config.mjs';
 
@@ -104,22 +105,29 @@ export function checkPermissions() {
     });
   }
 
-  // 2. WorkBuddy 数据目录（models.json 写入目标）
-  for (const v of VARIANT_LIST) {
-    const dir = dataRoot(v);
-    const stat = probeDirWritable(dir);
-    items.push({
-      id: `data-${v.id}`,
-      group: 'WorkBuddy 数据目录',
-      label: `${v.label}数据目录`,
-      path: dir,
-      exists: stat.exists,
-      readable: stat.readable,
-      writable: stat.writable,
-      required: 'read-write',
-      hint: stat.exists ? '载入模型会写入此目录下的 models.json。' : '该档位尚未使用过（目录不存在）。',
-      ok: stat.exists ? stat.writable : true,
-    });
+  // 2. WorkBuddy 数据目录（models.json/workbuddy.db 实际写入目标）。
+  // ⚠️ 必须用 sessionDataRoot()（国内版含 settings.workbuddyDir 覆盖），此前固定用
+  // dataRoot()——设置过自定义数据目录的机器上自检探的是没人写的目录，纯误导（M12）
+  {
+    const seen = new Set();
+    for (const v of VARIANT_LIST) {
+      const dir = sessionDataRoot(v.id);
+      if (seen.has(dir)) continue; // 两档位指向同一目录时只报一次
+      seen.add(dir);
+      const stat = probeDirWritable(dir);
+      items.push({
+        id: `data-${v.id}`,
+        group: 'WorkBuddy 数据目录',
+        label: `${v.label}数据目录`,
+        path: dir,
+        exists: stat.exists,
+        readable: stat.readable,
+        writable: stat.writable,
+        required: 'read-write',
+        hint: stat.exists ? '载入模型会写入此目录下的 models.json，会话操作读写 workbuddy.db。' : '该档位尚未使用过（目录不存在）。',
+        ok: stat.exists ? stat.writable : true,
+      });
+    }
   }
 
   // 3. 账号库（与 workbuddy-switch 共用）

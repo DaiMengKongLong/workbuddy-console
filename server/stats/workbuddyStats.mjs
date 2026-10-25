@@ -46,8 +46,10 @@ function getWorker() {
     failAllPending(err);
     worker = null;
   });
-  worker.on('exit', (code) => {
-    if (code !== 0 && pending.size) failAllPending(new Error(`统计线程异常退出（代码 ${code}）`));
+  worker.on('exit', () => {
+    // 无条件清空 pending：正常退出（被 terminate/环境回收）但消息没回来时，
+    // 这些 Promise 此前永不落定，对应请求悬挂到客户端超时
+    if (pending.size) failAllPending(new Error('统计线程已退出，结果未返回'));
     worker = null;
   });
   return worker;

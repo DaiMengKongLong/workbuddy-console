@@ -2338,7 +2338,9 @@ export default function AccountsPage() {
     try {
       const r = await post<AppStopResult>('/api/workbuddy/stop');
       if (r?.wasRunning) {
-        toast('ok', `已退出 WorkBuddy（结束 ${r.killed.length} 个进程${r.forced ? '，强制结束' : ''}）`);
+        // 提速版 stopWorkbuddy 用一条 taskkill 结束整棵树、不再逐个枚举（killed 恒空），
+        // 文案只说结论，不编造进程数
+        toast('ok', `已退出 WorkBuddy${r.forced ? '（强制结束）' : ''}`);
       } else {
         toast('ok', 'WorkBuddy 本来就没有在运行');
       }
