@@ -1089,14 +1089,31 @@ app.get(['/', '/index.html'], (req, res, next) => {
     if (base) {
       html = html.replace(/<head>/i, `<head>\n    <base href="${base}">`);
     }
+    // ⚠️ 必须显式关掉缓存：index.html 只带 ETag 时，手机端 WebView（飞牛 App 内打开）
+    // 会强缓存旧的首页，于是引用的还是旧 hash 的 JS/CSS —— 表现为"发了新版但手机上没变化"。
+    // 这里强制每次回源，资源文件名本身带 hash，所以不会影响加载速度。
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+    res.set('Pragma', 'no-cache');
     res.type('html').send(html);
   } catch {
     next();
   }
 });
 
-app.use(express.static(DIST));
+// 带 hash 的静态资源可以放心长缓存；其余（如 favicon）走短缓存
+app.use(
+  express.static(DIST, {
+    setHeaders(res, filePath) {
+      if (/\.[0-9a-f]{8,}\.(js|css|woff2?|png|svg|ico)$/i.test(filePath)) {
+        res.set('Cache-Control', 'public, max-age=31536000, immutable');
+      } else {
+        res.set('Cache-Control', 'no-cache');
+      }
+    },
+  })
+);
 app.get(/^\/(?!api\/).*/, (req, res) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
   res.sendFile(path.join(DIST, 'index.html'));
 });
 
