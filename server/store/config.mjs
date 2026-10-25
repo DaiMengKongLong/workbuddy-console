@@ -11,7 +11,15 @@ export const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
 export const CACHE_DIR = path.join(CONFIG_DIR, 'cache');
 
 const DEFAULT_SETTINGS = {
-  workbuddyDir: '', // 覆盖默认 ~/.workbuddy
+  workbuddyDir: '', // 覆盖默认 ~/.workbuddy（**数据目录**：sessions/projects/workbuddy.db）
+  /**
+   * 客户端**安装**目录（如 `E:\workbuddy`）。与上面的数据目录是两件事：
+   * 装到盘符根、非 Program Files 的位置时自动扫描可能扫不到，切号后「自动重新打开」
+   * 就会报「未能定位可执行文件」——填这里可以直接指定。
+   */
+  workbuddyInstallDir: '',
+  /** 直接指定客户端 exe 的绝对路径；优先级高于安装目录 */
+  workbuddyExePath: '',
   proxyUrl: '', // 出站代理（如 http://127.0.0.1:7890）；留空自动探测环境变量 / Windows 系统代理
   autoCheckin: true, // 自动签到（仅国内版账号，服务端每小时巡检一次）；默认开启，可在设置里关闭
   // 凭据自动刷新（服务端每 6 小时巡检一次，只在 access/refresh 临期时才动手）；默认开启。
@@ -87,41 +95,47 @@ const PERSIST_STRATEGIES = [
 ];
 
 /**
- * 把已写好的临时文件落盘到目标：三种策略轮试 × 8 轮退避重试。
- *
- * 退避序列 0/250/600/1500/3000/6000/10000/15000 ≈ 最坏 36 秒 —— 本机存在「外部进程
- * 瞬时锁定/扫描用户目录」的现象（2026-10-24 实测 config.json 的 EPERM 持续超过
- * 原来的 5.4 秒窗口），用户点一次按钮等几十秒也比直接报错好。
- * 全链失败才抛最后一轮错误。
+ * 落盘重试窗口：0/250/600/1500/3000/6000/10000/15000 ≈ 最坏 36 秒。
+ * 本机存在「外部进程间歇性锁定/扫描/删除新文件」的现象：一次 EPERM 可能持续
+ * 几十秒甚至几分钟（2026-10-25 实测 auth 目录锁了 3 分钟左右），所以**创建临时
+ * 文件本身也必须在这个窗口里重试**——早期实现只给写临时文件 2 秒，窗口一来
+ * 直接放弃，用户看到的就是「写入登录态文件失败（已重试 2 秒）」。
  */
 const PERSIST_DELAYS = [0, 250, 600, 1500, 3000, 6000, 10000, 15000];
 
-/** 写临时文件本身也可能被拦（新建文件同样会 EPERM）：单独带重试 */
-function writeTmpWithRetry(tmp, text) {
+/**
+ * 关键文件（登录态 workbuddy-desktop.info）专用的加长窗口：常规 36 秒之上再追加
+ * 8 轮 × 20 秒（约 2.6~3 分钟）。实测本机写不进登录态文件有两类窗口，36 秒都盖不住
+ * （2026-10-25 用户切换账号连续报「已重试 38 秒」）：
+ * 1. WorkBuddy 被 taskkill 强杀后被「崩溃自动恢复」拉起，新实例启动期间锁住 auth 文件
+ *    ——而切换流程里「杀进程 → 搬会话 → 写登录态」中间还隔着可能耗时几十秒的会话搬家；
+ * 2. 未查明的外部进程间歇性锁 auth 目录（同日实测约 3 分钟）。
+ */
+export const CRITICAL_WRITE_DELAYS = [...PERSIST_DELAYS, ...Array(8).fill(20_000)];
+
+/** 单轮落盘：对已存在的临时文件依次尝试三种覆盖策略（rename → copy → 直接写），不重试 */
+function persistTmpOnce(tmp, file, text) {
   let lastErr = null;
-  for (let i = 0; i < 5; i++) {
-    if (i > 0) syncSleep(200 * i);
+  for (const strategy of PERSIST_STRATEGIES) {
     try {
-      fs.writeFileSync(tmp, text, 'utf8');
+      strategy(tmp, file, text);
       return;
     } catch (err) {
       lastErr = err;
     }
   }
-  throw lastErr || new Error(`写临时文件失败：${tmp}`);
+  throw lastErr;
 }
 
 export function persistTmpOverwrite(tmp, file, text) {
   let lastErr = null;
   for (const delay of PERSIST_DELAYS) {
     if (delay > 0) syncSleep(delay);
-    for (const strategy of PERSIST_STRATEGIES) {
-      try {
-        strategy(tmp, file, text);
-        return;
-      } catch (err) {
-        lastErr = err;
-      }
+    try {
+      persistTmpOnce(tmp, file, text);
+      return;
+    } catch (err) {
+      lastErr = err;
     }
   }
   throw lastErr || new Error(`落盘失败：${file}`);
@@ -151,26 +165,86 @@ export function safeRenameOverwrite(tmp, file) {
 }
 
 /**
- * 原子写 JSON：先写临时文件，再按「rename → copy 覆盖 → 直接写」三策略 × 5 轮
- * 退避重试落盘（详见 persistTmpOverwrite）。同步接口，调用方无需改动。
+ * 一轮完整的写入尝试（不重试）：
+ *   1) 临时文件写在**目标所在目录**（rename 原子）；
+ *   2) 失败则写在**系统临时目录**（copyFileSync 跨目录覆盖，实测可用）；
+ *   3) 都失败再直接写目标文件本身。
  *
- * ⚠️ 同步 = 阻塞事件循环：本机 EPERM 窗口内最坏会冻住整个 HTTP 服务 36 秒，
- * 导致前端 25 秒默认超时把「还在正常等待」误判成失败（2026-10-25 扫码添加报
- * 「25 秒超时」即此）。长耗时/用户正在等待结果的链路请用 atomicWriteJsonAsync。
- * 这里只保留慢写告警，方便事后定位。
+ * 直接写兜底要求调用方满足「有备份 + 回读校验 + 失败回滚」或「内容可重生成」——
+ * 本项目写登录态 / 配置 / 快照的调用方都满足。
  */
-export function atomicWriteJson(file, obj) {
-  const text = JSON.stringify(obj, null, 2);
-  const tmp = `${file}.tmp-${process.pid}-${Date.now()}`;
-  const started = Date.now();
-  try {
-    writeTmpWithRetry(tmp, text);
-    persistTmpOverwrite(tmp, file, text);
-  } finally {
-    cleanupTmpQuietly(tmp);
-    const ms = Date.now() - started;
-    if (ms > 2000) console.warn(`[store] 同步落盘耗时 ${ms}ms（期间服务无响应）：${file}`);
+function writeRound(file, text) {
+  const errs = [];
+  for (const base of [path.dirname(file), os.tmpdir()]) {
+    const tmp = path.join(
+      base,
+      `${path.basename(file)}.tmp-${process.pid}-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`
+    );
+    try {
+      fs.writeFileSync(tmp, text, 'utf8');
+    } catch (err) {
+      errs.push(err);
+      cleanupTmpQuietly(tmp);
+      continue;
+    }
+    try {
+      persistTmpOnce(tmp, file, text);
+      cleanupTmpQuietly(tmp);
+      return { ok: true };
+    } catch (err) {
+      errs.push(err);
+      cleanupTmpQuietly(tmp);
+    }
   }
+  try {
+    fs.writeFileSync(file, text, 'utf8');
+    return { ok: true };
+  } catch (err) {
+    errs.push(err);
+    return { ok: false, err: errs[errs.length - 1], errs };
+  }
+}
+
+/** 把一轮里的多个错误压成一行摘要（去重计数），随异常抛给调用方/用户 */
+function summarizeErrors(last) {
+  const seen = new Map();
+  for (const e of last?.errs || []) {
+    const sig = `${e.code || 'ERR'} ${e.syscall || ''} ${path.basename(String(e.path || ''))}`.trim();
+    if (!sig) continue;
+    seen.set(sig, (seen.get(sig) || 0) + 1);
+  }
+  return [...seen.entries()].map(([sig, n]) => (n > 1 ? `${sig} ×${n}` : sig)).join(' | ');
+}
+
+function failAfter(file, started, last) {
+  const summary = summarizeErrors(last);
+  // 用 console.log（stdout）：会话内重启服务若忘了 2>&1，console.warn 的 stderr 会整段丢失，
+  // 2026-10-25 排障时正是因此拿不到「各次尝试」清单
+  console.log(`[store] 落盘失败（重试 ${Math.round((Date.now() - started) / 1000)}s 仍失败）：${file}`);
+  if (summary) console.log(`[store] 各次尝试：${summary}`);
+  const err = last?.err || new Error(`落盘失败：${file}`);
+  if (summary) err.message = `${err.message}（${summary}）`;
+  return err;
+}
+
+/**
+ * 持久写任意文本（同步）：整个「建临时文件 → 覆盖 → 兜底」全流程都在 36 秒窗口内重试。
+ *
+ * 给「登录态文件 / 恢复备份 / 模型列表 / exe 路径缓存」这类**不能半写、又可能被
+ * 瞬时锁住**的关键文件用。之前这些位置是裸 `writeFileSync(tmp)`：一次瞬时 EPERM
+ * 就让整个切号失败（2026-10-25 报错 `.info.tmp-<pid>`）。
+ * @returns 落盘耗时（毫秒）
+ */
+export function durableWriteText(file, text) {
+  const started = Date.now();
+  let last = null;
+  for (const delay of PERSIST_DELAYS) {
+    if (delay > 0) syncSleep(delay);
+    const r = writeRound(file, text);
+    if (r.ok) return Date.now() - started;
+    last = r;
+  }
+  throw failAfter(file, started, last);
 }
 
 /* ---------------- 异步落盘（不阻塞事件循环） ---------------- */
@@ -178,53 +252,50 @@ export function atomicWriteJson(file, obj) {
 /** 异步 sleep：退避等待时把事件循环让给 HTTP 请求 */
 const sleepAsync = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-/** writeTmpWithRetry 的异步版：重试期间不冻结服务 */
-async function writeTmpWithRetryAsync(tmp, text) {
-  let lastErr = null;
-  for (let i = 0; i < 5; i++) {
-    if (i > 0) await sleepAsync(200 * i);
-    try {
-      fs.writeFileSync(tmp, text, 'utf8');
-      return;
-    } catch (err) {
-      lastErr = err;
-    }
-  }
-  throw lastErr || new Error(`写临时文件失败：${tmp}`);
-}
-
-/** persistTmpOverwrite 的异步版：策略与退避序列完全一致，只是等待改为异步 */
-export async function persistTmpOverwriteAsync(tmp, file, text) {
-  let lastErr = null;
-  for (const delay of PERSIST_DELAYS) {
+/** durableWriteText 的异步版：重试等待不冻结事件循环。@returns 落盘耗时（毫秒）
+ *
+ * @param opts.delays  自定义退避表（默认 36 秒窗口；登录态文件请用 CRITICAL_WRITE_DELAYS）
+ * @param opts.onRetry 每轮写盘失败后、进入下一轮退避前调用（异步）。
+ *   给调用方一个「清理外部障碍」的机会——典型用法：登录态文件写不进时，探一下
+ *   WorkBuddy 是否被崩溃自动恢复拉起并在锁文件，是就再杀一轮。守卫抛错只记日志，
+ *   不影响写盘重试本身。
+ */
+export async function durableWriteTextAsync(file, text, { delays = PERSIST_DELAYS, onRetry = null } = {}) {
+  const started = Date.now();
+  let last = null;
+  let round = 0;
+  for (const delay of delays) {
     if (delay > 0) await sleepAsync(delay);
-    for (const strategy of PERSIST_STRATEGIES) {
+    const r = writeRound(file, text);
+    if (r.ok) return Date.now() - started;
+    last = r;
+    round += 1;
+    if (onRetry && round < delays.length) {
       try {
-        strategy(tmp, file, text);
-        return;
-      } catch (err) {
-        lastErr = err;
+        await onRetry(Date.now() - started, round, r);
+      } catch (e) {
+        console.log(`[store] 写盘重试守卫异常（忽略，继续重试）：${e?.message || e}`);
       }
     }
   }
-  throw lastErr || new Error(`落盘失败：${file}`);
+  throw failAfter(file, started, last);
 }
 
 /**
- * 异步原子写 JSON：语义与 atomicWriteJson 相同，但退避等待期间服务仍能正常响应。
- * 返回本次落盘耗时（毫秒），供调用方判断是否需要告警。
+ * 原子写 JSON（同步）：等价于 durableWriteText(JSON)。
+ * ⚠️ 同步 = 阻塞事件循环：EPERM 窗口内最坏冻结服务 36 秒，用户正在等待结果的
+ * 链路请改用 atomicWriteJsonAsync（2026-10-25 扫码/重新生成 Key 两次反馈）。
  */
-export async function atomicWriteJsonAsync(file, obj) {
-  const text = JSON.stringify(obj, null, 2);
-  const tmp = `${file}.tmp-${process.pid}-${Date.now()}`;
+export function atomicWriteJson(file, obj) {
   const started = Date.now();
-  try {
-    await writeTmpWithRetryAsync(tmp, text);
-    await persistTmpOverwriteAsync(tmp, file, text);
-    return Date.now() - started;
-  } finally {
-    cleanupTmpQuietly(tmp);
-  }
+  const ms = durableWriteText(file, JSON.stringify(obj, null, 2));
+  if (ms > 2000) console.warn(`[store] 同步落盘耗时 ${ms}ms（期间服务无响应）：${file}`);
+  return ms;
+}
+
+/** 原子写 JSON（异步）：退避等待期间服务仍能正常响应。@returns 落盘耗时（毫秒） */
+export async function atomicWriteJsonAsync(file, obj) {
+  return durableWriteTextAsync(file, JSON.stringify(obj, null, 2));
 }
 
 export function loadConfig() {

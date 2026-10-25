@@ -889,6 +889,34 @@ export function sessionDataRoot(variantId) {
   return id === 'cn' ? workbuddyDir() : path.join(os.homedir(), '.workbuddy-ai');
 }
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * SQLite 瞬时错误重试。
+ *
+ * WorkBuddy 被结束后可能被系统的「崩溃自动恢复」在几秒内重新拉起，新实例会立刻打开
+ * workbuddy.db；写入撞锁（SQLITE_BUSY / SQLITE_LOCKED）或被杀软拦一下（EPERM/EBUSY）
+ * 都是瞬时的，隔几百毫秒再来一次基本就过了。
+ * 此前一次失败就把整条会话记成错误——用户看到的就是「转移会话失败」，而实际只是一次抖动。
+ */
+async function retryDbWrite(fn, { tries = 4, delays = [120, 300, 700] } = {}) {
+  let lastErr = null;
+  for (let i = 0; i < tries; i++) {
+    try {
+      return fn();
+    } catch (err) {
+      lastErr = err;
+      const text = `${err?.code || ''} ${err?.message || err}`;
+      const retryable = /SQLITE_BUSY|SQLITE_LOCKED|database is locked|table is locked|EBUSY|EPERM|EACCES|disk I\/O error/i.test(
+        text
+      );
+      if (!retryable || i === tries - 1) break;
+      await sleep(delays[Math.min(i, delays.length - 1)]);
+    }
+  }
+  throw lastErr;
+}
+
 /** 打开会话数据库；readOnly 用于只读查询，写操作必须用读写连接 */
 async function openSessionDb(variantId, { readOnly = false } = {}) {
   const { DatabaseSync } = await sqlite();
@@ -2452,8 +2480,13 @@ export async function moveSessionsToAccount({ targetAccountId, ids = null, dryRu
               (!peerRow || Number(row.updated_at) > Number(peerRow.updated_at)) && String(row.custom_title || '').trim()
                 ? String(row.custom_title).trim()
                 : null;
-            if (newer) db.prepare('UPDATE sessions SET custom_title = ? WHERE id = ?').run(newer, peer);
-            db.prepare('UPDATE sessions SET deleted_at = ? WHERE id = ?').run(Date.now(), cid);
+            if (newer)
+              await retryDbWrite(() =>
+                db.prepare('UPDATE sessions SET custom_title = ? WHERE id = ?').run(newer, peer)
+              );
+            await retryDbWrite(() =>
+              db.prepare('UPDATE sessions SET deleted_at = ? WHERE id = ?').run(Date.now(), cid)
+            );
             ledgerAdds.push({ sourceId: cid, newId: peer });
             // 源正文同盘移动进备份目录：磁盘不再保留重复内容，但随时可找回
             if (fromPath && toPath && fromPath !== toPath) {
@@ -2469,7 +2502,15 @@ export async function moveSessionsToAccount({ targetAccountId, ids = null, dryRu
         } else {
           // 目标没有：直接过户（改归属，正文文件不动）
           if (!dryRun) {
-            db.prepare('UPDATE sessions SET user_id = ?, updated_at = MAX(updated_at, ?) WHERE id = ?').run(targetUid, Date.now(), cid);
+            // 撞锁/被杀软拦一下就重试：一次抖动不该让整条会话算失败
+            const res = await retryDbWrite(() =>
+              db
+                .prepare('UPDATE sessions SET user_id = ?, updated_at = MAX(updated_at, ?) WHERE id = ?')
+                .run(targetUid, Date.now(), cid)
+            );
+            if (!res || Number(res.changes) < 1) {
+              throw new Error('UPDATE 未命中任何行（会话可能已被删除或已被别的连接改走）');
+            }
           }
           report.moved.push({ id: cid, title: displayTitle(row.title, row.custom_title), bytes: size });
           byFamRoot.set(family.rootOf(cid), cid);
@@ -2488,6 +2529,42 @@ export async function moveSessionsToAccount({ targetAccountId, ids = null, dryRu
     }
   } finally {
     db.close();
+  }
+
+  /**
+   * 写后回读校验（新连接）。
+   *
+   * node:sqlite 的 UPDATE 偶尔会「报告成功但没生效」——库被正在重启的 WorkBuddy 实例
+   * 或安全软件回滚了。此前这种静默失败会直接算进 moved，界面提示成功、用户回到会话列表
+   * 却发现会话还在原账号（2026-10-25 反馈）。这里复核一遍，把静默失败变成明确错误。
+   */
+  if (!dryRun && (report.moved.length || report.merged.length)) {
+    try {
+      const checkDb = await openSessionDb(variantId, { readOnly: true });
+      try {
+        const notApplied = [];
+        for (const m of report.moved) {
+          const row = checkDb.prepare('SELECT user_id FROM sessions WHERE id = ?').get(String(m.id));
+          if (!row || String(row.user_id) !== String(targetUid)) notApplied.push(m.id);
+        }
+        for (const m of report.merged) {
+          const row = checkDb.prepare('SELECT user_id, deleted_at FROM sessions WHERE id = ?').get(String(m.sourceId));
+          if (row && row.deleted_at == null) notApplied.push(m.sourceId);
+        }
+        report.verified = notApplied.length === 0;
+        for (const id of notApplied) {
+          report.errors.push({
+            id,
+            error: '写入未生效（库被其它进程回滚，通常是有 WorkBuddy 实例正在运行），请退出 WorkBuddy 后重试',
+          });
+        }
+      } finally {
+        checkDb.close();
+      }
+    } catch (err) {
+      report.verified = null;
+      report.verifyError = err?.message || String(err);
+    }
   }
 
   report.ok = report.errors.length === 0;

@@ -115,6 +115,9 @@ export default function SettingsPage() {
   const [savingDir, setSavingDir] = useState(false);
   const [detecting, setDetecting] = useState(false);
   const [showManual, setShowManual] = useState(false);
+  /** 客户端安装目录（跟数据目录是两回事：切换账号后「自动重新打开」要靠它定位 exe） */
+  const [exeDir, setExeDir] = useState('');
+  const [savingExeDir, setSavingExeDir] = useState(false);
   const [proxyInput, setProxyInput] = useState('');
   const [savingProxy, setSavingProxy] = useState(false);
 
@@ -156,6 +159,7 @@ export default function SettingsPage() {
       .then((r) => {
         setSettings(r);
         setWbDir(r.workbuddyDir || '');
+        setExeDir(r.workbuddyInstallDir || '');
         setProxyInput(r.proxyUrl || '');
       })
       .catch((e) => toast('err', e.message));
@@ -320,6 +324,36 @@ export default function SettingsPage() {
       toast('err', e?.message || '保存失败');
     } finally {
       setSavingDir(false);
+    }
+  };
+
+  /**
+   * 保存客户端安装目录。
+   *
+   * 保存后服务端会立刻按该目录重新定位 exe 并回传结果——
+   * 用户填错目录时当场就知道，而不是等切完账号才看到「未能定位可执行文件」。
+   */
+  const saveExeDir = async (dir: string) => {
+    setSavingExeDir(true);
+    try {
+      const r = await put<{ workbuddyInstallDir: string; detectedExe: string | null }>(
+        '/api/settings',
+        { workbuddyInstallDir: dir },
+        { timeoutMs: TIMEOUT.write }
+      );
+      setSettings((prev) => (prev ? { ...prev, workbuddyInstallDir: r.workbuddyInstallDir, detectedExe: r.detectedExe } : prev));
+      setExeDir(r.workbuddyInstallDir);
+      if (dir.trim() && !r.detectedExe) {
+        toast('err', '该目录下没找到 WorkBuddy.exe，请选到 exe 所在的那一层目录');
+      } else if (r.detectedExe) {
+        toast('ok', `已定位到客户端：${r.detectedExe}`);
+      } else {
+        toast('ok', '已清空，恢复自动定位');
+      }
+    } catch (e: any) {
+      toast('err', e?.message || '保存失败');
+    } finally {
+      setSavingExeDir(false);
     }
   };
 
@@ -869,6 +903,58 @@ export default function SettingsPage() {
                   </div>
                 </div>
               )}
+            </>
+          )}
+        </Card>
+      </PageSection>
+
+      {/* WorkBuddy 安装目录（客户端 exe） */}
+      <PageSection
+        icon={<IconLayers />}
+        title="WorkBuddy 安装目录"
+        desc="切换账号后自动重新打开客户端时用来定位 exe"
+      >
+        <Card className="p-5">
+          {!settings ? (
+            <div className="py-6 flex justify-center">
+              <Spinner />
+            </div>
+          ) : (
+            <>
+              <div
+                className={`rounded-xl border px-3.5 py-3 ${
+                  settings.detectedExe ? 'border-emerald-200 bg-emerald-50/60' : 'border-amber-200 bg-amber-50'
+                }`}
+              >
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="font-mono text-sm text-zinc-800 break-all">
+                    {settings.detectedExe || '未定位到客户端 exe'}
+                  </span>
+                  <div className="ml-auto">
+                    {settings.detectedExe ? <Badge color="green">已定位</Badge> : <Badge color="amber">未定位</Badge>}
+                  </div>
+                </div>
+                <div className="mt-2 text-xs leading-relaxed text-zinc-600">
+                  {settings.detectedExe
+                    ? '切换账号 / 转移会话完成后，控制台会用这个路径把 WorkBuddy 重新打开。'
+                    : '定位不到客户端时，切换账号后无法自动重新打开 WorkBuddy（会改成提示你手动打开）。装在盘符根目录（如 E:\workbuddy）最容易遇到，在这里填一次即可。'}
+                </div>
+              </div>
+              <div className="mt-3 flex items-center gap-2">
+                <input
+                  value={exeDir}
+                  onChange={(e) => setExeDir(e.target.value)}
+                  onKeyDown={(e) => e.key === 'Enter' && saveExeDir(exeDir)}
+                  placeholder="例如 E:\workbuddy（填 WorkBuddy.exe 所在目录）"
+                  className="flex-1 h-9 px-3 rounded-xl border border-zinc-200 text-sm font-mono outline-none focus:border-indigo-400"
+                />
+                <Button variant="primary" loading={savingExeDir} onClick={() => saveExeDir(exeDir)}>
+                  保存
+                </Button>
+              </div>
+              <div className="mt-2 text-[11px] text-zinc-400">
+                留空保存 = 恢复自动定位（进程路径 → 上次记录 → 各盘 Program Files → 盘符根目录 → 注册表卸载项）。
+              </div>
             </>
           )}
         </Card>

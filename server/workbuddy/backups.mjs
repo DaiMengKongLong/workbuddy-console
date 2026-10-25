@@ -14,7 +14,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { BACKUP_DIR, backupAuthFile } from './accounts.mjs';
 import { VARIANT_LIST, getVariant, authFilePath } from './variant.mjs';
-import { safeRenameOverwrite } from '../store/config.mjs';
+import { durableWriteText } from '../store/config.mjs';
 
 /** 备份文件名可能来自本工具（-cn / -ai 后缀）或 workbuddy-switch（无 cn 后缀） */
 const TAG_TO_VARIANT = [
@@ -125,16 +125,10 @@ export function restoreBackup(name) {
   // 先把「当前」文件另存一份，恢复本身也可回退
   const safety = backupAuthFile(target, `workbuddy-desktop-${variant.id}`);
 
-  const tmp = `${target}.tmp-${process.pid}`;
   try {
-    fs.writeFileSync(tmp, raw, 'utf8');
-    safeRenameOverwrite(tmp, target);
+    // 与切号同一条写盘路径：带退避重试，避免一次瞬时 EPERM 就让恢复失败
+    durableWriteText(target, raw);
   } catch (e) {
-    try {
-      fs.unlinkSync(tmp);
-    } catch {
-      /* 临时文件可能未生成 */
-    }
     throw new Error(`写入登录态文件失败：${e?.message || e}`);
   }
 

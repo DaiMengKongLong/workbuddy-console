@@ -1,8 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { execFile, spawn } from 'node:child_process';
-import { loadConfig, safeRenameOverwrite } from '../store/config.mjs';
+import { execFile, execFileSync, spawn } from 'node:child_process';
+import { loadConfig, durableWriteText } from '../store/config.mjs';
 import { matchPlatformUrl } from '../providers/registry.mjs';
 
 /** 检查目录是否具备 WorkBuddy 数据目录的特征文件 */
@@ -106,10 +106,9 @@ function backupModelsJson() {
   return bak;
 }
 
+/** 本文件内部写盘：统一走带退避重试的持久写（模型列表 / exe 路径缓存都是关键文件） */
 function atomicWriteJson(file, obj) {
-  const tmp = `${file}.tmp-${process.pid}`;
-  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2), 'utf8');
-  safeRenameOverwrite(tmp, file);
+  durableWriteText(file, JSON.stringify(obj, null, 2));
 }
 
 function verifyEntries(ids, apiKey) {
@@ -319,6 +318,10 @@ async function detectViaPowerShell(names = WORKBUDDY_PROCESS_NAMES) {
   if (!rows.length) return null;
   // WorkBuddy 基于 Electron，会有多个进程（主进程 + 渲染/GPU/工具子进程）。
   const main = rows[0];
+  // 进程还活着时是**唯一能百分百读到真实安装路径**的时刻（进程一死 Path 就没了，
+  // 而任务管理器/安全软件又常把 PowerShell 挡掉）。这里顺手把路径落盘，
+  // 供「先杀进程、再重新打开」的流程在杀完之后仍然找得到 exe。
+  rememberExePath(main.exePath);
   return {
     running: true,
     pid: main.pid,
@@ -518,8 +521,17 @@ export async function detectWorkbuddyProcess({ names = WORKBUDDY_PROCESS_NAMES }
  * 与安装目录特征（目录名以这些开头）。
  */
 const WORKBUDDY_EXE_NAMES = ['WorkBuddy.exe', 'WorkBuddy AI.exe', 'WorkBuddyAI.exe', 'CodeBuddy.exe', 'CodeBuddy AI.exe'];
-const WORKBUDDY_DIR_RE = /^(workbuddy|codebuddy)/i;
-const EXE_NAME_RE = /^(workbuddy|codebuddy)[^/\\]*\.exe$/i;
+/**
+ * 安装目录名特征。
+ *
+ * 为什么不是简单的 `/^(workbuddy|codebuddy)/i`：加上盘符根目录扫描后，同前缀的非安装目录
+ * 也会被命中——`E:\workbuddy_space`（工作区）、`WorkBuddy-Console`（本工具自己）。
+ * 一旦下钻到 `WorkBuddy-Console.exe`，切号后的「重新打开」就会把我们自己拉起来。
+ * 现在只认「workbuddy/codebuddy + 可选的 ai/cn/desktop/app 后缀 + 可选版本号」。
+ */
+const WORKBUDDY_DIR_RE = /^(workbuddy|codebuddy)(?:[ _-]?(?:ai|cn|desktop|app))?(?:[ _-]?v?\d[\w.-]*)?$/i;
+/** 同理：exe 名里带 console/space 的一律不是客户端本体 */
+const EXE_NAME_RE = /^(workbuddy|codebuddy)(?![ _-]?(?:console|space))[^/\\]*\.exe$/i;
 
 function existsQuiet(p) {
   try {
@@ -601,7 +613,14 @@ export function findExeUnderRoots(roots, io = { exists: existsQuiet, listDir: li
   return best;
 }
 
-/** Windows 上值得一查的安装根目录：环境变量给的 + 所有盘符的 Program Files */
+/**
+ * Windows 上值得一查的安装根目录：环境变量给的 + 所有盘符的 Program Files + **盘符根目录**。
+ *
+ * 盘符根目录是 2026-10-25 补的：本机客户端装在 `E:\workbuddy`（盘符根 + 目录名），
+ * 四个 Program Files 一个都盖不到，于是「切换账号后自动重新打开」稳定报
+ * 「未能定位 WorkBuddy 可执行文件」。列一层目录的开销很小——findExeUnderRoots 只
+ * 下钻名字匹配 WORKBUDDY_DIR_RE 的目录，不会真去遍历整块盘。
+ */
 export function installRoots(env = process.env) {
   const roots = [];
   const push = (p) => {
@@ -619,20 +638,41 @@ export function installRoots(env = process.env) {
     push(env.LOCALAPPDATA);
   }
   if (env.APPDATA) push(path.join(env.APPDATA, 'Programs'));
+  for (const drive of ['C', 'D', 'E', 'F', 'G', 'H']) push(`${drive}:\\`);
   return roots;
 }
 
 /**
  * exe 路径持久化缓存：`~/.wb-switch/workbuddy_exe.json`（与 workbuddy-switch 共用同一文件）。
  *
- * 为什么必须缓存：WorkBuddy 常被装在自定义位置（本机 `D:\WorkbuddyCN\WorkBuddy.exe`，
- * 不在任何 Program Files / LocalAppData\Programs 下，根目录扫描扫不到 D 盘根）。
+ * 为什么必须缓存：WorkBuddy 常被装在自定义位置（本机 `E:\workbuddy\WorkBuddy.exe`，
+ * 不在任何 Program Files / LocalAppData\Programs 下）。
  * 而切换流程是「先杀进程 → 再重新打开」，杀完就再也读不到进程的真实路径了——
  * 一旦杀之前那一次 PowerShell 探测没拿到 Path，relaunch 就报「未能定位可执行文件」，
  * 用户只能手动打开（2026-10-21 用户反馈：切换后 WorkBuddy 没有自动重新打开）。
  * 缓存写入发生在杀进程之前，读取发生在 relaunch 定位时，正好补上这条链。
+ *
+ * 2026-10-25 修：`rememberExePath` 此前**从未被调用**（死代码），缓存永远是空的；
+ * 唯一一条内容来自集成测试写的临时假 exe（`%TEMP%\wb-stop-test-*\WorkBuddyFake.exe`）。
  */
-const EXE_CACHE_FILE = path.join(os.homedir(), '.wb-switch', 'workbuddy_exe.json');
+const SWITCH_HOME = String(process.env.WB_SWITCH_HOME || '').trim() || path.join(os.homedir(), '.wb-switch');
+const EXE_CACHE_FILE = path.join(SWITCH_HOME, 'workbuddy_exe.json');
+
+/**
+ * 只有「看起来就是真客户端」的路径才能被信任：排除控制台自身与测试假文件。
+ *
+ * `allowTemp`：进程**当场读到的**路径无条件相信（那是它真正在跑的位置，
+ * 便携版/测试桩都可能落在临时目录）；而缓存与目录扫描的结果不允许来自临时目录——
+ * 本机缓存里那条 `%TEMP%\wb-stop-test-*\WorkBuddyFake.exe` 就是这么混进去的。
+ */
+function looksLikeRealWorkbuddyExe(p, { allowTemp = false } = {}) {
+  const file = String(p || '');
+  if (!file) return false;
+  const base = path.basename(file);
+  if (!EXE_NAME_RE.test(base)) return false;
+  if (!allowTemp && /[\\/](?:tmp|temp)[\\/]/i.test(file)) return false;
+  return true;
+}
 
 function readExeCache() {
   try {
@@ -643,23 +683,8 @@ function readExeCache() {
   }
 }
 
-/** 缓存里第一条真实存在的 exe 路径（key 只是习惯命名，读取端只认值） */
-function exeFromCache() {
-  for (const v of Object.values(readExeCache())) {
-    const p = String(v || '');
-    if (p && existsQuiet(p)) return p;
-  }
-  return null;
-}
-
-/** 把运行中读到的 exe 路径记下来；已记录过（大小写不敏感）就不重写 */
-function rememberExePath(exePath) {
-  const p = String(exePath || '').trim();
-  if (!p || !existsQuiet(p)) return;
+function writeExeCache(data) {
   try {
-    const data = readExeCache();
-    if (Object.values(data).some((v) => String(v || '').toLowerCase() === p.toLowerCase())) return;
-    data.cn = p; // key 无所谓，读取端只按「值是否存在」匹配
     fs.mkdirSync(path.dirname(EXE_CACHE_FILE), { recursive: true });
     fs.writeFileSync(EXE_CACHE_FILE, JSON.stringify(data, null, 2));
   } catch {
@@ -667,10 +692,117 @@ function rememberExePath(exePath) {
   }
 }
 
-/** 定位 WorkBuddy 可执行文件：优先检测到的真实路径，再按常见安装位置兜底，最后扫安装根目录 */
-export function findWorkbuddyExe(detectedPath) {
-  if (existsQuiet(detectedPath)) return detectedPath;
-  // 进程已死、读不到路径时的第一条捷径：上次运行时记下的真实路径
+/** 缓存里第一条真实存在的 exe 路径；顺手清掉失效/不可信的条目（测试假路径就这么被淘汰） */
+function exeFromCache() {
+  const data = readExeCache();
+  let dirty = false;
+  let hit = null;
+  for (const [k, v] of Object.entries(data)) {
+    const p = String(v || '');
+    const usable = p && existsQuiet(p) && looksLikeRealWorkbuddyExe(p);
+    if (!usable) {
+      delete data[k];
+      dirty = true;
+      continue;
+    }
+    if (!hit) hit = p;
+  }
+  if (dirty) writeExeCache(data);
+  return hit;
+}
+
+/** 把运行中读到的 exe 路径记下来（覆盖旧值：进程活着的路径永远比历史记录可信） */
+function rememberExePath(exePath) {
+  const p = String(exePath || '').trim();
+  // 进程当场读到的路径允许来自临时目录（便携版就装在那里）
+  if (!p || !existsQuiet(p) || !looksLikeRealWorkbuddyExe(p, { allowTemp: true })) return;
+  try {
+    const data = readExeCache();
+    if (String(data.cn || '').toLowerCase() === p.toLowerCase()) return;
+    data.cn = p; // key 无所谓，读取端只按「值是否存在」匹配
+    writeExeCache(data);
+  } catch {
+    /* 缓存写失败无关紧要，不干扰主流程 */
+  }
+}
+
+/**
+ * 设置页里用户显式指定的安装位置（优先级最高：用户指过就别再猜）。
+ *
+ * 三个来源都认，是因为历史版本把「WorkBuddy 目录」这个设置说成了可指安装目录：
+ * - workbuddyExePath：直接指到 exe
+ * - workbuddyInstallDir：指到安装目录（`E:\workbuddy`）
+ * - workbuddyDir：**语义是数据目录**，但若该目录下真有客户端 exe，也当成安装目录用
+ *   （不该因为用户按旧提示填了一个"错的"设置就继续报错）
+ */
+function configuredExeCandidates() {
+  let settings = {};
+  try {
+    settings = loadConfig()?.settings || {};
+  } catch {
+    return [];
+  }
+  const out = [];
+  const exe = String(settings.workbuddyExePath || '').trim();
+  if (exe) out.push(exe);
+  for (const dir of [settings.workbuddyInstallDir, settings.workbuddyDir]) {
+    const d = String(dir || '').trim();
+    if (!d) continue;
+    const found = findExeInDir(path.resolve(d));
+    if (found) out.push(found);
+  }
+  return out;
+}
+
+/** 注册表兜底：装到非标准目录、又没被扫到时的最后一招（reg.exe 不依赖 PowerShell 策略） */
+function findExeFromRegistry() {
+  if (process.platform !== 'win32') return null;
+  const uninstall = 'SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall';
+  const probes = [
+    [`HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\WorkBuddy.exe`, '/ve'],
+    [`HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\WorkBuddy.exe`, '/ve'],
+    [`HKLM\\${uninstall}`, '/s', '/f', 'WorkBuddy', '/d'],
+    [`HKCU\\${uninstall}`, '/s', '/f', 'WorkBuddy', '/d'],
+  ];
+  for (const args of probes) {
+    let text = '';
+    try {
+      text = String(
+        execFileSync('reg', ['query', ...args], {
+          timeout: 5000,
+          windowsHide: true,
+          stdio: ['ignore', 'pipe', 'ignore'],
+        })
+      );
+    } catch {
+      continue; // 查不到时 reg 的退出码是 1，属于正常情况
+    }
+    // 任何一行里出现的 `X:\...\WorkBuddy*.exe` 都拿来试一下（App Paths 的默认值、
+    // 卸载项的 DisplayIcon 都是这种形状）
+    const re = /([A-Za-z]:\\[^\r\n"]*?\.exe)/g;
+    for (const m of text.match(re) || []) {
+      const p = m.trim().replace(/,\d+$/, ''); // DisplayIcon 常带 ",0" 图标序号
+      if (looksLikeRealWorkbuddyExe(p) && existsQuiet(p)) return p;
+    }
+  }
+  return null;
+}
+
+/**
+ * 定位 WorkBuddy 可执行文件。优先级（越靠前越可信）：
+ * 1. 进程里读到的真实路径（调用方传入，通常来自 detectWorkbuddyProcess）
+ * 2. 设置页里用户指定的安装位置
+ * 3. 上次运行记下的路径缓存
+ * 4. 几个写死的常见路径
+ * 5. 安装根目录扫描（Program Files / 盘符根目录）
+ * 6. 注册表 / 卸载项
+ */
+export function findWorkbuddyExe(detectedPath, { registry = true } = {}) {
+  // 进程里读到的路径最权威（便携版可能就在临时目录里，故 allowTemp）
+  if (looksLikeRealWorkbuddyExe(detectedPath, { allowTemp: true }) && existsQuiet(detectedPath)) return detectedPath;
+  for (const p of configuredExeCandidates()) {
+    if (existsQuiet(p)) return p;
+  }
   const cached = exeFromCache();
   if (cached) return cached;
   const home = os.homedir();
@@ -682,7 +814,10 @@ export function findWorkbuddyExe(detectedPath) {
   ];
   const direct = quick.find((p) => existsQuiet(p));
   if (direct) return direct;
-  return findExeUnderRoots(installRoots());
+  const scanned = findExeUnderRoots(installRoots());
+  if (scanned) return scanned;
+  // registry=false 供「设置页只读展示」用：reg 查询是阻塞的，不能挂在普通接口上
+  return registry ? findExeFromRegistry() : null;
 }
 
 /**
@@ -839,12 +974,64 @@ async function tasklistAlive(exe) {
   }
 }
 
-/** 结束（强杀）全部 WorkBuddy 进程并确认消失；用于冻结后的收尾 */
-export async function killWorkbuddy() {
+/**
+ * 关进程前解析 exe 路径的完整顺序（冷路径，只多一次探测）：
+ * 调用方传入的真实路径 → 缓存 → **趁进程还活着问一次** → 扫描/注册表。
+ *
+ * 最后一步的「问一次」是关键：缓存为空（首次使用、或缓存被清）时，
+ * 一旦先杀了进程，就再也没人知道它装在哪了。
+ */
+async function resolveExePathBeforeKill(detectedPath) {
+  if (looksLikeRealWorkbuddyExe(detectedPath, { allowTemp: true }) && existsQuiet(detectedPath)) {
+    rememberExePath(detectedPath);
+    return detectedPath;
+  }
+  const viaCache = exeFromCache();
+  if (viaCache) return viaCache;
+  try {
+    const proc = await detectWorkbuddyProcess();
+    const p = proc?.exePath || null;
+    if (p) rememberExePath(p);
+    if (looksLikeRealWorkbuddyExe(p, { allowTemp: true }) && existsQuiet(p)) return p;
+  } catch {
+    /* 探测失败不阻断关闭流程，退回扫描 */
+  }
+  return findWorkbuddyExe(detectedPath) || null;
+}
+
+/**
+ * 确认 WorkBuddy 真的没有进程了（最多等 timeoutMs）。
+ *
+ * 写库前为什么要等：taskkill 返回不等于句柄已释放，而 WorkBuddy 被结束后还可能被
+ * 系统的「崩溃自动恢复」在几秒内重新拉起来——新实例会立刻重新打开 workbuddy.db。
+ * 写入落在这个窗口里就会撞锁/被回滚，表现为「点了转移，界面说成功，会话却没动」。
+ */
+export async function waitForWorkbuddyGone(timeoutMs = 4000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    let running = false;
+    try {
+      running = !!(await detectWorkbuddyProcess())?.running;
+    } catch {
+      running = false; // 探测不出来就认为已退出（否则会把用户永久卡在门口）
+    }
+    if (!running) return true;
+    if (Date.now() >= deadline) return false;
+    await sleep(250);
+  }
+}
+
+/**
+ * 结束（强杀）全部 WorkBuddy 进程并确认消失；用于冻结后的收尾。
+ *
+ * `detectedPath`：调用方在**杀之前**从进程里读到的真实路径。必须传——
+ * 杀完之后进程没了，PowerShell 再也读不到 Path，只能靠缓存/扫描去猜。
+ */
+export async function killWorkbuddy(detectedPath = null) {
   // 与 stopWorkbuddy 同策略：一条 taskkill 结束全部，不做枚举与轮询。
   // 目标机器每 spawn 一个外部命令可能要 3~7 秒，循环枚举会把关闭拖到几十秒。
   const t0 = Date.now();
-  const exePath = exeFromCache() || findWorkbuddyExe(null) || null;
+  const exePath = await resolveExePathBeforeKill(detectedPath);
   const exe = String(WORKBUDDY_PROCESS_NAMES[0] || 'WorkBuddy').replace(/\.exe$/i, '') + '.exe';
   let wasRunning = true;
   try {
@@ -856,7 +1043,8 @@ export async function killWorkbuddy() {
   }
   if (wasRunning) await sleep(400);
   console.log('[kill] 关闭命令完成 ' + (Date.now() - t0) + 'ms（wasRunning=' + wasRunning + '）');
-  return { stopped: true, wasRunning, killed: [], forced: true, exePath, ms: Date.now() - t0 };
+  // forced 如实反映「是否真的动过手」：本来就没人运行时 false（测试与 UI 文案都依赖）
+  return { stopped: true, wasRunning, killed: [], forced: wasRunning, exePath, ms: Date.now() - t0 };
 }
 
 /**
@@ -874,9 +1062,10 @@ export async function killWorkbuddy() {
  *
  * @returns { stopped, wasRunning, killed, forced, exePath }
  */
-export async function stopWorkbuddy({ names = WORKBUDDY_PROCESS_NAMES } = {}) {
+export async function stopWorkbuddy({ names = WORKBUDDY_PROCESS_NAMES, detectedPath = null } = {}) {
   const t0 = Date.now();
-  const exePath = exeFromCache() || findWorkbuddyExe(null) || null;
+  // 杀之前先把真实路径记下来：这一行是「自动重新打开」能找到 exe 的前提
+  const exePath = await resolveExePathBeforeKill(detectedPath);
   const exe = String(names[0] || 'WorkBuddy').replace(/\.exe$/i, '') + '.exe';
   let wasRunning = true;
   try {
@@ -900,7 +1089,7 @@ export async function stopWorkbuddy({ names = WORKBUDDY_PROCESS_NAMES } = {}) {
   }
   if (wasRunning) await sleep(400);
   console.log('[stop] 关闭命令完成 ' + (Date.now() - t0) + 'ms（wasRunning=' + wasRunning + '）');
-  return { stopped: true, wasRunning, killed: [], forced: true, exePath };
+  return { stopped: true, wasRunning, killed: [], forced: wasRunning, exePath };
 }
 
 export async function launchWorkbuddy(exePath) {
@@ -924,10 +1113,17 @@ export async function launchWorkbuddy(exePath) {
   }
   const exe = findWorkbuddyExe(exePath);
   if (!exe) {
+    // 把「查过哪些地方」写进服务日志：用户看不到控制台，出问题只能靠 /api/diag/tail
+    const roots = installRoots();
+    console.log(
+      `[launch] 未能定位 exe。进程路径=${exePath || '(空)'} 缓存=${EXE_CACHE_FILE} 扫描根目录=${roots.join(' | ')}`
+    );
     throw new Error(
-      '未能定位 WorkBuddy 可执行文件（已检查 Program Files、其它盘符与 LocalAppData\\Programs），请手动重新打开 WorkBuddy。' +
-        (exePath ? `（检测到的进程路径：${exePath}）` : '（未能从进程读到路径，通常是 PowerShell 被安全软件拦截）') +
-        '；也可以把「设置 → WorkBuddy 目录」指到安装目录所在盘，我们会重新扫描'
+      '未能定位 WorkBuddy 可执行文件：已查过程序路径缓存、设置里的安装目录、各盘 Program Files、' +
+        '盘符根目录与注册表卸载项，都没有找到客户端 exe。' +
+        (exePath ? `（读到的进程路径已失效：${exePath}）` : '（进程已退出，读不到安装路径）') +
+        ' 请手动打开 WorkBuddy 后重试；也可以在「设置 → WorkBuddy 安装目录」里选到 WorkBuddy.exe 所在目录，' +
+        '保存后会立即按该目录定位，不必再猜'
     );
   }
   return spawnAndVerify(exe);

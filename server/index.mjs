@@ -25,6 +25,8 @@ import {
   removeModels,
   restartWorkbuddy,
   killWorkbuddy,
+  waitForWorkbuddyGone,
+  findWorkbuddyExe,
 } from './targets/workbuddy.mjs';
 import { getStats } from './stats/workbuddyStats.mjs';
 import { getProxyUrl } from './proxy.mjs';
@@ -157,6 +159,26 @@ async function withSessionOpLock(fn) {
 }
 
 /**
+ * 会话搬家结果落一行服务日志。
+ *
+ * 控制台是隐藏启动的，用户看不到 stdout，排查全靠 /api/diag/tail；
+ * 而此前搬家结果根本没打日志——「说成功但会话没动」这类反馈完全无从下手。
+ */
+function logMove(report, targetAccountId) {
+  if (!report) return;
+  const moved = report.moved?.length || 0;
+  const merged = report.merged?.length || 0;
+  const skipped = report.skippedDeleted?.length || 0;
+  const failed = report.errors?.length || 0;
+  const firstError = failed ? ` / 首个失败：${report.errors[0]?.error}` : '';
+  const verify = report.verified === false ? ' / 回读校验未通过（写入未生效）' : '';
+  console.log(
+    `[move] → ${String(targetAccountId).slice(0, 8)} 过户 ${moved} / 合并 ${merged} / 跳过 ${skipped} / 失败 ${failed}` +
+      `${verify}${firstError}（${report.elapsedMs ?? 0}ms）`
+  );
+}
+
+/**
  * 全自动执行：关掉 WorkBuddy → 干活 → 自动重新打开。
  * 仅在用户明确要求时使用（stopApp=true）。关闭失败直接中止，不会在应用还开着时写库。
  * 任何情况下都会尝试把 WorkBuddy 重新拉起来，避免把用户的应用留在关闭状态。
@@ -176,6 +198,13 @@ async function withAppRestart(fn) {
     stop = await stopPromise;
   } catch (e) {
     throw Object.assign(new Error(`无法关闭 WorkBuddy，已中止（没有改动任何数据）：${e?.message || e}`), { status: 500 });
+  }
+  // 等进程真的消失再动库：taskkill 返回 ≠ 句柄释放，WorkBuddy 还可能被系统
+  // 「崩溃自动恢复」在几秒内重新拉起（新实例会重新打开 workbuddy.db）。
+  // 写入落在这个窗口里就会撞锁或被回滚——用户看到的是「说成功了，会话没动」。
+  if (stop?.wasRunning) {
+    const gone = await waitForWorkbuddyGone(4000);
+    if (!gone) console.log('[restart] 关闭后 4 秒内仍检测到 WorkBuddy 进程，仍继续写入（可能撞锁，失败会重试）');
   }
   const tStop = Date.now();
   let result = null;
@@ -830,9 +859,26 @@ app.post(
       try {
         const proc = await detectWorkbuddyProcess();
         wasRunning = proc.running;
-        if (wasRunning) appStop = await killWorkbuddy();
+        // 把杀之前读到的真实路径传下去：进程一死就再也读不到它装在哪，
+        // 后面「关掉重开」和「杀完再写库」都依赖这个路径
+        if (wasRunning) appStop = await killWorkbuddy(proc.exePath);
       } catch (err) {
         return res.status(400).json({ error: `退出 WorkBuddy 失败，已中止切换：${err?.message || err}` });
+      }
+      if (wasRunning) {
+        const gone = await waitForWorkbuddyGone(4000);
+        if (!gone) {
+          // 4 秒没死透或已被崩溃自动恢复拉起：再杀一轮（写盘重试里还有复活守卫兜底）。
+          // 之前这里对返回值看都不看，杀失败也径直往下写，登录态文件被启动中的
+          // 新实例锁住，写盘重试全灭（2026-10-25 用户切号报 38 秒 EPERM 即此）
+          console.log('[switch] 4 秒内 WorkBuddy 仍有进程，再结束一轮后继续');
+          try {
+            await killWorkbuddy(appStop?.exePath || null);
+          } catch {
+            /* 复活守卫还会兜底 */
+          }
+          await waitForWorkbuddyGone(4000);
+        }
       }
     }
 
@@ -866,7 +912,7 @@ app.post(
     // 3) 写登录态；无论成败都不把用户的应用留在"被关掉"的状态
     let result;
     try {
-      result = switchAccount(id);
+      result = await switchAccount(id); // 异步：~3 分钟重试窗口，期间服务保持响应
     } catch (err) {
       await relaunchIfStopped(appStop);
       throw err;
@@ -880,7 +926,7 @@ app.post(
     let relaunch = null;
     if (wasRunning) {
       try {
-        killed = await killWorkbuddy();
+        killed = await killWorkbuddy(appStop?.exePath || null);
       } catch (err) {
         killed = { stopped: false, error: err?.message || String(err) };
       }
@@ -888,7 +934,8 @@ app.post(
     }
     console.log(
       `[switch] → ${String(target.uid || '').slice(0, 8)} 搬家 ${sessionCopy?.moved?.length || 0} 个 / 合并 ${sessionCopy?.merged?.length || 0} 个 / 失败 ${sessionCopy?.errors?.length || 0} 个` +
-        ` / 登录态已写 = ${result?.ok ? 'ok' : 'fail'}`
+        ` / 登录态已写 = ${result?.ok ? 'ok' : 'fail'}` +
+        (sessionCopy?.errors?.length ? ` / 首个失败：${sessionCopy.errors[0]?.error}` : '')
     );
     res.json({ ...result, sessionCopy, appStop, killed, relaunch });
   })
@@ -1121,11 +1168,13 @@ app.post(
       const { result, appStop, relaunch } = await withSessionOpLock(() =>
         withAppRestart(() => moveSessionsToAccount({ targetAccountId, ids, sourceVariant }))
       );
+      logMove(result, targetAccountId);
       res.json({ ...result, appStop, relaunch });
       return;
     }
     await assertAppClosed();
     const result = await withSessionOpLock(() => moveSessionsToAccount({ targetAccountId, ids, sourceVariant }));
+    logMove(result, targetAccountId);
     res.json({ ...result, relaunch: null });
   })
 );
@@ -1290,6 +1339,10 @@ app.get(
     const cfg = loadConfig();
     res.json({
       workbuddyDir: cfg.settings.workbuddyDir || '',
+      workbuddyInstallDir: cfg.settings.workbuddyInstallDir || '',
+      workbuddyExePath: cfg.settings.workbuddyExePath || '',
+      // 自动定位到的客户端 exe（只读展示：找不到时用户才知道该去填安装目录）
+      detectedExe: findWorkbuddyExe(null, { registry: false }) || null,
       proxyUrl: cfg.settings.proxyUrl || '',
       autoCheckin: !!cfg.settings.autoCheckin,
       autoRefreshToken: !!cfg.settings.autoRefreshToken,
@@ -1309,6 +1362,12 @@ app.put(
     const cfg = loadConfig();
     if (typeof req.body?.workbuddyDir === 'string') {
       cfg.settings.workbuddyDir = req.body.workbuddyDir.trim();
+    }
+    if (typeof req.body?.workbuddyInstallDir === 'string') {
+      cfg.settings.workbuddyInstallDir = req.body.workbuddyInstallDir.trim();
+    }
+    if (typeof req.body?.workbuddyExePath === 'string') {
+      cfg.settings.workbuddyExePath = req.body.workbuddyExePath.trim();
     }
     if (typeof req.body?.proxyUrl === 'string') {
       cfg.settings.proxyUrl = req.body.proxyUrl.trim();
@@ -1331,6 +1390,9 @@ app.put(
     res.json({
       ok: true,
       workbuddyDir: cfg.settings.workbuddyDir,
+      workbuddyInstallDir: cfg.settings.workbuddyInstallDir || '',
+      workbuddyExePath: cfg.settings.workbuddyExePath || '',
+      detectedExe: findWorkbuddyExe(null, { registry: false }) || null,
       proxyUrl: cfg.settings.proxyUrl,
       autoCheckin: !!cfg.settings.autoCheckin,
       autoRefreshToken: !!cfg.settings.autoRefreshToken,
@@ -1612,7 +1674,22 @@ const onListening = () => {
   }
 };
 
-app.listen(PORT, '127.0.0.1', onListening);
+/**
+ * 端口被占（已经有一个控制台在跑）时**干净退出**。
+ *
+ * 不处理的话 `listen` 的 error 事件会走 uncaughtException 保命处理器（见文件开头），
+ * 进程既不监听也不退出——变成一个僵尸：定时巡检、签到、模型探测照跑，
+ * 于是官方接口被两个实例各调一遍（实测 2026-10-25 手动重启时踩到）。
+ */
+const httpServer = app.listen(PORT, '127.0.0.1', onListening);
+httpServer.on('error', (err) => {
+  if (err?.code === 'EADDRINUSE') {
+    console.log(`端口 ${PORT} 已被占用：已有一个控制台在运行，本进程退出（不会再重复跑定时任务）`);
+    process.exit(0);
+  }
+  console.error('[listen] 监听失败：', err?.message || err);
+  process.exit(1);
+});
 
 /*
  * 同时监听 IPv6 环回。

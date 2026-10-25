@@ -13,7 +13,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { authFilePath, getVariant, variantOf } from './variant.mjs';
-import { safeRenameOverwrite } from '../store/config.mjs';
+import { durableWriteText, durableWriteTextAsync, CRITICAL_WRITE_DELAYS } from '../store/config.mjs';
+import { detectWorkbuddyProcess, killWorkbuddy, waitForWorkbuddyGone } from '../targets/workbuddy.mjs';
 import {
   findAccount,
   loadAccounts,
@@ -162,16 +163,10 @@ export function syncTokensToAuthFile(account, { authPath: overridePath = null } 
   doc.auth = auth;
 
   const backup = backupAuthFile(authPath, `authsync-${variant.id}`);
-  const tmp = `${authPath}.tmp-${process.pid}`;
   try {
-    fs.writeFileSync(tmp, JSON.stringify(doc, null, 2), 'utf8');
-    safeRenameOverwrite(tmp, authPath);
+    // 带退避重试的持久写：本机写盘会被间歇拦截（EPERM），裸写一次失败就整条链路放弃
+    durableWriteText(authPath, JSON.stringify(doc, null, 2));
   } catch (err) {
-    try {
-      fs.unlinkSync(tmp);
-    } catch {
-      /* 临时文件可能未生成 */
-    }
     return { synced: false, reason: `write-failed: ${err?.message || err}` };
   }
   // 回读校验：写坏了立刻回滚，绝不留下半成品登录态（按 authPath 读，测试可注入临时文件）
@@ -199,12 +194,40 @@ export function syncTokensToAuthFile(account, { authPath: overridePath = null } 
 }
 
 /**
+ * 登录态写盘期间的「复活守卫」：WorkBuddy 被 taskkill 强杀后会被系统的崩溃自动恢复
+ * 重新拉起（stopWorkbuddy 注释里的已知现象），新实例启动时会打开/锁住 auth 文件。
+ * 切换流程里「杀进程 → 搬会话 → 写登录态」的会话搬家一步可能耗时几十秒，正好把
+ * 写盘窗口撞进自动重启实例的启动期——2026-10-25 用户切换账号即此：38 秒重试全灭。
+ * 每轮写盘失败后先探一次，发现 WorkBuddy 又活了就再杀一轮，把锁源掐掉再继续重试。
+ */
+async function rekillWorkbuddyGuard(waitedMs, round) {
+  let proc = null;
+  try {
+    proc = await detectWorkbuddyProcess();
+  } catch {
+    return; // 探测不出就当没复活（探测失败不该中断写盘重试）
+  }
+  if (!proc?.running) return;
+  console.log(
+    `[switch] 写盘第 ${round} 轮仍失败（已等 ${Math.round(waitedMs / 1000)}s），` +
+      `发现 WorkBuddy 又在运行（pid=${proc.pid}，疑被崩溃自动恢复拉起），再次结束以释放登录态文件`
+  );
+  try {
+    await killWorkbuddy(proc.exePath || null);
+    await waitForWorkbuddyGone(4000);
+  } catch (e) {
+    console.log(`[switch] 复活守卫结束进程失败（继续重试写盘）：${e?.message || e}`);
+  }
+}
+
+/**
  * 切换账号：把目标账号写入登录态文件。
  *
- * 流程：校验 → 备份 → 原子写 → 回读校验 → 失败回滚。
+ * 流程：校验 → 备份 → 原子写（约 3 分钟重试窗口 + 复活守卫）→ 回读校验 → 失败回滚。
+ * 异步函数：重试退避期间不冻结事件循环（同步版会把整个服务冻住，在途请求全部超时）。
  * 返回 { ok, backupPath, variant, account }。
  */
-export function switchAccount(accountId) {
+export async function switchAccount(accountId) {
   const account = findAccount(accountId);
   if (!account) throw new Error('账号不存在');
 
@@ -232,17 +255,23 @@ export function switchAccount(accountId) {
   // 切换前备份（即使当前文件不存在也无妨，返回 null）
   const backup = backupAuthFile(authPath, `workbuddy-desktop-${variant.id}`);
 
-  const tmp = `${authPath}.tmp-${process.pid}`;
+  const writeStarted = Date.now();
   try {
-    fs.writeFileSync(tmp, JSON.stringify(doc, null, 2), 'utf8');
-    safeRenameOverwrite(tmp, authPath);
+    // 加长窗口（~3 分钟）+ 复活守卫：36 秒窗口盖不住「自动恢复实例启动锁」和
+    // 外部进程的间歇锁窗（2026-10-25 实测 38 秒重试全灭、目录锁约 3 分钟）
+    const ms = await durableWriteTextAsync(authPath, JSON.stringify(doc, null, 2), {
+      delays: CRITICAL_WRITE_DELAYS,
+      onRetry: rekillWorkbuddyGuard,
+    });
+    if (ms > 2000) console.log(`[switch] 登录态文件落盘耗时 ${ms}ms`);
   } catch (err) {
-    try {
-      fs.unlinkSync(tmp);
-    } catch {
-      /* 临时文件可能未生成 */
-    }
-    throw new Error(`写入登录态文件失败：${err?.message || err}`);
+    const waited = Math.round((Date.now() - writeStarted) / 1000);
+    console.log(`[switch] 登录态文件写入失败（累计重试 ${waited}s）：${err?.message || err}`);
+    throw new Error(
+      `写入登录态文件失败（已重试 ${waited} 秒）：${err?.message || err}。` +
+        '常见原因：WorkBuddy 被结束后又被系统自动拉起、启动期间锁住登录态文件（重试期间已反复结束它）；' +
+        '文件被杀毒软件/同步盘占用；WorkBuddy 尚未完全退出'
+    );
   }
 
   // 回读校验：结构不对立刻回滚，绝不留下半成品登录态

@@ -1417,6 +1417,75 @@ function CopyOnSwitchToggle({ flagRef }: { flagRef: { current: boolean } }) {
 }
 
 /**
+ * 结果明细块。
+ *
+ * 必须同时兼容两种形态：`/api/sessions/copy` 返回 copied/skipped，
+ * `/api/sessions/move`（以及切换里的会话转移）返回 moved/merged/skippedDeleted。
+ * 早期只读 copied/skipped，搬家结果一进来 `report.copied.length` 就是 TypeError，
+ * 弹窗直接崩掉——用户看到的就是「转移会话失败」，而且连失败原因都看不到。
+ */
+function SessionReportBlock({ report }: { report: SessionCopyReport }) {
+  const movedOk = (report.moved?.length || 0) + (report.copied?.length || 0);
+  const merged = report.merged?.length || 0;
+  const okCount = movedOk + merged;
+  const skippedList = [...(report.skippedDeleted || []), ...(report.skipped || [])];
+  const errCount = report.errors?.length || 0;
+  const isMove = !report.copied || !!report.moved;
+  return (
+    <div className="space-y-2 rounded-xl border border-zinc-200 bg-zinc-50/70 px-3.5 py-3 text-xs">
+      <div className="font-medium text-zinc-700">
+        {isMove ? '转移结果' : '复制结果'}：成功 <b className="tabular-nums text-emerald-600">{okCount}</b> 个
+        {merged > 0 && <span className="text-zinc-500">（其中 {merged} 个与已有副本合并取全）</span>} ·
+        跳过 <b className="tabular-nums text-zinc-500">{skippedList.length}</b> 个 ·
+        失败 <b className={`tabular-nums ${errCount ? 'text-red-600' : 'text-zinc-500'}`}>{errCount}</b> 个 ·
+        共 {fmtBytes(report.totalBytes)} · 用时 {(report.elapsedMs / 1000).toFixed(1)}s
+      </div>
+      {report.backupPath && (
+        <div className="truncate font-mono text-[11px] text-zinc-400" title={report.backupPath}>
+          执行前已备份会话库：{report.backupPath}
+        </div>
+      )}
+      {report.verified === false && (
+        <div className="flex items-start gap-1.5 rounded-lg border border-red-200 bg-red-50 px-2.5 py-2 text-[11px] text-red-700">
+          <IconWarning className="mt-px w-3.5 h-3.5 shrink-0 text-red-500" />
+          <span>
+            <b>写入没有生效</b>：数据库被其它进程回滚了，通常是有 WorkBuddy 实例还在运行。
+            完全退出 WorkBuddy 后重试即可，源账号的会话没有被破坏。
+          </span>
+        </div>
+      )}
+      {!!report.titleSynced?.length && (
+        <div className="text-[11px] text-emerald-700">
+          改名同步：<b className="tabular-nums">{report.titleSynced.length}</b>{' '}
+          个会话的新名字已写到目标账号里同一份会话上（客户端会给导入的副本重新生成自动标题，会话带上固定名后不再被覆盖）。
+        </div>
+      )}
+      {!!report.contentSynced?.length && (
+        <div className="text-[11px] text-emerald-700">
+          内容同步：<b className="tabular-nums">{report.contentSynced.length}</b> 个会话新聊的内容（共{' '}
+          <b className="tabular-nums">{report.contentSynced.reduce((s, c) => s + c.appendedLines, 0)}</b> 行）已
+          合并进目标账号里同一份会话，不会再重复复制出新会话。
+        </div>
+      )}
+      {errCount > 0 && (
+        <ul className="max-h-32 space-y-0.5 overflow-y-auto text-[11px] text-red-600">
+          {report.errors.slice(0, 50).map((e) => (
+            <li key={e.id} className="truncate" title={`${e.id}：${e.error}`}>
+              {e.id.slice(0, 8)}… — {e.error}
+            </li>
+          ))}
+        </ul>
+      )}
+      {skippedList.length > 0 && okCount === 0 && errCount === 0 && (
+        <div className="text-[11px] text-zinc-500">
+          选中的会话在目标账号里你已删过同一对话，按「尊重删除」不回填，本次没有需要搬的内容。
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
  * 会话复制弹窗：列出「当前登录账号 → 目标账号」可复制的会话并执行复制。
  *
  * `mode='switch'` 时按钮变成「复制并切换」——先复制会话、再写登录态文件。
@@ -1545,15 +1614,20 @@ function SessionCopyDialog({
         );
         const rep = r?.sessionCopy || null;
         const failed = rep?.errors?.length || 0;
-        const movedCount = rep?.moved?.length || 0;
+        const movedCount = (rep?.moved?.length || 0) + (rep?.merged?.length || 0);
         const mergedCount = rep?.merged?.length || 0;
         const reopenFailed = r?.relaunch ? r.relaunch.launched === false : false;
+        const firstErr = rep?.errors?.[0]?.error || '';
         const tail = relaunchTail(r?.relaunch, !!r?.appStop?.wasRunning);
+        // 三件事分开说：账号切没切成 / 会话转没转过去 / 有没有自动重新打开。
+        // 之前把「重新打开失败」也算成切换失败（红框），用户会以为账号没切——其实已经切了。
+        const level = failed && !movedCount ? 'err' : failed || reopenFailed ? 'info' : 'ok';
         toast(
-          failed || reopenFailed ? 'err' : 'ok',
-          `已切换到「${target.name}」，${movedCount + mergedCount} 个会话已转移到该账号` +
+          level,
+          `已切换到「${target.name}」` +
+            (movedCount ? `，${movedCount} 个会话已转移到该账号` : '') +
             (mergedCount ? `（其中 ${mergedCount} 个与原有副本合并为全量内容）` : '') +
-            (failed ? `，${failed} 个失败（见下方明细）` : '') +
+            (failed ? `，${failed} 个会话转移失败${firstErr ? `（首个原因：${firstErr}）` : ''}` : '') +
             `；${tail}`
         );
         onDone();
@@ -1604,22 +1678,37 @@ function SessionCopyDialog({
         },
         { timeoutMs: TIMEOUT.switch }
       );
-      const movedCount = rep?.moved?.length || 0;
+      const movedCount = (rep?.moved?.length || 0) + (rep?.merged?.length || 0);
       const mergedCount = rep?.merged?.length || 0;
       const failed = rep?.errors?.length || 0;
-      if (!failed) {
+      const skippedDeleted = rep?.skippedDeleted?.length || 0;
+      const firstErr = rep?.errors?.[0]?.error || '';
+      if (failed) {
+        // 失败必须把明细留在弹窗里（此前只在 toast 里说一句「失败 N 个」，原因完全看不到）
+        setReport(rep);
         toast(
-          'ok',
-          `已把 ${movedCount + mergedCount} 个会话转移到「${target.name}」` +
+          'err',
+          `会话转移失败：${failed} 个没有搬过去${firstErr ? `（首个原因：${firstErr}）` : ''}` +
+            (movedCount ? `，成功 ${movedCount} 个` : '') +
+            '；明细见下方'
+        );
+      } else if (!movedCount && skippedDeleted) {
+        setReport(rep);
+        toast('info', `这 ${skippedDeleted} 个会话你在目标账号里删过同一对话，按「尊重删除」没有搬`);
+      } else {
+        // 搬家会先关掉 WorkBuddy、写完再打开；「没自动打开」要说清楚，别让用户以为卡住了
+        const tail = relaunchTail(rep?.relaunch, !!rep?.appStop?.wasRunning);
+        toast(
+          rep?.relaunch && rep.relaunch.launched === false ? 'info' : 'ok',
+          `已把 ${movedCount} 个会话转移到「${target.name}」` +
             (mergedCount ? `（其中 ${mergedCount} 个与原有副本合并为全量内容）` : '') +
-            '，磁盘上只保留一份'
+            '，磁盘上只保留一份' +
+            (tail ? `；${tail}` : '')
         );
         onClose();
-      } else {
-        toast('err', `转移完成：成功 ${movedCount + mergedCount} 个，失败 ${failed} 个`);
       }
       setSelected(new Set());
-      await load();
+      if (!failed) await load();
       onDone();
     } catch (e: any) {
       toast('err', e?.message || '复制失败');
@@ -1807,50 +1896,8 @@ function SessionCopyDialog({
           </>
         )}
 
-        {/* 复制结果：成功 / 跳过 / 失败逐条列出，避免"点了没反应" */}
-        {report && (
-          <div className="space-y-2 rounded-xl border border-zinc-200 bg-zinc-50/70 px-3.5 py-3 text-xs">
-            <div className="font-medium text-zinc-700">
-              复制结果：成功 <b className="tabular-nums text-emerald-600">{report.copied.length}</b> 个 ·
-              跳过 <b className="tabular-nums text-zinc-500">{report.skipped.length}</b> 个 ·
-              失败 <b className="tabular-nums text-red-600">{report.errors.length}</b> 个 ·
-              共 {fmtBytes(report.totalBytes)} · 用时 {(report.elapsedMs / 1000).toFixed(1)}s
-            </div>
-            {report.backupPath && (
-              <div className="truncate font-mono text-[11px] text-zinc-400" title={report.backupPath}>
-                复制前已备份会话库：{report.backupPath}
-              </div>
-            )}
-            {!!report.titleSynced?.length && (
-              <div className="text-[11px] text-emerald-700">
-                改名同步：<b className="tabular-nums">{report.titleSynced.length}</b>{' '}
-                个会话的新名字已写到目标账号里同一份会话上（客户端会给导入的副本重新生成自动标题，会话带上固定名后不再被覆盖）。
-              </div>
-            )}
-            {!!report.contentSynced?.length && (
-              <div className="text-[11px] text-emerald-700">
-                内容同步：<b className="tabular-nums">{report.contentSynced.length}</b>{' '}
-                个会话新聊的内容（共{' '}
-                <b className="tabular-nums">{report.contentSynced.reduce((s, c) => s + c.appendedLines, 0)}</b> 行）已
-                合并进目标账号里同一份会话，不会再重复复制出新会话。
-              </div>
-            )}
-            {report.errors.length > 0 && (
-              <ul className="max-h-32 space-y-0.5 overflow-y-auto text-[11px] text-red-600">
-                {report.errors.slice(0, 50).map((e) => (
-                  <li key={e.id} className="truncate" title={`${e.id}：${e.error}`}>
-                    {e.id.slice(0, 8)}… — {e.error}
-                  </li>
-                ))}
-              </ul>
-            )}
-            {report.skipped.length > 0 && report.copied.length === 0 && report.errors.length === 0 && (
-              <div className="text-[11px] text-zinc-500">
-                选中的会话在目标账号里已经有同一份了，本次不再重复复制，只把新增的内容与改名同步过去。
-              </div>
-            )}
-          </div>
-        )}
+        {/* 结果：成功 / 跳过 / 失败逐条列出，避免"点了没反应" */}
+        {report && <SessionReportBlock report={report} />}
       </div>
     </Modal>
   );
@@ -2171,18 +2218,25 @@ export default function AccountsPage() {
       );
       // 切换时服务端可能返回「搬家」结果（moved/merged），也可能返回「复制」结果（copied/skipped），
       // 两种都要兼容——之前只读 copied，字段不存在时抛 TypeError，界面就弹红框。
-      const copied = r?.sessionCopy?.copied?.length || r?.sessionCopy?.moved?.length || 0;
+      const copied = r?.sessionCopy?.copied?.length || 0;
+      const moved = r?.sessionCopy?.moved?.length || 0;
       const merged = r?.sessionCopy?.merged?.length || 0;
       const synced = r?.sessionCopy?.skipped?.length || 0;
+      const transferFailed = r?.sessionCopy?.errors?.length || 0;
+      const firstErr = r?.sessionCopy?.errors?.[0]?.error || '';
+      const transferCount = copied + moved + merged;
       const wasStopped = !!r?.appStop?.wasRunning;
       const reopenFailed = r?.relaunch ? r.relaunch.launched === false : false;
       const tail = relaunchTail(r?.relaunch, wasStopped || !!r?.appStop?.wasRunning);
+      // 账号已经切了、只是会话没搬完 / 只是没自动打开——不能都算「切换失败」
+      const level = transferFailed && !transferCount ? 'err' : transferFailed || reopenFailed ? 'info' : 'ok';
       toast(
-        reopenFailed ? 'err' : 'ok',
+        level,
         `已切换到「${account.name}」` +
-          (copied ? `，${copied} 个会话已转到该账号` : '') +
+          (transferCount ? `，${transferCount} 个会话已转到该账号` : '') +
           (merged ? `（其中 ${merged} 个与原副本合并取全）` : '') +
           (synced ? `；${synced} 个已同步会话的最新内容与改名已带过去` : '') +
+          (transferFailed ? `；${transferFailed} 个会话转移失败${firstErr ? `（${firstErr}）` : ''}` : '') +
           `，${tail}`
       );
       if (r?.backupPath) console.info('登录态备份：', r.backupPath);

@@ -390,9 +390,17 @@ export interface SessionCopyReport {
   merged?: { sourceId: string; targetId: string; title: string; bytes?: number }[];
   /** 目标账号用户手动删过同一对话 → 跳过不搬（尊重删除） */
   skippedDeleted?: { id: string; title: string; bytes?: number; reason?: string }[];
-  copied: SessionCopyItem[];
-  skipped: { id: string; reason: string; newId?: string }[];
+  /**
+   * 「复制」形态的结果。搬家（/api/sessions/move、切换账号里的会话转移）**不返回**这两个字段，
+   * 调用方必须按 moved/merged/skippedDeleted 兼容——否则 `report.copied.length` 会抛
+   * TypeError，整个弹窗直接崩成白屏（2026-10-25 反馈的「转移会话失败」）。
+   */
+  copied?: SessionCopyItem[];
+  skipped?: { id: string; reason: string; newId?: string }[];
   errors: { id: string; error: string }[];
+  /** 搬家后的回读校验：false = 写进去了但没生效（被其它进程回滚） */
+  verified?: boolean | null;
+  verifyError?: string;
   /**
    * 原位同步到目标账号里那一份的改名。
    * 两个方向都会触发：往返（本账号会话是目标账号某会话的副本）与正向（目标账号里已有旧副本）。
@@ -594,6 +602,12 @@ export interface PlatformCacheInfo {
 
 export interface SettingsInfo {
   workbuddyDir: string;
+  /** 客户端**安装**目录（与上面的数据目录不是一回事），用于「切换后自动重新打开」 */
+  workbuddyInstallDir: string;
+  /** 直接指定的客户端 exe 绝对路径（优先级最高） */
+  workbuddyExePath: string;
+  /** 自动定位到的客户端 exe；null = 没找到（此时切换后无法自动重新打开） */
+  detectedExe: string | null;
   proxyUrl: string;
   /** 自动签到（仅国内版账号，服务端每小时巡检一次） */
   autoCheckin: boolean;

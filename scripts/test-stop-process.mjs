@@ -116,7 +116,9 @@ async function main() {
     const stopped = await stopWorkbuddy({ names: FAKE_NAMES, gracefulMs: 1500, forceMs: 8000 });
     check('stopped = true', stopped.stopped === true, stopped);
     check('wasRunning = true（确实关掉了东西）', stopped.wasRunning === true, stopped);
-    check('killed 里包含替身 PID', stopped.killed.includes(fakePid), stopped.killed);
+    // 提速版 stopWorkbuddy 用一条 taskkill /IM /T /F 结束整棵树，不再枚举 PID
+    // （枚举一轮要十几秒），killed 恒为 []；真正要保证的是下面「替身彻底消失」。
+    check('killed 为数组（提速版不枚举 PID，恒为空）', Array.isArray(stopped.killed), stopped.killed);
     check(
       '无窗口进程走的是强杀分支（forced = true）',
       stopped.forced === true,

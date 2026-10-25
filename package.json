@@ -24,6 +24,7 @@
     "test:proxy-protocols": "node scripts/test-proxy-protocols.mjs",
     "test:proxy-pool": "node scripts/test-proxy-pool.mjs",
     "test:sessions": "node scripts/test-session-copy.mjs",
+    "test:session-move": "node scripts/test-session-move.mjs",
     "test:session-cycle": "node scripts/test-session-cycle.mjs",
     "test:roundtrip": "node scripts/test-roundtrip-flow.mjs",
     "test:stop": "node scripts/test-stop-process.mjs",
