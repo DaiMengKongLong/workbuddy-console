@@ -152,10 +152,29 @@ if (argv.includes('--archive')) {
 if (argv.includes('--purge')) {
   const st = JSON.parse(fs.readFileSync(STATE, 'utf8'));
   if (!st.ok) { console.log('❌ 上次归档未通过校验，拒绝删除'); process.exit(1); }
+  // 归档目录以状态文件里记录的为准：--purge 若在归档次日运行，按当天日期重算
+  // ROOT_OUT 会指向一个不存在的目录（历史潜伏 bug），用它校验必然全部「缺归档」
+  const purgeRoot = st.root || ROOT_OUT;
+  const destOf = (p) => {
+    const r = path.relative(HOME, p);
+    return path.join(purgeRoot, (r.startsWith('..') ? path.basename(p) : r) + '.gz');
+  };
+  // 计划一致性：--purge 进程里 buildPlan() 是重算的，若归档后数据有变化（用户删了会话等），
+  // 新计划里会出现没归档过的新文件——直接删就是无归档丢数据。对不上就要求重新归档
+  if (Number(st.expect) !== archiveSet.length) {
+    console.log(`❌ 当前计划 ${archiveSet.length} 项 ≠ 归档时 ${st.expect} 项（期间数据有变化），请重新 --archive 后再 --purge`);
+    process.exit(1);
+  }
+  // 逐项确认归档真实存在（状态文件说 ok 也信不过：磁盘可能被清理）
+  const missing = archiveSet.filter(([p]) => !fs.existsSync(destOf(p)));
+  if (missing.length) {
+    console.log(`❌ 有 ${missing.length} 个文件找不到对应归档（${purgeRoot}），拒绝删除；请重新 --archive`);
+    process.exit(1);
+  }
   let freed = 0, ok = 0, fail = 0;
   for (const [p, s] of [...archiveSet, ...plan.oldLogs, ...plan.cache]) {
     try { fs.rmSync(p, { recursive: true, force: true }); freed += s; ok++; } catch { fail++; }
   }
-  console.log(`删除 ${ok} 项，失败 ${fail}，回收 ${mb(freed)}`);
+  console.log(`删除 ${ok} 项，失败 ${fail}，回收 ${mb(freed)}（归档在 ${purgeRoot}）`);
   process.exit(0);
 }

@@ -1094,12 +1094,23 @@ function backupSessionDb(variantId) {
   const today = new Date().toISOString().slice(0, 10);
   const sizeNow = fs.statSync(dbPath).size;
 
-  // 当天已有「同尺寸」备份就直接复用：同一天、库没变大，再拷一份只是白等
+  // 当天已有「同尺寸」备份就直接复用：同一天、库没变大，再拷一份只是白等。
+  // ⚠️ 尺寸必须连同 -wal 一起比：主库没变但新写入还在 WAL 里时，旧备份其实落后于
+  // 上一次操作（2026-10-26 体检发现）
+  const walSig = (db) => {
+    const w = `${db}-wal`;
+    try {
+      const st = fs.statSync(w);
+      return `${st.size}:${st.mtimeMs}`;
+    } catch {
+      return 'none';
+    }
+  };
   try {
     for (const name of fs.readdirSync(backupsRoot)) {
       if (!name.startsWith(`session-copy-${today}`)) continue;
       const cand = path.join(backupsRoot, name, 'workbuddy.db');
-      if (fs.existsSync(cand) && fs.statSync(cand).size === sizeNow) return path.join(backupsRoot, name);
+      if (fs.existsSync(cand) && fs.statSync(cand).size === sizeNow && walSig(cand) === walSig(dbPath)) return path.join(backupsRoot, name);
     }
   } catch {
     /* 读不到备份目录就正常走下面的全量备份 */
@@ -1685,14 +1696,12 @@ export async function syncAllAccounts({ stopApp = false, fillMissing = false, dr
         const dstOnly = [...dstIds].filter((x) => !srcIds.has(x)).length;
         if (dryRun) return { targetId: toId, diverged: true, mergeable: true, srcOnly, dstOnly, dryRun: true };
         try {
-          if (backupDir) {
-            fs.mkdirSync(backupDir, { recursive: true });
-            fs.copyFileSync(toPath, path.join(backupDir, toId + '.before-merge.jsonl'));
-          } else {
-            const bd = path.join(STORE_DIR, 'backups', 'merge-' + Date.now());
-            fs.mkdirSync(bd, { recursive: true });
-            fs.copyFileSync(toPath, path.join(bd, toId + '.jsonl'));
-          }
+          // 目标正文先备份再合并。⚠️ 这里曾有引用未定义 backupDir 的分支——每次同步
+          // 都抛 ReferenceError 被 catch 吞成错误条目，内容同步自合并功能引入起就
+          // 100% 静默失败（2026-10-26 体检发现）；改为无条件自建备份目录
+          const bd = path.join(STORE_DIR, 'backups', 'merge-' + Date.now());
+          fs.mkdirSync(bd, { recursive: true });
+          fs.copyFileSync(toPath, path.join(bd, toId + '.before-merge.jsonl'));
           const mr = mergeUnion(
             [
               { id: fromId, file: fromPath },
@@ -1725,14 +1734,9 @@ export async function syncAllAccounts({ stopApp = false, fillMissing = false, dr
       if (dryRun) return { targetId: toId, replacedByComplete: true, appendedLines: gain, dryRun: true };
       // 备份目标后用源内容替换（源更全）
       try {
-        if (backupDir) {
-          fs.mkdirSync(backupDir, { recursive: true });
-          fs.copyFileSync(toPath, path.join(backupDir, toId + '.before-replace.jsonl'));
-        } else {
-          const bd = path.join(STORE_DIR, 'backups', 'replace-' + Date.now());
-          fs.mkdirSync(bd, { recursive: true });
-          fs.copyFileSync(toPath, path.join(bd, toId + '.jsonl'));
-        }
+        const bd = path.join(STORE_DIR, 'backups', 'replace-' + Date.now());
+        fs.mkdirSync(bd, { recursive: true });
+        fs.copyFileSync(toPath, path.join(bd, toId + '.before-replace.jsonl'));
         byteCopyReplace(fromPath, fromId, toPath, toId);
       } catch (err) {
         return { targetId: toId, error: err?.message || String(err) };
@@ -1893,7 +1897,10 @@ export async function syncAllAccounts({ stopApp = false, fillMissing = false, dr
                 }
                 const banned = deletedFpCache.get(tgtUid);
                 if (banned && banned.size) {
-                  const fp = contentFingerprintText(sourcePath, cid);
+                  // ⚠️ 指纹必须与 deletedFingerprintsOf 的收集口径一致（contentFingerprint，
+                  // 字节级归一化）。这里曾误用 contentFingerprintText（文本级），两种算法
+                  // 永不相等 → 「尊重删除」禁令完全失效，删掉的对话会被原样回填
+                  const fp = contentFingerprint(sourcePath, cid);
                   if (fp && banned.has(fp)) {
                     report.skippedDeleted = report.skippedDeleted || [];
                     report.skippedDeleted.push({
@@ -2629,8 +2636,12 @@ async function moveAcrossVariants({ sourceVariant, targetVariant, sourceUid, tar
   const srcDb = await openSessionDb(sourceVariant, { readOnly: dryRun });
   const dstDb = await openSessionDb(targetVariant, { readOnly: false });
   const dstPath = sessionDbPath(targetVariant);
+  // 目标库与源库都要备份：下面会对**源库**执行不可逆的软删（UPDATE deleted_at），
+  // 只备份目标库的话源库没有任何还原点（2026-10-26 体检发现）
+  const srcBackup = dryRun ? null : backupSessionDb(sourceVariant);
   const dstBackup = dryRun ? null : backupSessionDb(targetVariant);
   if (dstBackup) report.backupPath = dstBackup;
+  if (srcBackup) report.sourceBackupPath = srcBackup;
 
   // 尊重删除：目标档位里被用户手动删过的对话指纹
   const targetIndex = indexProjectBodies(targetVariant);
@@ -2717,12 +2728,23 @@ async function moveAcrossVariants({ sourceVariant, targetVariant, sourceUid, tar
               const rel = path.relative(path.join(sessionDataRoot(sourceVariant), 'projects'), fromPath);
               const destPath = path.join(targetProjects, rel);
               fs.mkdirSync(path.dirname(destPath), { recursive: true });
-              fs.renameSync(fromPath, destPath);
-              // 插入行：源行全部字段照搬，只改 user_id
+              // 先插行、后移正文：插行失败时源数据原封不动；移正文失败时补偿删掉
+              // 已插的行——绝不能出现「正文已搬走、两边库里都没有行」的孤儿
+              // （此前先 rename 再 INSERT，INSERT 一失败正文就成孤儿，2026-10-26 体检发现）
               const cols = Object.keys(row);
               const placeholders = cols.map(() => '?').join(', ');
               const values = cols.map((c) => (c === 'user_id' ? targetUid : row[c]));
               dstDb.prepare(`INSERT OR REPLACE INTO sessions (${cols.map((c) => `"${c}"`).join(', ')}) VALUES (${placeholders})`).run(...values);
+              try {
+                fs.renameSync(fromPath, destPath);
+              } catch (err) {
+                try {
+                  dstDb.prepare('DELETE FROM sessions WHERE id = ? AND user_id = ?').run(cid, targetUid);
+                } catch {
+                  /* 补偿失败只能如实报错 */
+                }
+                throw err;
+              }
               srcDb.prepare('UPDATE sessions SET deleted_at = ? WHERE id = ?').run(Date.now(), cid);
             }
           }

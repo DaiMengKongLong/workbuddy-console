@@ -54,7 +54,33 @@ export function loadAccounts() {
   }
 }
 
+/**
+ * 覆盖写之前的安全护栏：accounts.json 与 workbuddy-switch 共写，对方（或半写/断电）
+ * 可能把文件写坏。loadAccounts 对损坏返回 []，调用方基于它构建新列表再全量覆盖，
+ * 一次入库就会把全部账号（含不可再得的 token）清空。这里在写前检查：文件存在、
+ * 非空、且解析失败 → 拒绝写入，让调用方把真实错误报给用户（2026-10-26 体检发现）。
+ */
+function refuseOverwriteIfCorrupt() {
+  let raw;
+  try {
+    raw = fs.readFileSync(ACCOUNTS_FILE, 'utf8');
+  } catch (e) {
+    if (e.code === 'ENOENT') return; // 还没有账号库，正常首写
+    throw e;
+  }
+  if (!raw.trim()) return; // 空文件视为无账号，允许写
+  try {
+    JSON.parse(raw);
+  } catch {
+    throw new Error(
+      'accounts.json 已损坏，已拒绝覆盖写入（防止把账号库清空）。' +
+        '请先手工检查/修复该文件，或把它改名备份后重试'
+    );
+  }
+}
+
 export function saveAccounts(accounts) {
+  refuseOverwriteIfCorrupt();
   fs.mkdirSync(STORE_DIR, { recursive: true });
   atomicWriteJson(ACCOUNTS_FILE, accounts);
 }
@@ -67,6 +93,7 @@ export function saveAccounts(accounts) {
  * 「后台其实还在正常干活」误报成失败（2026-10-25 反馈）。
  */
 export async function saveAccountsAsync(accounts) {
+  refuseOverwriteIfCorrupt();
   fs.mkdirSync(STORE_DIR, { recursive: true });
   return atomicWriteJsonAsync(ACCOUNTS_FILE, accounts);
 }

@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { execFile, execFileSync, spawn } from 'node:child_process';
+import iconv from 'iconv-lite';
 import { loadConfig, durableWriteText, durableWriteTextAsync } from '../store/config.mjs';
 import { matchPlatformUrl } from '../providers/registry.mjs';
 
@@ -214,19 +215,39 @@ export function listLoaded() {
   return { exists, invalid, dir: workbuddyDir(), modelsJsonPath: modelsJsonPath(), loaded };
 }
 
+/**
+ * 解码外部命令输出。中文 Windows 上 taskkill/tasklist/powershell 的输出是 GBK 编码，
+ * Node 默认按 UTF-8 解码会得到乱码，混进错误信息后用户看到的就是
+ * 「Command failed:taskkill /PID …（后面一串乱码）」（2026-10-26 用户实测）。
+ * 策略：先按 UTF-8 解；出现替换符（说明不是合法 UTF-8）就按 GBK 重解；再不行退回原文。
+ */
+function decodeCmdBuffer(buf) {
+  if (!buf || !buf.length) return '';
+  const utf8 = buf.toString('utf8');
+  if (!utf8.includes('\uFFFD')) return utf8;
+  try {
+    const gbk = iconv.decode(buf, 'gbk');
+    if (gbk && !gbk.includes('\uFFFD')) return gbk;
+  } catch {
+    /* iconv 不可用时退回 UTF-8 原文 */
+  }
+  return utf8;
+}
+
 function run(cmd, args, timeoutMs = 10000, opts = {}) {
   return new Promise((resolve, reject) => {
-    execFile(cmd, args, { timeout: timeoutMs, windowsHide: true, ...opts }, (err, stdout, stderr) => {
-      if (err) return reject(Object.assign(err, { stderr }));
-      resolve(stdout);
+    execFile(cmd, args, { timeout: timeoutMs, windowsHide: true, encoding: 'buffer', ...opts }, (err, stdout, stderr) => {
+      if (err) return reject(Object.assign(err, { stderr: decodeCmdBuffer(stderr), stdout: decodeCmdBuffer(stdout) }));
+      resolve(decodeCmdBuffer(stdout));
     });
   });
 }
 
-/** 把 execFile 的报错压成一句可读原因（原始 message 会带上整条命令行，不适合展示） */
+/** 把 execFile 的报错压成一句可读原因（原始 message 会带上整条命令行与可能的乱码，不适合展示） */
 function shortExecError(err) {
   const code = err?.code;
   if (code && typeof code === 'string') return code; // EPERM / EACCES / ENOENT ...
+  if (Number(code) === 128) return '进程已不存在';
   const first = String(err?.stderr || '')
     .split('\n')
     .map((s) => s.trim())
@@ -1219,8 +1240,42 @@ export async function restartWorkbuddy() {
   if (!proc.running) throw new Error('未检测到运行中的 WorkBuddy 进程，无需重启（下次启动自动生效）');
   if (process.platform === 'win32') {
     if (!proc.pid) throw new Error('未获取到进程 ID，无法重启');
-    await run('taskkill', ['/PID', String(proc.pid), '/T', '/F'], 10000);
-    await new Promise((r) => setTimeout(r, 1500));
+    const imName = String(WORKBUDDY_PROCESS_NAMES[0] || 'WorkBuddy').replace(/\.exe$/i, '') + '.exe';
+    /**
+     * 按主进程树杀 + 杀完验证。此前直接 `await run(taskkill /PID …)` 且不看结果：
+     * - 探测与杀之间的竞态（进程刚好自己退出）→ taskkill 128 → 原始报错带着 GBK 乱码
+     *   直接抛给界面（2026-10-26 用户实测「Command failed:taskkill /PID …（乱码）」）；
+     * - /PID /T 只杀主进程树，多进程可能有幸存者 → 新实例起不来或单实例握手让**旧实例**
+     *   弹窗 → 重启「显示成功」但活着的还是旧进程（启动时间早于 models.json 修改时间），
+     *   「配置待重启生效」横幅一直消不掉，用户连重启三遍才好（同日用户反馈）。
+     */
+    try {
+      await run('taskkill', ['/PID', String(proc.pid), '/T', '/F'], 10000, { windowsHide: true });
+    } catch (e) {
+      if (Number(e?.code) !== 128) {
+        // 128 = 已不在（竞态，按已死处理）；其它失败退回按映像名全量结束
+        try {
+          await run('taskkill', ['/IM', imName, '/T', '/F'], 10000, { windowsHide: true });
+        } catch (e2) {
+          if (Number(e2?.code) !== 128) {
+            throw new Error(`结束 WorkBuddy 失败（${shortExecError(e2)}），请手动退出 WorkBuddy 后重试`);
+          }
+        }
+      }
+    }
+    await sleep(1500);
+    // 杀完必须确认真的没了；幸存者再补一轮全量，仍活着就明说而不是硬着头皮重开
+    if ((await detectWorkbuddyProcess().catch(() => null))?.running) {
+      try {
+        await run('taskkill', ['/IM', imName, '/T', '/F'], 10000, { windowsHide: true });
+        await sleep(800);
+      } catch {
+        /* 下一行探测再确认 */
+      }
+      if ((await detectWorkbuddyProcess().catch(() => null))?.running) {
+        throw new Error('WorkBuddy 未能完全退出（进程被占用或权限不足），请手动退出后重试');
+      }
+    }
     const exe = findWorkbuddyExe(proc.exePath);
     if (!exe) {
       throw new Error(
