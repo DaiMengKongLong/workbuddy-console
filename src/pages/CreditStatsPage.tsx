@@ -242,7 +242,8 @@ export default function CreditStatsPage() {
     [data]
   );
 
-  if (loading) {
+  // 只有「首次进入、还没有任何数据」才整页骨架；切档位/切天数时保留旧内容，避免白屏
+  if (loading && !data) {
     return (
       <div className="space-y-4">
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
@@ -255,7 +256,7 @@ export default function CreditStatsPage() {
     );
   }
 
-  if (!data || (data.accounts.length === 0 && data.models.length === 0)) {
+  if (data && !loading && data.accounts.length === 0 && data.models.length === 0) {
     const variantLabel = variant === 'ai' ? '国际版' : variant === 'cn' ? '国内版' : '';
     return (
       <Card className="p-4">
@@ -285,10 +286,13 @@ export default function CreditStatsPage() {
     );
   }
 
+  // 走到这里 data 一定存在：上面只有「有数据但为空」才提前 return
+  if (!data) return null;
+
   const s = data.summary;
 
   return (
-    <div className="space-y-5">
+    <div className="relative space-y-5">
       {/* 工具栏 */}
       <Toolbar>
         <Segmented
@@ -320,6 +324,7 @@ export default function CreditStatsPage() {
           )}
         </div>
         <div className="ml-auto flex items-center gap-2">
+          {loading && <span className="text-xs text-zinc-400">更新中…</span>}
           {data.status !== 'complete' && (
             <Badge color={data.status === 'error' ? 'red' : 'amber'} dot>
               {data.status === 'error' ? '查询失败' : '部分成功'}
@@ -411,7 +416,7 @@ export default function CreditStatsPage() {
                     contentStyle={tooltipStyle}
                     formatter={(v: any, _n: any, item: any) => [fmtCredit(v), `消耗（${item?.payload?.requests ?? 0} 次请求）`]}
                   />
-                  <Area type="monotone" dataKey="credit" stroke="#6366f1" strokeWidth={2} fill="url(#creditGrad)" />
+                  <Area type="monotone" dataKey="credit" stroke="#6366f1" strokeWidth={2} fill="url(#creditGrad)" isAnimationActive={false} />
                 </AreaChart>
               </ResponsiveContainer>
             )}
@@ -443,7 +448,7 @@ export default function CreditStatsPage() {
               ) : (
                 <ResponsiveContainer width="100%" height="100%">
                   <PieChart>
-                    <Pie data={topModels} dataKey="credit" nameKey="model" innerRadius={48} outerRadius={78} paddingAngle={2}>
+                    <Pie data={topModels} dataKey="credit" nameKey="model" innerRadius={48} outerRadius={78} paddingAngle={2} isAnimationActive={false}>
                       {topModels.map((_, i) => (
                         <Cell key={i} fill={PALETTE[i % PALETTE.length]} />
                       ))}

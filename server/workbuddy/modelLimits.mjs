@@ -111,7 +111,21 @@ async function probeOne(account, variantId, model) {
     const msg = String(j?.msg || j?.message || txt).slice(0, 200);
     const m = /将在\s*(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})/.exec(msg);
     const resetAt = m ? new Date(m[1].replace(' ', 'T') + '+08:00').getTime() : 0;
-    if (res.status === 429 && resetAt > Date.now()) return { limited: true, resetAt };
+
+    // 判定不能只认 429：上游换成 400/403 或改文案时，真实限流会被漏掉
+    const limitWord = /限流|频率|额度|配额|超出|用尽|超额|too many requests|rate.?limit|quota|insufficient|11128/i.test(msg);
+    const hardLimit = res.status === 429;
+    const softLimit = !hardLimit && (res.status === 400 || res.status === 403) && limitWord;
+    if (hardLimit || softLimit) {
+      return {
+        limited: true,
+        // 解析不到恢复时间也给一个占位（10 分钟后复探），否则前端会把它当作“已过期”丢掉
+        resetAt: resetAt > Date.now() ? resetAt : Date.now() + 10 * 60 * 1000,
+        resetKnown: resetAt > Date.now(),
+        status: res.status,
+        model,
+      };
+    }
     return { limited: false, note: `${res.status} ${model}: ${msg.slice(0, 60)}` };
   } catch (e) {
     return { limited: false, note: `${model}: ${e?.name === 'AbortError' ? '超时' : e?.message}` };
@@ -142,13 +156,14 @@ export async function probeAllModelLimits({ refresh = false } = {}) {
   for (const a of accs) {
     const v = variantOf(a).id;
     // 固定探一次最常用的模型（账号可能已经把会话搬走了，没有「最近模型」可依），
-    // 再补一个它自己最近用过的模型，最多两个。
+    // 再补最近用过的 2 个：只探 1 个时，被限的往往是没探到的那个型号。
     const cand = ['deepseek-v4.1-flash'];
-    for (const m of recentModelsOf(String(a.uid), v, 1)) if (!cand.includes(m)) cand.push(m);
-    for (const model of cand.slice(0, 2)) tasks.push({ a, v, model });
+    for (const m of recentModelsOf(String(a.uid), v, 2)) if (!cand.includes(m)) cand.push(m);
+    for (const model of cand.slice(0, 3)) tasks.push({ a, v, model });
   }
 
   const notes = [];
+  const accountNotes = {};
   let idx = 0;
   const worker = async () => {
     while (idx < tasks.length) {
@@ -156,15 +171,32 @@ export async function probeAllModelLimits({ refresh = false } = {}) {
       const r = await probeOne(t.a, t.v, t.model);
       const id = String(t.a.id || t.a.uid);
       if (r.limited) {
-        if (!out[id].some((x) => x.model === t.model)) out[id].push({ model: t.model, resetAt: r.resetAt });
+        if (!out[id].some((x) => x.model === t.model)) {
+          out[id].push({
+            model: t.model,
+            resetAt: r.resetAt,
+            resetKnown: !!r.resetKnown,
+            status: r.status || 0,
+          });
+        }
+        accountNotes[id] = `${t.model} 已被上游限流（HTTP ${r.status || 429}）`;
       } else if (r.note) {
         notes.push(r.note);
+        // 探测失败但没被判定为限流：把原因一并带回前端，避免"什么都没显示"的黑盒
+        if (!accountNotes[id]) accountNotes[id] = r.note;
       }
     }
   };
   await Promise.all(Array.from({ length: 6 }, () => worker()));
 
-  const data = { accounts: out, at: Date.now(), probed: tasks.length, notes: notes.slice(0, 6), source: 'live-probe' };
+  const data = {
+    accounts: out,
+    accountNotes,
+    at: Date.now(),
+    probed: tasks.length,
+    notes: notes.slice(0, 6),
+    source: 'live-probe',
+  };
   cache = { at: Date.now(), data };
   return data;
 }

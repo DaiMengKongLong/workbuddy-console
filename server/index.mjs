@@ -42,6 +42,9 @@ import {
   getOfflineCreditProjection,
   getAccountBalances,
   getCreditDetails,
+  // 提速版在 credit-stats 路由尾部调用了它（预热 7/90 天），但漏了 import：
+  // 缺这行每次统计请求都会抛 ReferenceError（响应已发出，只在服务端日志里炸）
+  prefetchCreditRanges,
 } from './workbuddy/credits.mjs';
 import { refreshAccessToken } from './proxy/wb.mjs';
 import { VARIANT_LIST, authFilePath, dataRoot } from './workbuddy/variant.mjs';
@@ -65,7 +68,7 @@ import { listBackups, restoreBackup, deleteBackup, cleanBackups, backupVariants 
 import { probeAllModelLimits } from './workbuddy/modelLimits.mjs';
 import { registerProxyRoutes, refreshModelsCache } from './proxy/index.mjs';
 import { stopWorkbuddy, launchWorkbuddy } from './targets/workbuddy.mjs';
-import { listSessionsForSwitch, copySessions, moveSessionsToAccount, sessionIdsNeedingSync, syncAllAccounts, dedupeSessions, sessionDataRoot, copyVariantIntoAccount, currentUidOfVariant } from './workbuddy/sessions.mjs';
+import { listSessionsForSwitch, copySessions, moveSessionsToAccount, sessionIdsNeedingSync, syncAllAccounts, dedupeSessions, sessionDataRoot, copyVariantIntoAccount, currentUidOfVariant, warmSessionSignatures } from './workbuddy/sessions.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -159,12 +162,22 @@ async function withSessionOpLock(fn) {
  * 任何情况下都会尝试把 WorkBuddy 重新拉起来，避免把用户的应用留在关闭状态。
  */
 async function withAppRestart(fn) {
+  const t0 = Date.now();
+  // 关应用（子进程、要等）和「预热会话指纹」（纯读文件）并行跑，互不干扰
+  const stopPromise = stopWorkbuddy();
+  let warm = null;
+  try {
+    warm = warmSessionSignatures();
+  } catch {
+    /* 预热失败不影响主流程 */
+  }
   let stop = null;
   try {
-    stop = await stopWorkbuddy();
+    stop = await stopPromise;
   } catch (e) {
     throw Object.assign(new Error(`无法关闭 WorkBuddy，已中止（没有改动任何数据）：${e?.message || e}`), { status: 500 });
   }
+  const tStop = Date.now();
   let result = null;
   let failure = null;
   try {
@@ -172,22 +185,36 @@ async function withAppRestart(fn) {
   } catch (e) {
     failure = e;
   }
+  const tWork = Date.now();
   let relaunch = null;
   if (stop?.wasRunning) {
-    // 等 SQLite 彻底放开 -wal/-shm 再拉起，避免新实例读到半写状态
-    await new Promise((r) => setTimeout(r, 1500));
-    try {
-      relaunch = await launchWorkbuddy(stop.exePath || null);
-    } catch (e) {
-      relaunch = { launched: false, error: e?.message || String(e) };
-    }
+    // 应用是自己退出的，句柄已释放；只留 200ms 缓冲即可
+    await new Promise((r) => setTimeout(r, 200));
+    relaunch = launchWorkbuddyInBackground(stop.exePath || null, '-restart');
   }
+  const tLaunch = Date.now();
+  console.log(
+    `[restart] 关闭 ${tStop - t0}ms（含并行预热 ${warm?.files ?? 0} 文件 ${warm?.ms ?? 0}ms）` +
+      ` / 处理 ${tWork - tStop}ms / 打开 ${tLaunch - tWork}ms / 总计 ${tLaunch - t0}ms`
+  );
   if (failure) {
     failure.relaunch = relaunch;
     failure.appStop = stop;
     throw failure;
   }
   return { result, appStop: stop, relaunch };
+}
+
+/**
+ * 后台重新打开 WorkBuddy：不阻塞当前请求。
+ * 用户点确认后要的是「快点结束」，窗口晚几秒出现完全可以接受。
+ */
+function launchWorkbuddyInBackground(exePath, tag = '') {
+  const t = Date.now();
+  launchWorkbuddy(exePath)
+    .then((r) => console.log(`[launch${tag}] 窗口就绪 ${Date.now() - t}ms verified=${r?.verified}`))
+    .catch((e) => console.log(`[launch${tag}] 打开失败：${e?.message || e}`));
+  return { launched: true, background: true };
 }
 
 async function runWithAppClosed(fn) {
@@ -837,7 +864,8 @@ app.post(
 
     // 4) 收尾：把「登录态切换前就已自动重开」的旧账号实例再关一次，让下一次重开
     //    读到已切换的登录态——重开出来的就是新账号的 WorkBuddy。
-    //    8 秒内没有自动重开就主动拉起兜底（保证用户总能拿到一个能用的 WorkBuddy）。
+    //    不再固定等 8 秒再探测（探测本身也要 4~7 秒），改为直接后台拉起：
+    //    已有实例时 launchWorkbuddy 会自动激活窗口而不会重复开。
     let killed = null;
     let relaunch = null;
     if (wasRunning) {
@@ -846,17 +874,7 @@ app.post(
       } catch (err) {
         killed = { stopped: false, error: err?.message || String(err) };
       }
-      await new Promise((r) => setTimeout(r, 8000));
-      const proc = await detectWorkbuddyProcess();
-      if (proc.running) {
-        relaunch = { launched: true, resurrected: true };
-      } else {
-        try {
-          relaunch = await launchWorkbuddy(killed?.exePath || appStop?.exePath || null);
-        } catch (err) {
-          relaunch = { launched: false, error: err?.message || String(err) };
-        }
-      }
+      relaunch = launchWorkbuddyInBackground(killed?.exePath || appStop?.exePath || null, '-switch');
     }
     console.log(
       `[switch] → ${String(target.uid || '').slice(0, 8)} 搬家 ${sessionCopy?.moved?.length || 0} 个 / 合并 ${sessionCopy?.merged?.length || 0} 个 / 失败 ${sessionCopy?.errors?.length || 0} 个` +
@@ -1014,6 +1032,30 @@ function kickOffStorageClean(reason = 'after-sync') {
 }
 
 /**
+ * 服务日志尾部（服务是隐藏启动的，用户看不到控制台输出，排查全靠这个）
+ * GET /api/diag/tail?n=80
+ */
+app.get(
+  '/api/diag/tail',
+  wrap(async (req, res) => {
+    const n = Math.min(500, Math.max(1, Number(req.query?.n) || 80));
+    // 候选顺序：本仓库的启动方式（.workbuddy/tmp/service.log）→ 部署包的
+    // deploy-windows 布局（server-detached.log 在项目上级目录或项目根）
+    const candidates = [
+      path.join(ROOT, '.workbuddy', 'tmp', 'service.log'),
+      path.join(ROOT, '.workbuddy', 'tmp', 'service.err.log'),
+      path.join(process.cwd(), '..', 'server-detached.log'),
+      path.join(process.cwd(), 'server-detached.log'),
+    ];
+    const file = candidates.find((p) => fs.existsSync(p));
+    if (!file) return res.json({ ok: false, error: '找不到日志文件', tried: candidates });
+    const text = fs.readFileSync(file, 'utf8');
+    const lines = text.split('\n').filter((l) => l.trim());
+    res.json({ ok: true, file, total: lines.length, lines: lines.slice(-n) });
+  })
+);
+
+/**
  * 一键同步所有本机账号：内容并集取最新 + 改名跟随，已有副本原位合并、绝不重复复制。
  * fillMissing=true 时把「目标账号里从来没有」的会话也补全复制过去（全量对齐，占磁盘）。
  * stopApp=true 时由服务端先结束 WorkBuddy（写库门禁要求），完成后再重新打开。
@@ -1034,7 +1076,7 @@ app.post(
     // 默认全自动：关掉 WorkBuddy → 汇总 → 自动重新打开
     if (req.body?.stopApp !== false) {
       const { result, appStop, relaunch } = await withSessionOpLock(() =>
-        withAppRestart(() => syncAllAccounts({ stopApp: false, fillMissing, pruneOthers, dryRun: false, keepVariant }))
+        withAppRestart(() => syncAllAccounts({ stopApp: false, assumeClosed: true, fillMissing, pruneOthers, dryRun: false, keepVariant }))
       );
       if (result?.ok) kickOffStorageClean('sync-all');
       res.json({ ...result, appStop, relaunch });
@@ -1203,6 +1245,8 @@ app.get(
     const refresh = req.query.refresh === '1' || req.query.refresh === 'true';
     const variant = ['cn', 'ai'].includes(String(req.query.variant)) ? String(req.query.variant) : 'all';
     res.json(await getCreditStatistics({ days, refresh, variant }));
+    // 后台把另外两个区间也算好，用户切 7/30/90 时直接命中缓存
+    prefetchCreditRanges({ variant, days });
   })
 );
 

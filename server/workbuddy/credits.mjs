@@ -205,17 +205,13 @@ function extractRows(data) {
  * 因此不能靠 total 判断是否取完，而是"取满就把起点推进到本轮最新一条"反复扫，
  * 直到某一轮取不满为止。
  */
-async function fetchAccountUsage(account, days) {
-  const variant = variantOf(account);
-  const url = variant.usageUrl;
-  const end = new Date();
-  const start = new Date();
-  start.setDate(start.getDate() - (days - 1));
+/** 官方接口一次最多只认 30 天窗口，超过就返回空数组（实测 90 天全账号都是 0 条） */
+const MAX_WINDOW_DAYS = 30;
 
-  const endTime = `${dateStr(end)} 23:59:59`;
-  let startTime = `${dateTimeStr(start)}`;
+/** 取一个时间窗口内的全部记录（自动翻页），seen 跨窗口共享用于去重 */
+async function fetchWindow(account, url, startTime0, endTime, seen) {
   const rows = [];
-  const seen = new Set();
+  let startTime = startTime0;
   let rounds = 0;
 
   while (rounds < MAX_ROUNDS) {
@@ -260,6 +256,28 @@ async function fetchAccountUsage(account, days) {
     rounds++;
   }
 
+  return rows;
+}
+
+async function fetchAccountUsage(account, days) {
+  const url = variantOf(account).usageUrl;
+  const rows = [];
+  const seen = new Set();
+
+  // 按 30 天切段往前扫：接口对超长区间直接返回空，不切段的话 60/90 天永远是空数据
+  let cursorEnd = new Date();
+  let remaining = Math.max(1, days);
+  while (remaining > 0) {
+    const span = Math.min(MAX_WINDOW_DAYS, remaining);
+    const start = new Date(cursorEnd);
+    start.setDate(start.getDate() - (span - 1));
+    const endTime = `${dateStr(cursorEnd)} 23:59:59`;
+    const chunk = await fetchWindow(account, url, dateTimeStr(start), endTime, seen);
+    rows.push(...chunk);
+    cursorEnd = new Date(start);
+    cursorEnd.setDate(cursorEnd.getDate() - 1);
+    remaining -= span;
+  }
   return rows;
 }
 
@@ -828,6 +846,10 @@ export async function getCreditDetails({ accountId, refresh = false } = {}) {
 /** 本工具缓存 payload 的结构标识；读到别的结构一律当缓存不存在 */
 const CACHE_SCHEMA = 'wb-console-credit-v1';
 
+/** 各档位统计结果的进程内缓存（切「国内版/国际版」不再重新打官方接口） */
+const variantCache = new Map(); // `${variant}|${days}` -> { at, payload }
+const rawRowsCache = new Map(); // `all|${days}` -> 全量明细，供档位过滤重算
+
 function readCache() {
   const raw = readJsonFile(OFFICIAL_USAGE_CACHE_FILE, null);
   const payload = raw?.payload;
@@ -848,6 +870,29 @@ function readCache() {
  * @param {boolean} opts.refresh true 时绕过缓存重新打官方接口
  * @param {'all'|'cn'|'ai'} opts.variant 档位筛选：只统计该档位的账号（默认 all）
  */
+/**
+ * 预热另外两个区间：用户点完 30 天，通常在 7/90 之间来回切。
+ * 后台算好放缓存，切换时直接命中（冷算一次 1.5~3.5 秒，切起来太慢）。
+ */
+const prefetching = new Set();
+export function prefetchCreditRanges({ variant = 'all', days = 30 } = {}) {
+  for (const d of [7, 30, 90]) {
+    if (d === days) continue;
+    // 统一预热「全部档位」的明细：cn/ai 之后直接过滤重算，不用各自再打一遍接口
+    const key = `all|${d}`;
+    if (prefetching.has(key)) continue;
+    prefetching.add(key);
+    // 90 天要按 30 天切 3 段，请求量是 7 天的 3 倍：错开 2.5 秒再跑，别和界面抢带宽
+    const delay = d >= 90 ? 2500 : 80;
+    setTimeout(() => {
+      getCreditStatistics({ days: d, refresh: false, variant: 'all' })
+        .catch(() => {})
+        .finally(() => prefetching.delete(key));
+    }, delay);
+  }
+  void variant;
+}
+
 export async function getCreditStatistics({ days = 30, refresh = false, variant = 'all' } = {}) {
   const variantFilter = variant === 'cn' || variant === 'ai' ? variant : 'all';
   const accounts = loadAccounts()
@@ -856,10 +901,43 @@ export async function getCreditStatistics({ days = 30, refresh = false, variant 
   const now = Date.now();
 
   // 缓存命中则直接返回，避免每次打开统计页都打官方接口
+  // 注意：缓存键必须带天数——只按档位做键会导致「点近 7 天仍返回近 90 天的数据」
+  const memKey = `${variantFilter}|${days}`;
   if (!refresh) {
+    const mem = variantCache.get(memKey);
+    if (mem && now - mem.at < CACHE_TTL_MS) return { ...mem.payload, cached: true };
+
+    // 国内版/国际版 = 全部档位的子集：只要「全部」的原始明细还在内存里，
+    // 直接过滤后重算聚合（几十毫秒），不用再打一遍官方接口（冷算 1.4 秒）。
+    if (variantFilter !== 'all') {
+      const raw = rawRowsCache.get(`all|${days}`);
+      if (raw && now - raw.at < CACHE_TTL_MS) {
+        const rows = raw.allRows.filter((r) => r.variant === variantFilter);
+        const accts = raw.accountsResult.filter((a) => a.variant === variantFilter);
+        const errs = raw.errors.filter((a) => a.variant === variantFilter);
+        const payload = buildProjection({
+          allRows: rows,
+          accountsResult: accts,
+          errors: errs,
+          rangeStart: raw.rangeStart,
+          rangeEnd: raw.rangeEnd,
+          collectedAt: raw.collectedAt,
+          days,
+          variantFilter,
+        });
+        variantCache.set(memKey, { at: now, payload });
+        return { ...payload, cached: true };
+      }
+    }
     const cached = readCache();
-    // 档位筛选结果不能跨档位复用：缓存里的筛选口径必须一致
-    if (cached && (cached.variantFilter || 'all') === variantFilter && now - num(cached.collectedAt) < CACHE_TTL_MS) {
+    // 档位与区间必须同时一致才算命中
+    if (
+      cached &&
+      (cached.variantFilter || 'all') === variantFilter &&
+      num(cached.days) === days &&
+      now - num(cached.collectedAt) < CACHE_TTL_MS
+    ) {
+      variantCache.set(memKey, { at: now, payload: cached });
       return { ...cached, cached: true };
     }
   }
@@ -931,6 +1009,22 @@ export async function getCreditStatistics({ days = 30, refresh = false, variant 
     days,
     variantFilter,
   });
+
+  // 全量明细留在内存里：切「国内版/国际版」时直接过滤重算，不再打官方接口
+  if (variantFilter === 'all') {
+    rawRowsCache.set(`all|${days}`, {
+      at: Date.now(),
+      allRows,
+      accountsResult,
+      errors,
+      rangeStart,
+      rangeEnd,
+      collectedAt: now,
+    });
+  }
+
+  // 记住本档位结果：再切回来直接命中，不用重算
+  variantCache.set(`${variantFilter}|${days}`, { at: Date.now(), payload });
 
   // 只有真的取到数据才覆盖缓存，避免一次网络抖动把好缓存冲掉
   if (collectedAt) {

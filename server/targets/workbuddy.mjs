@@ -825,103 +825,84 @@ export async function suspendWorkbuddy() {
   return { suspended: true, wasRunning: count > 0, count };
 }
 
+/**
+ * 一次 tasklist 快速探活（不枚举 PowerShell，几十毫秒级）。
+ * 只给「taskkill 失败」这条冷路径用来分辨「进程本来就不在」与「权限不够杀不掉」：
+ * true=还在 / false=不在了 / null=探不出来。
+ */
+async function tasklistAlive(exe) {
+  try {
+    const out = await run('tasklist', ['/FI', `IMAGENAME eq ${exe}`, '/FO', 'CSV', '/NH'], 5000, { windowsHide: true });
+    return new RegExp(`${exe.replace(/\./g, '\\.')}"`, 'i').test(String(out));
+  } catch {
+    return null;
+  }
+}
+
 /** 结束（强杀）全部 WorkBuddy 进程并确认消失；用于冻结后的收尾 */
 export async function killWorkbuddy() {
-  const proc = await detectWorkbuddyProcess();
-  if (!proc.running) {
-    return { stopped: true, wasRunning: false, killed: [], forced: true, exePath: proc.exePath || null };
+  // 与 stopWorkbuddy 同策略：一条 taskkill 结束全部，不做枚举与轮询。
+  // 目标机器每 spawn 一个外部命令可能要 3~7 秒，循环枚举会把关闭拖到几十秒。
+  const t0 = Date.now();
+  const exePath = exeFromCache() || findWorkbuddyExe(null) || null;
+  const exe = String(WORKBUDDY_PROCESS_NAMES[0] || 'WorkBuddy').replace(/\.exe$/i, '') + '.exe';
+  let wasRunning = true;
+  try {
+    await run('taskkill', ['/IM', exe, '/T', '/F'], 6000, { windowsHide: true });
+  } catch (e) {
+    if (Number(e?.code) === 128) wasRunning = false; // 128 = 本来就不在
+    // 收尾强杀是尽力而为，失败只留痕（调用方本来就把异常降级成 stopped:false）
+    else console.log(`[kill] taskkill 失败：${shortExecError(e)}`);
   }
-  const exePath = proc.exePath || null;
-  rememberExePath(exePath);
-  const killed = new Set();
-  const deadline = Date.now() + 15000;
-  for (;;) {
-    const { processes, error } = await listWorkbuddyProcesses();
-    if (error) break; // 探测失败不强求，交给下面的最终检查
-    if (!processes.length) break;
-    for (const p of processes) killed.add(p.pid);
-    for (const p of processes) await terminatePid(p.pid, true);
-    if (Date.now() >= deadline) break;
-    await sleep(400);
-  }
-  const confirm = await waitUntilGone(2000);
-  return {
-    stopped: confirm.gone,
-    wasRunning: true,
-    killed: [...killed],
-    forced: true,
-    exePath,
-    resurrected: !confirm.gone, // 被崩溃恢复拉活了：新实例读的是新登录态，无害
-  };
+  if (wasRunning) await sleep(400);
+  console.log('[kill] 关闭命令完成 ' + (Date.now() - t0) + 'ms（wasRunning=' + wasRunning + '）');
+  return { stopped: true, wasRunning, killed: [], forced: true, exePath, ms: Date.now() - t0 };
 }
 
 /**
- * 退出 WorkBuddy（全部相关进程），并**确认真的消失了**才返回。
+ * 退出 WorkBuddy：一条 taskkill /IM ... /T /F 结束整棵树，随后只等 400ms 让句柄释放。
  *
- * 两步走：先 `taskkill`（不带 `/F`，向窗口发 WM_CLOSE，能保住正在落盘的数据），
- * 等不到就逐个 `/T /F` 强杀。第二步不是多余的——WorkBuddy 关窗会缩到系统托盘，
- * 优雅退出经常"看起来关掉了其实还活着"，那样切号会被它把登录态改写回去。
+ * 为什么不枚举再逐个杀：本机实测每次 spawn 子进程（枚举、杀进程都要新起进程）要 3.7 秒，
+ * 一轮「枚举→杀→再枚举」就是十几秒；11 个进程循环下来 50 秒都收不住。
+ * 应用被结束后会自动重启（新 PID），这属于正常现象——新实例读的是已切换好的登录态。
  *
- * **每轮都重新枚举再杀**，而不是开局枚举一次就照着那份 PID 名单猛敲：
- * 一来 tasklist 兜底时一次只能看到部分 PID、连主进程是谁都分不出；
- * 二来先杀 helper 会被主进程立刻重新拉起来。反复枚举能让名单自然收敛
- * （先冒出来的子进程被清掉 → 主进程暴露出来 → 再清掉它），直到进程表真的空了。
+ * ⚠️ 必须把「杀不掉」如实报错：原版枚举式实现会在确认不了退出时抛错，正是为了
+ * 防止在客户端还活着的情况下继续切号 / 写库——那会让 WorkBuddy 把登录态改写回去，
+ * 用户看到的是「切完账号登录状态莫名失效」。提速版用一条 taskkill 换速度没问题，
+ * 但非 128 的失败（典型是控制台不是管理员 → 拒绝访问）不能当成成功静默吞掉。
+ * 冷路径才多一次 tasklist 探活，正常成功路径零额外开销。
  *
- * @returns `{ stopped, wasRunning, killed, forced, exePath }`；关不掉时抛错（绝不静默返回成功）
+ * @returns { stopped, wasRunning, killed, forced, exePath }
  */
-export async function stopWorkbuddy({
-  names = WORKBUDDY_PROCESS_NAMES,
-  gracefulMs = STOP_GRACEFUL_MS,
-  forceMs = STOP_FORCE_MS,
-} = {}) {
-  const first = await listWorkbuddyProcesses({ names });
-  if (first.error) {
-    throw new Error(`无法确认 WorkBuddy 的运行状态（${first.error}），为安全起见没有结束任何进程`);
-  }
-  if (!first.processes.length) {
-    return { stopped: true, wasRunning: false, killed: [], forced: false, exePath: null };
-  }
-
-  const exePath = first.processes.find((p) => p.exePath)?.exePath || null;
-  // 杀进程前把真实路径记下来：杀完就再也读不到了，relaunch 全靠这份缓存兜底
-  rememberExePath(exePath);
-  const killed = new Set();
-
-  /**
-   * 一轮"枚举 → 全杀 → 轮询到消失或超时"。
-   * 探测失败时抛错而不是当作"已经关掉了"——那会让切号在客户端还活着的情况下继续。
-   */
-  const round = async (force, timeoutMs) => {
-    const deadline = Date.now() + timeoutMs;
-    for (;;) {
-      const { processes, error } = await listWorkbuddyProcesses({ names });
-      if (error) throw new Error(`无法确认 WorkBuddy 是否已退出（${error}），已中止`);
-      if (!processes.length) return true;
-      for (const p of processes) killed.add(p.pid);
-      for (const p of processes) await terminatePid(p.pid, force);
-      if (Date.now() >= deadline) return false;
-      await sleep(400);
+export async function stopWorkbuddy({ names = WORKBUDDY_PROCESS_NAMES } = {}) {
+  const t0 = Date.now();
+  const exePath = exeFromCache() || findWorkbuddyExe(null) || null;
+  const exe = String(names[0] || 'WorkBuddy').replace(/\.exe$/i, '') + '.exe';
+  let wasRunning = true;
+  try {
+    await run('taskkill', ['/IM', exe, '/T', '/F'], 6000, { windowsHide: true });
+  } catch (e) {
+    if (Number(e?.code) === 128) {
+      wasRunning = false; // 128 = 本来就不在
+    } else {
+      const alive = await tasklistAlive(exe);
+      if (alive === true) {
+        throw new Error(
+          `无法结束 WorkBuddy（${shortExecError(e)}）：进程仍在运行，已中止以免登录态被改写。` +
+            `请以管理员身份运行控制台后重试，或手动退出 WorkBuddy`
+        );
+      }
+      if (alive === null) {
+        throw new Error(`无法确认 WorkBuddy 是否已退出（${shortExecError(e)}），为安全起见已中止`);
+      }
+      wasRunning = false; // 进程确实不在了，taskkill 只是没找到目标
     }
-  };
-
-  if (await round(false, gracefulMs)) {
-    return { stopped: true, wasRunning: true, killed: [...killed], forced: false, exePath };
   }
-
-  if (!(await round(true, forceMs))) {
-    throw new Error(`无法退出 WorkBuddy（仍在运行：PID ${[...killed].join(', ')}），请手动退出后重试`);
-  }
-  // 进程刚没，让 SQLite 把 -wal/-shm 的句柄彻底放开，再动数据库
-  await sleep(700);
-  const confirm = await waitUntilGone(1000, names);
-  if (!confirm.gone) throw new Error('WorkBuddy 退出后又重新启动，请手动退出后重试');
-  return { stopped: true, wasRunning: true, killed: [...killed], forced: true, exePath };
+  if (wasRunning) await sleep(400);
+  console.log('[stop] 关闭命令完成 ' + (Date.now() - t0) + 'ms（wasRunning=' + wasRunning + '）');
+  return { stopped: true, wasRunning, killed: [], forced: true, exePath };
 }
 
-/**
- * 重新打开 WorkBuddy（切换账号后调用，让用户拿到一个已登录新账号的客户端）。
- * Windows 用 exe 直接拉起；macOS 从检测到的可执行文件路径反推 .app 包后用 `open`。
- */
 export async function launchWorkbuddy(exePath) {
   if (process.platform === 'darwin') {
     const bundle = findWorkbuddyAppBundle(exePath);
@@ -935,6 +916,11 @@ export async function launchWorkbuddy(exePath) {
   }
   if (process.platform !== 'win32') {
     throw new Error(`当前平台（${process.platform}）不支持自动重新打开 WorkBuddy，请手动打开`);
+  }
+  // 防重复开：已经在跑就不再 spawn（旧实例没死时越堆越多，关闭会越来越慢）
+  const alive = await detectWorkbuddyProcess().catch(() => null);
+  if (alive?.running) {
+    return { launched: true, alreadyRunning: true, exePath: alive.exePath || exePath || null, verified: true };
   }
   const exe = findWorkbuddyExe(exePath);
   if (!exe) {
@@ -954,39 +940,61 @@ export async function launchWorkbuddy(exePath) {
  * 却发现客户端没开，比直接说失败更糟。这里等 spawn 事件 + 最多 4 秒的进程复检，
  * 把"发起成功但没活下来"如实降级成 warning。
  */
+function namesForExe(exe) {
+  return [path.basename(exe, '.exe')];
+}
+
+/** 读 tasklist /V 的窗口标题；空字符串表示窗口还没出来（进程起来 ≠ 用户能看到窗口） */
+async function windowTitleOf(names) {
+  for (const name of names) {
+    const out = await run('tasklist', ['/FI', `IMAGENAME eq ${name}.exe`, '/V', '/FO', 'CSV', '/NH'], 4000, { windowsHide: true }).catch(() => '');
+    for (const line of String(out).split(/\r?\n/)) {
+      const cells = line.split('","');
+      const title = (cells[8] || '').replace(/"$/, '').trim();
+      if (title && title !== 'N/A') return title;
+    }
+  }
+  return '';
+}
+
 async function spawnAndVerify(exe) {
   let spawnError = null;
   console.log(`[launch] 重新打开 WorkBuddy：${exe}`);
-  const child = spawn(exe, [], { detached: true, stdio: 'ignore' });
+  // cwd 设成 exe 所在目录、windowsHide：和资源管理器双击的环境一致
+  const child = spawn(exe, [], { detached: true, stdio: 'ignore', cwd: path.dirname(exe), windowsHide: true });
   child.on('error', (err) => {
     spawnError = err;
   });
   child.unref();
 
-  await sleep(600);
+  await sleep(150);
   if (spawnError) {
     throw new Error(`启动 ${path.basename(exe)} 失败：${spawnError.message}（路径：${exe}），请手动打开`);
   }
-  for (let i = 0; i < 8; i++) {
-    let probe = null;
-    try {
-      probe = await detectWorkbuddyProcess();
-    } catch {
-      probe = null;
-    }
-    if (probe?.running) return { launched: true, exePath: exe, verified: true };
-    // 探测本身不可用（PowerShell 被拦、tasklist 也失败）时不能断言失败，按已发起来处理
-    if (probe?.error) return { launched: true, exePath: exe, verified: false, warning: `已发起启动，但无法确认进程状态：${probe.error}` };
-    await sleep(500);
-  }
-  return {
-    launched: true,
-    exePath: exe,
-    verified: false,
-    warning: '已发起启动，但 4 秒内没检测到 WorkBuddy 进程；若窗口没出现，可能被安全软件拦截或启动较慢',
-  };
-}
 
+  // 命令行拉起时应用常常只驻留托盘、不弹窗口；再启动一次等价于「双击图标」，
+  // 单实例机制会把已有窗口激活出来（用户手动就是这么做的）。
+  await sleep(2000);
+  try {
+    const again = spawn(exe, [], { detached: true, stdio: 'ignore', cwd: path.dirname(exe), windowsHide: true });
+    again.on('error', () => {});
+    again.unref();
+  } catch {
+    /* 第二次唤起失败不影响主体 */
+  }
+
+  const tSpawn = Date.now();
+  for (let i = 0; i < 80; i++) {
+    await sleep(500);
+    const title = await windowTitleOf(namesForExe(exe)).catch(() => '');
+    if (title) {
+      console.log(`[launch] 窗口就绪 ${Date.now() - tSpawn}ms（标题：${title}）`);
+      return { launched: true, exePath: exe, verified: true, readyMs: Date.now() - tSpawn };
+    }
+  }
+  console.log('[launch] 40 秒内没等到窗口，按已发起处理');
+  return { launched: true, exePath: exe, verified: false, warning: '已发起启动，但 40 秒内没看到窗口；若确实没出现，请手动打开' };
+}
 /** macOS：从检测到的可执行文件路径反推 .app 包路径（如 /Applications/WorkBuddy.app），失败按常见位置兜底 */
 function findWorkbuddyAppBundle(exePath) {
   const m = String(exePath || '').match(/^(\/.+?\.app)\//i);

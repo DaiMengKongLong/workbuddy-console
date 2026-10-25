@@ -312,8 +312,27 @@ function contentFingerprintText(filePath, sessionId) {
   }
 }
 
+/**
+ * 消息指纹缓存：key = 正文路径，value = { mtimeMs, size, set }。
+ * 文件一改（mtime/size 变化）就自动失效重算，所以只省重复读，不会读旧数据。
+ * 一次汇总里同一份正文会被 4~5 个阶段各算一遍，命中缓存后只算一次。
+ */
+const SIGNATURE_CACHE = new Map();
+const SIGNATURE_CACHE_MAX = 4000;
+
 /** 消息指纹集合：角色 + 正文前 200 字，最多 150 条。合并、改写、复制之后仍能对上同一段对话。 */
 function contentSignatureSet(filePath) {
+  let st = null;
+  try {
+    st = fs.statSync(filePath);
+  } catch {
+    return new Set();
+  }
+  const hit = SIGNATURE_CACHE.get(filePath);
+  if (hit && hit.mtimeMs === st.mtimeMs && hit.size === st.size) return hit.set;
+  // 刚被写过的文件（2 秒内）不进缓存：避免「同一毫秒内被改写、大小又恰好相同」的极端情况读到旧指纹
+  const cacheable = Date.now() - st.mtimeMs > 2000;
+
   const set = new Set();
   let fd = null;
   try {
@@ -339,7 +358,37 @@ function contentSignatureSet(filePath) {
   } finally {
     try { if (fd != null) fs.closeSync(fd); } catch { /* ignore */ }
   }
+  if (cacheable) {
+    if (SIGNATURE_CACHE.size >= SIGNATURE_CACHE_MAX) SIGNATURE_CACHE.clear();
+    SIGNATURE_CACHE.set(filePath, { mtimeMs: st.mtimeMs, size: st.size, set });
+  }
   return set;
+}
+
+/**
+ * 预热指纹缓存：把两个档位所有会话正文先算一遍（只读，不动任何数据）。
+ * 调用方可以在「关闭 WorkBuddy」的同时跑它，等同步开始时全部命中缓存。
+ */
+export function warmSessionSignatures() {
+  const t0 = Date.now();
+  let files = 0;
+  for (const variantId of ['cn', 'ai']) {
+    let index;
+    try {
+      index = indexProjectBodies(variantId);
+    } catch {
+      continue;
+    }
+    for (const [, file] of index) {
+      try {
+        contentSignatureSet(file);
+        files += 1;
+      } catch {
+        /* 单个文件失败不影响其它 */
+      }
+    }
+  }
+  return { files, ms: Date.now() - t0 };
 }
 
 /** 与已有会话的消息重合度 ≥85% 就认为「这段对话已经有了」，不再复制 */
@@ -845,7 +894,18 @@ async function openSessionDb(variantId, { readOnly = false } = {}) {
   const { DatabaseSync } = await sqlite();
   const file = sessionDbPath(variantId);
   if (!fs.existsSync(file)) throw new Error(`会话数据库不存在：${file}（请先运行一次 WorkBuddy）`);
-  return new DatabaseSync(file, { readOnly, timeout: readOnly ? 5000 : 8000 });
+  const db = new DatabaseSync(file, { readOnly, timeout: readOnly ? 5000 : 8000 });
+  // WAL + synchronous=NORMAL 是 SQLite 官方推荐组合：少一次 fsync，写入快一个量级，
+  // 崩溃最多丢最后几笔事务（本工具是可重跑的同步，可接受）。只读连接不动。
+  if (!readOnly) {
+    try {
+      db.exec('PRAGMA journal_mode = WAL');
+      db.exec('PRAGMA synchronous = NORMAL');
+    } catch {
+      /* PRAGMA 失败不影响主流程 */
+    }
+  }
+  return db;
 }
 
 /** 递归索引 projects/：会话id → 正文完整路径（符号链接天然被排除） */
@@ -1001,8 +1061,23 @@ function pruneSessionBackups() {
 function backupSessionDb(variantId) {
   const dbPath = sessionDbPath(variantId);
   if (!fs.existsSync(dbPath)) throw new Error('会话数据库不存在，未复制');
+  const backupsRoot = path.join(STORE_DIR, 'backups');
+  const today = new Date().toISOString().slice(0, 10);
+  const sizeNow = fs.statSync(dbPath).size;
+
+  // 当天已有「同尺寸」备份就直接复用：同一天、库没变大，再拷一份只是白等
+  try {
+    for (const name of fs.readdirSync(backupsRoot)) {
+      if (!name.startsWith(`session-copy-${today}`)) continue;
+      const cand = path.join(backupsRoot, name, 'workbuddy.db');
+      if (fs.existsSync(cand) && fs.statSync(cand).size === sizeNow) return path.join(backupsRoot, name);
+    }
+  } catch {
+    /* 读不到备份目录就正常走下面的全量备份 */
+  }
+
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const dir = path.join(STORE_DIR, 'backups', `session-copy-${stamp}`);
+  const dir = path.join(backupsRoot, `session-copy-${stamp}`);
   fs.mkdirSync(dir, { recursive: true });
   for (const suffix of ['', '-wal', '-shm']) {
     const src = `${dbPath}${suffix}`;
@@ -1496,10 +1571,16 @@ export async function copySessions({ targetAccountId, ids, stopApp = false, skip
  *                                  **不做任何写入**（也不要求 WorkBuddy 退出，只读访问）
  * @returns {Promise<object>} 汇总报告
  */
-export async function syncAllAccounts({ stopApp = false, fillMissing = false, dryRun = false, pruneOthers = false, keepVariant = null } = {}) {
+export async function syncAllAccounts({ stopApp = false, fillMissing = false, dryRun = false, pruneOthers = false, keepVariant = null, assumeClosed = false } = {}) {
   const started = Date.now();
   // 预演只读：不结束 WorkBuddy、用只读连接打开库，App 运行中也能跑
-  const appStop = dryRun ? null : await ensureAppClosed({ stop: stopApp });
+  // assumeClosed：调用方（withAppRestart）已经关过应用，别再枚举一次进程——
+  // 目标机器起一个子进程可能要 3~7 秒，多枚举一次就多等这么久。
+  const appStop = dryRun
+    ? null
+    : assumeClosed
+      ? { stopped: true, wasRunning: true, assumed: true }
+      : await ensureAppClosed({ stop: stopApp });
 
   const report = {
     ok: true,
@@ -1894,7 +1975,9 @@ export async function syncAllAccounts({ stopApp = false, fillMissing = false, dr
     // ⓪先把「另一档位」的会话复制进保留档位的当前账号——切换过去能直接看到
     try {
       const keepUid0 = currentUidOfVariant(kv) || '';
+      const __pt = Date.now();
       const cross = await copyVariantIntoAccount({ sourceVariant: ov, targetVariant: kv, targetUid: keepUid0, dryRun });
+      console.log(`[sync] 跨档位复制 ${Date.now() - __pt}ms`);
       report.crossVariantCopy = {
         copied: cross.copied.length,
         skipped: cross.skipped.length,
@@ -1912,7 +1995,9 @@ export async function syncAllAccounts({ stopApp = false, fillMissing = false, dr
     }
     // ①先把「其他国内账号独有的对话」汇总进当前账号（单向，不铺满）
     try {
+      const __pt = Date.now();
       const collected = await collectIntoCurrent({ variantId: kv, dryRun });
+      console.log(`[sync] 汇总独有会话 ${Date.now() - __pt}ms`);
       report.collected = {
         copied: collected.copied.length,
         skipped: collected.skipped.length,
@@ -1930,7 +2015,9 @@ export async function syncAllAccounts({ stopApp = false, fillMissing = false, dr
     // ②先处理「当前账号内同一对话多份」：合并成最完整的一份（内容取全）
     try {
       const mergeUid = currentUidOfVariant(kv) || '';
+      const __pt = Date.now();
       const merged = await mergeWithinAccount({ uid: mergeUid, variantId: kv, dryRun });
+      console.log(`[sync] 同账号合并 ${Date.now() - __pt}ms`);
       report.mergedWithin = {
         groups: merged.groups.length,
         removed: merged.groups.reduce((s, g) => s + g.merged.length, 0),
@@ -1950,7 +2037,9 @@ export async function syncAllAccounts({ stopApp = false, fillMissing = false, dr
       if (report.collected && report.collected.errors) {
         report.prune = { pruned: 0, kept: 0, freedBytes: 0, errors: 0, dryRun, skipped: true };
       } else {
+        const __pt = Date.now();
         const pruned = await pruneOtherAccounts({ keepUid, dryRun });
+        console.log(`[sync] 其它账号清理 ${Date.now() - __pt}ms`);
         report.prune = {
           pruned: pruned.pruned.length,
           kept: pruned.kept.length,
@@ -1972,7 +2061,9 @@ export async function syncAllAccounts({ stopApp = false, fillMissing = false, dr
         // 安全闸：跨档位复制有失败就不删，避免「没复制成功却把源删了」
         report.variantPrune = { pruned: 0, kept: 0, freedBytes: 0, errors: 0, dryRun, skipped: true };
       } else {
+        const __pt = Date.now();
         const vp = await pruneVariantAgainst({ keepVariant: kv, otherVariant: ov, keepUid: keepUid2, dryRun });
+        console.log(`[sync] 跨档位清理 ${Date.now() - __pt}ms`);
         report.variantPrune = {
           pruned: vp.pruned.length,
           kept: vp.kept.length,

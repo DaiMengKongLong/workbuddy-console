@@ -195,7 +195,13 @@ function ModelIcon({ model, className, mono = false }: { model: string; classNam
  * 模型额度超限小标：某个模型的用量超出限额时显示该模型图标（红色），
  * 鼠标悬停显示「何时恢复」。数据来自会话日志里的官方 429 报错。
  */
-function ModelLimitBadges({ limits }: { limits?: { model: string; resetAt: number }[] }) {
+function ModelLimitBadges({
+  limits,
+  note,
+}: {
+  limits?: { model: string; resetAt: number; resetKnown?: boolean; status?: number }[];
+  note?: string;
+}) {
   // 恢复时间一到就自动消失：每分钟刷新一次当前时间，顺手过滤掉已过期的条目
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
@@ -203,7 +209,18 @@ function ModelLimitBadges({ limits }: { limits?: { model: string; resetAt: numbe
     return () => window.clearInterval(timer);
   }, []);
   const live = (limits || []).filter((x) => !x.resetAt || x.resetAt > now);
-  if (!live.length) return null;
+  if (!live.length) {
+    // 探测有异常（非 429 的拒绝、超时、凭据被拒…）也要留痕，否则用户只看到“什么都没发生”
+    if (!note) return null;
+    return (
+      <span
+        className="inline-flex h-6 items-center justify-center rounded-md bg-zinc-100 px-1"
+        title={`额度探测异常：${note}`}
+      >
+        <IconWarning className="h-3.5 w-3.5 text-zinc-400" />
+      </span>
+    );
+  }
   const fmt = (ts: number) => {
     const d = new Date(ts);
     const p = (n: number) => String(n).padStart(2, '0');
@@ -215,7 +232,11 @@ function ModelLimitBadges({ limits }: { limits?: { model: string; resetAt: numbe
         <span
           key={x.model}
           className="inline-flex h-6 items-center justify-center rounded-md bg-rose-50 px-1"
-          title={`${x.model} 用量已超限额，将于 ${fmt(x.resetAt)} 恢复`}
+          title={
+            x.resetKnown === false
+              ? `${x.model} 用量已超限额（HTTP ${x.status || 429}），恢复时间未知，10 分钟后自动复探`
+              : `${x.model} 用量已超限额，将于 ${fmt(x.resetAt)} 恢复`
+          }
         >
           <ModelIcon model={x.model} mono className="h-3.5 w-3.5 text-rose-500" />
         </span>
@@ -376,6 +397,7 @@ function AccountCard({
   balance,
   daily,
   modelLimits,
+  limitNote,
   balanceLoading,
   authInvalid,
   onSwitch,
@@ -390,7 +412,8 @@ function AccountCard({
   busy: boolean;
   balance: CreditBalance | null;
   daily?: { checkedIn?: boolean; traveled?: boolean; checkinError?: string | null; travelError?: string | null };
-  modelLimits?: { model: string; resetAt: number }[];
+  modelLimits?: { model: string; resetAt: number; resetKnown?: boolean; status?: number }[];
+  limitNote?: string;
   balanceLoading: boolean;
   /** 官方接口已明确拒绝该账号的凭据（401/403）——本地未过期也不算数 */
   authInvalid: boolean;
@@ -481,7 +504,7 @@ function AccountCard({
                 <Badge color={credState.color}>{credState.text}</Badge>
               </span>
               <DailyBadges daily={daily} />
-              <ModelLimitBadges limits={modelLimits} />
+              <ModelLimitBadges limits={modelLimits} note={limitNote} />
             </div>
           </div>
         </div>
@@ -1840,6 +1863,8 @@ export default function AccountsPage() {
   const [balances, setBalances] = useState<AccountBalancesResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [balanceLoading, setBalanceLoading] = useState(true);
+  /** 「刷新」进行中：刷新登录态的同时会把成长中心奖励领一遍 */
+  const [refreshingAll, setRefreshingAll] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [importing, setImporting] = useState<string | null>(null);
   const [editing, setEditing] = useState<AccountInfo | null>(null);
@@ -2016,11 +2041,58 @@ export default function AccountsPage() {
   const loadBalances = useCallback(async (refresh = false) => {
     setBalanceLoading(true);
     try {
-      setBalances(await get<AccountBalancesResponse>(`/api/accounts/credits${refresh ? '?refresh=1' : ''}`, { timeoutMs: TIMEOUT.quota }));
+      const res = await get<AccountBalancesResponse>(`/api/accounts/credits${refresh ? '?refresh=1' : ''}`, { timeoutMs: TIMEOUT.quota });
+      setBalances(res);
+      // 存一份本地快照：下次打开先用旧数据渲染，避免盯着「查询中」空等
+      try {
+        localStorage.setItem('wb-console:balances', JSON.stringify({ at: Date.now(), res }));
+      } catch {
+        /* 存不下就算了 */
+      }
     } catch {
       /* 余额查询失败不阻塞账号列表，卡片上会显示"余额暂不可用" */
     } finally {
       setBalanceLoading(false);
+    }
+  }, []);
+
+  /**
+   * 「刷新」= 刷新登录态 + 余额，并且顺带把成长中心奖励领一遍。
+   * 切完账号最容易忘的就是再去设置页点「一键领取」，这里合成一步。
+   */
+  const refreshAll = useCallback(async () => {
+    setRefreshingAll(true);
+    try {
+      load();
+      void loadBalances(true);
+      void loadLimitStates(true);
+      const r = await post<{
+        summary: { checked: number; already: number; skipped: number; failed: number; growthCredits?: number };
+      }>('/api/workbuddy/checkin', { onlyPending: true });
+      const s = r.summary;
+      const parts: string[] = [];
+      if (s.checked) parts.push(`新签到 ${s.checked} 个`);
+      if (s.growthCredits) parts.push(`成长中心 +${s.growthCredits} 积分`);
+      if (s.failed) parts.push(`失败 ${s.failed} 个`);
+      toast(s.failed ? 'err' : 'ok', parts.length ? `刷新完成，顺带领取：${parts.join('，')}` : '刷新完成，今日奖励已领完');
+    } catch (e: any) {
+      toast('err', `刷新完成，但领取失败：${e?.message || '未知错误'}`);
+    } finally {
+      setRefreshingAll(false);
+      load();
+      void loadBalances(true);
+    }
+  }, [load, loadBalances, toast]);
+
+  // 首屏：30 分钟内的上次余额快照先垫上
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem('wb-console:balances');
+      if (!raw) return;
+      const saved = JSON.parse(raw) as { at: number; res: AccountBalancesResponse };
+      if (saved?.res && Date.now() - Number(saved.at || 0) < 30 * 60 * 1000) setBalances(saved.res);
+    } catch {
+      /* 脏数据忽略 */
     }
   }, []);
 
@@ -2259,23 +2331,36 @@ export default function AccountsPage() {
     }
   };
 
-  /** 各账号「模型额度超限」状态（后端缓存 3 分钟） */
-  const [modelLimits, setModelLimits] = useState<Record<string, { model: string; resetAt: number }[]>>({});
-  useEffect(() => {
-    let cancelled = false;
-    const load = async () => {
-      try {
-        const r = await get<{ accounts: Record<string, any> }>('/api/accounts/model-limits');
-        if (!cancelled && r?.accounts) setModelLimits(r.accounts);
-      } catch {
-        /* 查询失败不显示即可 */
-      }
-    };
-    load();
-    return () => {
-      cancelled = true;
-    };
+  /** 各账号「模型额度超限」状态（后端缓存 10 分钟，前端 90 秒轮询 + 窗口聚焦刷新） */
+  const [modelLimits, setModelLimits] = useState<
+    Record<string, { model: string; resetAt: number; resetKnown?: boolean; status?: number }[]>
+  >({});
+  /** 探测异常说明（非 429 的拒绝 / 超时 / 无可用凭据），按账号 id 或 uid 存 */
+  const [limitNotes, setLimitNotes] = useState<Record<string, string>>({});
+
+  const loadLimitStates = useCallback(async (refresh = false) => {
+    try {
+      const r = await get<{ accounts: Record<string, any>; accountNotes?: Record<string, string> }>(
+        `/api/accounts/model-limits${refresh ? '?refresh=1' : ''}`
+      );
+      if (r?.accounts) setModelLimits(r.accounts);
+      if (r?.accountNotes) setLimitNotes(r.accountNotes);
+    } catch {
+      /* 查询失败保留上一次结果，不清空 */
+    }
   }, []);
+
+  useEffect(() => {
+    void loadLimitStates();
+    // 限流是随时发生的事，只在挂载时拉一次会一直显示旧状态
+    const timer = window.setInterval(() => void loadLimitStates(), 90_000);
+    const onFocus = () => void loadLimitStates();
+    window.addEventListener('focus', onFocus);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener('focus', onFocus);
+    };
+  }, [loadLimitStates]);
 
   /** 今日签到/旅行状态（每 5 分钟由后端缓存刷新） */
   const [dailyStatus, setDailyStatus] = useState<
@@ -2455,13 +2540,7 @@ export default function AccountsPage() {
           title="当前登录态"
           desc="切换账号会重写 WorkBuddy 的登录态文件，操作前自动备份，失败自动回滚"
           actions={
-            <Button
-              size="sm"
-              onClick={() => {
-                load();
-                void loadBalances(true);
-              }}
-            >
+            <Button size="sm" loading={refreshingAll} onClick={refreshAll} title="刷新登录态与余额，并顺手领取今日签到与成长中心奖励">
               <IconRefresh className="w-3.5 h-3.5" />
               刷新
             </Button>
@@ -2564,6 +2643,7 @@ export default function AccountsPage() {
                 busy={busyId === a.id}
                 daily={dailyStatus[a.id] || dailyStatus[a.uid] || undefined}
                 modelLimits={modelLimits[a.id] || modelLimits[a.uid] || undefined}
+                limitNote={limitNotes[a.id] || limitNotes[a.uid] || undefined}
                 balance={balanceOf(a.id)}
                 balanceLoading={balanceLoading && !balanceOf(a.id)}
                 authInvalid={authInvalidIds.has(a.id)}
