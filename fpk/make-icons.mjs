@@ -254,7 +254,12 @@ if (fs.existsSync(SRC)) {
       fs.writeFileSync(out, encodePng16(w, h, rgba));
       fs.rmSync(tmp, { force: true });
     };
-    gen16(1024, path.join(__dirname, 'ICON.PNG'));
+    // ⚠️ ICON.PNG / ICON_256.PNG 统一 **256×256**。
+    // 试错记录：64×64 不显示 → 改 1024×1024（对齐图标正常显示的 com.dustinky.tunnel）仍不显示
+    // → 再加 16bit RGBA 仍不显示 → 客户端图标缓存刷了也没用。
+    // 飞牛打包文档写的是「ICON.PNG、ICON_256.PNG（256×256，应用中心读这两个）」，
+    // 尺寸是唯一还没验证过的变量，按文档来。
+    gen16(256, path.join(__dirname, 'ICON.PNG'));
     gen16(256, path.join(__dirname, 'ICON_256.PNG'));
     gen16(256, path.join(OUT_UI, 'icon_256.png'));
     gen16(64, path.join(OUT_UI, 'icon_64.png'));
@@ -266,7 +271,7 @@ if (fs.existsSync(SRC)) {
   }
 }
 for (const [size, out] of [
-  [1024, path.join(__dirname, 'ICON.PNG')],
+  [256, path.join(__dirname, 'ICON.PNG')],
   [256, path.join(__dirname, 'ICON_256.PNG')],
   [256, path.join(OUT_UI, 'icon_256.png')],
   [64, path.join(OUT_UI, 'icon_64.png')],
