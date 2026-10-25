@@ -65,12 +65,18 @@ function Row({
   className?: string;
 }) {
   return (
-    <div className={`flex flex-wrap items-center gap-x-4 gap-y-2 px-4 py-3 ${className}`}>
+    // 手机（<768px）改为上下堆叠：说明文字占满整行宽，操作项换到下一行。
+    // 否则长说明会被右侧控件挤成一条 ~150px 的窄竖条（每行十来个字），非常难读。
+    <div
+      className={`flex flex-wrap items-center gap-x-4 gap-y-2 px-4 py-3 max-md:flex-col max-md:items-stretch max-md:gap-y-1.5 ${className}`}
+    >
       <div className="min-w-0 flex-1">
         <div className="text-sm text-zinc-700">{label}</div>
         {desc && <div className="mt-0.5 text-xs text-zinc-400 leading-relaxed">{desc}</div>}
       </div>
-      {children && <div className="flex flex-wrap items-center gap-2">{children}</div>}
+      {children && (
+        <div className="flex flex-wrap items-center gap-2 max-md:justify-end max-md:pt-0.5">{children}</div>
+      )}
     </div>
   );
 }
