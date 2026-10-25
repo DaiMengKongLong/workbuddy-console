@@ -93,10 +93,13 @@ body {
 
 /* ============================================================
    多端适配（手机 / 平板 / 桌面）
-   —— 上游只做了「小屏隐藏侧栏 + 顶部标签导航」，这里补齐触控与窄屏细节
+   原则：只做「不会误伤」的兜底。
+   教训：之前用 [class*='grid-cols-'] 一刀切改列宽，把账号卡片挤成两列、
+   把「余额数字」所在的 grid-cols-[auto_1fr_auto] 结构行压碎成竖排——已移除。
+   网格布局交给组件里的响应式类（auto-fit / sm: / md:）自己处理。
    ============================================================ */
 
-/* 1) 窄屏：宽表格横向滚动，单元格内容允许换行（URL / 命令示例不会被截断成死板一行） */
+/* 1) 窄屏：宽表格横向滚动，单元格内容允许换行 */
 @media (max-width: 1023px) {
   table {
     display: block;
@@ -106,30 +109,50 @@ body {
   }
   table > thead { display: table-header-group; }
   table > tbody { display: table-row-group; }
-  table > tr,
-  table thead tr,
-  table tbody tr { display: table-row; }
-  table td,
-  table th { display: table-cell; }
   table td,
   table th {
     white-space: normal;
     word-break: break-word;
-    overflow-wrap: anywhere;
+    overflow-wrap: break-word;
   }
 }
 
-/* 2) 等宽代码块 / 长串：任何时候都换行，避免把页面撑宽（复制示例时不会横向溢出） */
+/* 2) 代码块 / 长串：换行，避免撑宽页面。
+   ⚠️ 只对 code 类元素生效，绝不全局套到文本上——
+   全局 break-all 会把「1,775.49」这样的数字逐字符竖着排（真踩过）。 */
 pre,
 code,
-.font-mono,
-[class*='font-mono'] {
+kbd,
+samp {
   white-space: pre-wrap !important;
   word-break: break-all;
   overflow-wrap: anywhere;
 }
 
-/* 3) 触控目标：小屏按钮 / 可点元素最小 40px，避免手机上点不中 */
+/* 2.0) 单行省略优先：.truncate 是刻意设计（如长 UID 截断显示），
+   不能被上面的 font-mono 换行规则冲掉——否则长 UID 会把整张卡片撑出屏幕 */
+.truncate,
+[class*='truncate'] {
+  white-space: nowrap !important;
+  word-break: normal;
+  overflow-wrap: normal;
+  text-overflow: ellipsis;
+  overflow: hidden;
+}
+
+/* 2.1) 数字保护：等宽数字一律不许在中间断开（余额 / 时间戳 / 计数） */
+@media (max-width: 1023px) {
+  .tabular-nums,
+  [class*='tabular-nums'] {
+    word-break: keep-all;
+    overflow-wrap: normal;
+  }
+  strong[class*='tabular-nums'] {
+    white-space: nowrap;
+  }
+}
+
+/* 3) 触控目标：小屏按钮 / 可点元素最小 40px；输入框 ≥16px 防 iOS 聚焦放大 */
 @media (max-width: 1023px) {
   button,
   [role='button'],
@@ -138,7 +161,6 @@ code,
   select {
     min-height: 40px;
   }
-  /* 输入框字号 ≥16px：防止 iOS Safari 聚焦时自动放大页面 */
   input,
   select,
   textarea {
@@ -146,7 +168,7 @@ code,
   }
 }
 
-/* 4) 弹窗 / 抽屉：窄屏铺满，底部留出 iPhone 安全区 */
+/* 4) 弹窗：窄屏铺满 + 底部安全区 */
 @media (max-width: 1023px) {
   [class*='fixed'][class*='inset-0'] > div:last-child,
   [role='dialog'] {
@@ -156,15 +178,94 @@ code,
   }
 }
 
-/* 5) 主内容区在窄屏更紧凑 + 底部安全区（全面屏手机不会被 Home 条压住） */
+/* 5) 主内容区窄屏更紧凑 + 底部安全区 */
 @media (max-width: 1023px) {
   main,
   main > div {
     padding-bottom: calc(1rem + env(safe-area-inset-bottom, 0px));
   }
+  /* 内边距收紧，小屏多看内容 */
+  [class*='p-4'],
+  [class*='p-5'],
+  [class*='p-6'] {
+    padding: 0.875rem !important;
+  }
+  [class*='px-4'],
+  [class*='px-5'],
+  [class*='px-6'] {
+    padding-left: 0.875rem !important;
+    padding-right: 0.875rem !important;
+  }
+  [class*='py-4'],
+  [class*='py-5'] {
+    padding-top: 0.875rem !important;
+    padding-bottom: 0.875rem !important;
+  }
+  [class*='gap-4'],
+  [class*='gap-5'] {
+    gap: 0.75rem !important;
+  }
+  [class*='rounded-2xl'] {
+    border-radius: 1rem !important;
+  }
 }
 
-/* 6) 横向滚动条在移动端隐藏，观感更干净 */
+/* 6) 手机（≤640px）：只收「明确写死多列」的卡片网格。
+   放过任意值网格 grid-cols-[...]——那些要么是 auto-fit 自适应，
+   要么是 [auto_1fr_auto] 这类内部结构行，收成单列会直接毁掉布局。 */
+@media (max-width: 640px) {
+  [class*='grid-cols-2']:not([class*='grid-cols-[']),
+  [class*='grid-cols-3']:not([class*='grid-cols-[']),
+  [class*='grid-cols-4']:not([class*='grid-cols-[']),
+  [class*='grid-cols-5']:not([class*='grid-cols-[']),
+  [class*='grid-cols-6']:not([class*='grid-cols-[']) {
+    grid-template-columns: minmax(0, 1fr) !important;
+  }
+  /* 固定 / 最小宽度不得撑破屏幕 */
+  [class*='w-['],
+  [class*='min-w-['] {
+    max-width: 100% !important;
+    min-width: 0 !important;
+  }
+}
+
+/* 7) 图片 / 视频不溢出；长单词可断（但不用 anywhere，避免数字被拆） */
+@media (max-width: 1023px) {
+  img,
+  video,
+  svg {
+    max-width: 100%;
+    height: auto;
+  }
+  body,
+  p,
+  td,
+  th,
+  li,
+  span,
+  div {
+    overflow-wrap: break-word;
+    word-break: normal;
+  }
+}
+
+/* 8) 顶部横向标签导航：可滑动、不换行，并给出「右边还有」的渐隐提示 */
+@media (max-width: 1023px) {
+  [class*='overflow-x-auto'] {
+    -webkit-overflow-scrolling: touch;
+    flex-wrap: nowrap !important;
+    scrollbar-width: none;
+  }
+}
+
+/* 9) 底部操作条留安全区 */
+@media (max-width: 1023px) {
+  [class*='sticky'] {
+    padding-bottom: calc(0.5rem + env(safe-area-inset-bottom, 0px));
+  }
+}
+
+/* 10) 横向滚动条在移动端隐藏 */
 @media (max-width: 1023px) {
   ::-webkit-scrollbar {
     height: 0;
@@ -172,80 +273,8 @@ code,
   }
 }
 
-/* 7) 防止整页在窄屏出现横向滚动（表格外的溢出由第 1 条处理） */
+/* 11) 防止整页横向滚动 */
 html,
 body {
   overflow-x: hidden;
-}
-
-/* ---------- 窄屏布局兜底（第二轮：修"部分页面不协调"） ---------- */
-@media (max-width: 1023px) {
-  /* 1) 多列网格在窄屏自动收敛（能放下几列就几列，放不下就单列） */
-  [class*='grid-cols-'] {
-    grid-template-columns: repeat(auto-fit, minmax(min(100%, 170px), 1fr)) !important;
-  }
-
-  /* 2) 固定宽度 / 最小宽度不得撑破屏幕 */
-  [class*='w-['],
-  [class*='min-w-['] {
-    max-width: 100% !important;
-    min-width: 0 !important;
-  }
-
-  /* 3) 弹窗与大容器铺满可用宽度（原选择器匹配不到时用这条兜底） */
-  [class*='max-w-'] {
-    max-width: 96vw !important;
-  }
-
-  /* 4) 内边距收紧，小屏能多看内容 */
-  [class*='p-4'],
-  [class*='p-5'],
-  [class*='p-6'],
-  [class*='px-4'],
-  [class*='px-5'],
-  [class*='px-6'],
-  [class*='py-4'],
-  [class*='py-5'] {
-    padding: 0.875rem !important;
-  }
-
-  /* 5) 卡片圆角与间距略收，观感更紧凑 */
-  [class*='rounded-2xl'] {
-    border-radius: 1rem !important;
-  }
-  [class*='gap-4'],
-  [class*='gap-5'] {
-    gap: 0.75rem !important;
-  }
-
-  /* 6) 图片 / 视频不溢出 */
-  img,
-  video,
-  svg {
-    max-width: 100%;
-    height: auto;
-  }
-
-  /* 7) 长单词 / 长域名允许断行，避免撑宽 */
-  body,
-  div,
-  span,
-  p,
-  td,
-  th,
-  li {
-    overflow-wrap: anywhere;
-    word-break: break-word;
-  }
-
-  /* 8) 顶部横向标签导航：可滑动、不换行 */
-  [class*='overflow-x-auto'] {
-    -webkit-overflow-scrolling: touch;
-    flex-wrap: nowrap !important;
-  }
-
-  /* 9) 底部操作条留安全区 */
-  [class*='sticky'] {
-    padding-bottom: calc(0.5rem + env(safe-area-inset-bottom, 0px));
-  }
 }
