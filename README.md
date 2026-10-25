@@ -6,7 +6,7 @@
 
 > 把 **WorkBuddy 账号管理**、**多平台免费模型广场**、**积分统计**、**每日签到与成长中心**、**反向代理** 收进飞牛 fnOS 的一个应用里。
 
-**当前版本：v0.2.41**
+**当前版本：v0.2.42**
 
 本仓库的 `fnos` 分支是**飞牛 fnOS（fnOS 应用中心）专用版本**，与上游
 [walter-io/workbuddy-console](https://github.com/walter-io/workbuddy-console) 的 Windows / macOS
@@ -14,14 +14,14 @@
 
 - 上游桌面版源码与 Release 镜像：`main` 分支
 - 飞牛 fnOS 版源码：`fnos` 分支（本文件）
-- 飞牛版安装包 Release：`[fnos-v0.2.41](https://github.com/DaiMengKongLong/workbuddy-console/releases/tag/fnos-v0.2.41)`
+- 飞牛版安装包 Release：`[fnos-v0.2.42](https://github.com/DaiMengKongLong/workbuddy-console/releases/tag/fnos-v0.2.42)`
 
 ---
 
 ## 一、安装
 
-1. 到 [fnos-v0.2.41 Release](https://github.com/DaiMengKongLong/workbuddy-console/releases/tag/fnos-v0.2.41)
-   下载 `wbconsole-0.2.41-x86.fpk`；
+1. 到 [fnos-v0.2.42 Release](https://github.com/DaiMengKongLong/workbuddy-console/releases/tag/fnos-v0.2.42)
+   下载 `wbconsole-0.2.42-x86.fpk`；
 2. 飞牛桌面 → **应用中心** → 右上角「设置」→「**手动安装应用**」→ 选择该 `.fpk`；
 3. 装完点「启用」，再从桌面打开即可。
 
