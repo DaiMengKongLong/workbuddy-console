@@ -990,21 +990,24 @@ function ScanAddDialog({
 
         {phase === 'waiting' && uri && !expired && (
           <>
-            {variant === 'ai' && (
-              <div className="flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3.5 py-2.5 text-xs text-amber-800 leading-relaxed">
-                <IconWarning className="w-3.5 h-3.5 shrink-0 mt-px text-amber-500" />
-                <span>
+            {/* 常驻提示（非国际版也显示）：这是「跳官网登录成功却没添加成功」最常见的原因——
+                浏览器已有官网登录态，授权页直接显示已登录，**不会绑定本次 state**。 */}
+            <div className="flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3.5 py-2.5 text-xs text-amber-800 leading-relaxed">
+              <IconWarning className="w-3.5 h-3.5 shrink-0 mt-px text-amber-500" />
+              <span>
+                {variant === 'ai' && (
                   <span className="block">
                     国际版登录要访问 <b>workbuddy.ai</b>，境内直连通常不通——请先开启代理，并到「设置 → 网络代理」填写代理地址；
                     没有可用的境外网络请改用「国内版」。
                   </span>
-                  <span className="mt-1 block">
-                    若浏览器已登录 workbuddy.ai，授权页会直接跳到「登录成功」而不会绑定新账号。
-                    请复制链接到<strong>无痕（隐私）窗口</strong>打开并完成登录。
-                  </span>
+                )}
+                <span className={variant === 'ai' ? 'mt-1 block' : 'block'}>
+                  若浏览器<strong>已登录</strong>官网（{variant === 'ai' ? 'workbuddy.ai' : 'codebuddy.cn'}），授权页会直接跳到
+                  「登录成功」而<strong>不会绑定本次登录</strong>，控制台就一直等不到账号。请复制链接到
+                  <strong>无痕（隐私）窗口</strong>打开，或用未登录的浏览器完成授权。
                 </span>
-              </div>
-            )}
+              </span>
+            </div>
             {/* 首选：浏览器里完成授权。官方页在浏览器里点「同意」才会绑定 state，
                 手机扫码偶发不绑定的情况，走浏览器最稳；二维码保留给手机扫码用户。 */}
             <div className="rounded-xl border border-indigo-100 bg-indigo-50/60 px-3.5 py-3 space-y-2">
