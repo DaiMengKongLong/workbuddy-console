@@ -1,0 +1,3 @@
+#!/bin/bash
+### 安装前：由应用中心先安装 nodejs_v22 依赖
+exit 0

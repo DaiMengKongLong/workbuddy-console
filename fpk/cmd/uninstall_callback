@@ -1,0 +1,4 @@
+#!/bin/bash
+### 卸载后：清理 socket（保留 data，避免误删账号库）
+rm -f "${TRIM_PKGVAR}/run/wbconsole.sock" "${TRIM_PKGVAR}/app.pid"
+exit 0

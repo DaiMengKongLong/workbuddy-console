@@ -1,0 +1,42 @@
+{
+  "name": "workbuddy-console-fnos",
+  "private": true,
+  "version": "0.2.35",
+  "description": "workbuddy控制台：账号切换、多平台免费模型广场、Token 与积分用量统计",
+  "author": "walter-io",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/walter-io/workbuddy-console.git"
+  },
+  "type": "module",
+  "scripts": {
+    "dev": "node node_modules/vite/bin/vite.js",
+    "dev:server": "node server/index.mjs",
+    "build": "node node_modules/vite/bin/vite.js build",
+    "start": "node server/index.mjs",
+    "fpk": "node fpk/build.mjs",
+    "fpk:icons": "node fpk/make-icons.mjs",
+    "hotupdate": "node tools/make-hotupdate.mjs"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "undici": "^6.29.0",
+    "qrcode": "^1.5.4"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.0.0",
+    "@types/qrcode": "^1.5.6",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "qrcode": "^1.5.4",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "recharts": "^2.13.0",
+    "tailwindcss": "^4.0.0",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.0"
+  },
+  "main": "server/index.mjs"
+}

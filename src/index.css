@@ -1,0 +1,251 @@
+@import "tailwindcss";
+
+html, body, #root {
+  height: 100%;
+}
+
+body {
+  @apply bg-zinc-100 text-zinc-800 antialiased;
+  color-scheme: light;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  /* 数字等宽对齐：价格/次数/Token 等纵向排版更整齐 */
+  font-variant-numeric: tabular-nums;
+  -moz-osx-font-smoothing: grayscale;
+  /* 页面底色：极淡的顶光，避免大面积纯色显得平 */
+  background-image: radial-gradient(1200px 480px at 70% -10%, rgba(99, 102, 241, 0.05), transparent 70%);
+  background-repeat: no-repeat;
+}
+
+::selection {
+  @apply bg-indigo-200/70;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  @apply bg-zinc-300 rounded-full;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  @apply bg-zinc-400;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+/* Firefox 细滚动条 */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #d4d4d8 transparent;
+}
+
+/* 键盘可达性：Tab 聚焦时给清晰的可见焦点环 */
+:focus-visible {
+  outline: 2px solid #a5b4fc;
+  outline-offset: 1px;
+  border-radius: 4px;
+}
+
+/* 鼠标点击不显示焦点环（仅键盘导航可见），减少视觉噪声 */
+:focus:not(:focus-visible) {
+  outline: none;
+}
+
+/* ---------------- 动效 ---------------- */
+
+@keyframes ft-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes ft-pop-in {
+  from { opacity: 0; transform: translateY(8px) scale(0.985); }
+  to { opacity: 1; transform: none; }
+}
+
+@keyframes ft-slide-up {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: none; }
+}
+
+.animate-fade-in { animation: ft-fade-in 0.16s ease-out both; }
+.animate-pop-in { animation: ft-pop-in 0.18s cubic-bezier(0.16, 1, 0.3, 1) both; }
+.animate-slide-up { animation: ft-slide-up 0.22s cubic-bezier(0.16, 1, 0.3, 1) both; }
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-fade-in,
+  .animate-pop-in,
+  .animate-slide-up {
+    animation: none;
+  }
+  * {
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* ============================================================
+   多端适配（手机 / 平板 / 桌面）
+   —— 上游只做了「小屏隐藏侧栏 + 顶部标签导航」，这里补齐触控与窄屏细节
+   ============================================================ */
+
+/* 1) 窄屏：宽表格横向滚动，单元格内容允许换行（URL / 命令示例不会被截断成死板一行） */
+@media (max-width: 1023px) {
+  table {
+    display: block;
+    width: 100%;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  table > thead { display: table-header-group; }
+  table > tbody { display: table-row-group; }
+  table > tr,
+  table thead tr,
+  table tbody tr { display: table-row; }
+  table td,
+  table th { display: table-cell; }
+  table td,
+  table th {
+    white-space: normal;
+    word-break: break-word;
+    overflow-wrap: anywhere;
+  }
+}
+
+/* 2) 等宽代码块 / 长串：任何时候都换行，避免把页面撑宽（复制示例时不会横向溢出） */
+pre,
+code,
+.font-mono,
+[class*='font-mono'] {
+  white-space: pre-wrap !important;
+  word-break: break-all;
+  overflow-wrap: anywhere;
+}
+
+/* 3) 触控目标：小屏按钮 / 可点元素最小 40px，避免手机上点不中 */
+@media (max-width: 1023px) {
+  button,
+  [role='button'],
+  a[class*='rounded'],
+  input[type='checkbox'],
+  select {
+    min-height: 40px;
+  }
+  /* 输入框字号 ≥16px：防止 iOS Safari 聚焦时自动放大页面 */
+  input,
+  select,
+  textarea {
+    font-size: 16px;
+  }
+}
+
+/* 4) 弹窗 / 抽屉：窄屏铺满，底部留出 iPhone 安全区 */
+@media (max-width: 1023px) {
+  [class*='fixed'][class*='inset-0'] > div:last-child,
+  [role='dialog'] {
+    max-width: 96vw !important;
+    max-height: 92vh !important;
+    padding-bottom: calc(0.75rem + env(safe-area-inset-bottom, 0px));
+  }
+}
+
+/* 5) 主内容区在窄屏更紧凑 + 底部安全区（全面屏手机不会被 Home 条压住） */
+@media (max-width: 1023px) {
+  main,
+  main > div {
+    padding-bottom: calc(1rem + env(safe-area-inset-bottom, 0px));
+  }
+}
+
+/* 6) 横向滚动条在移动端隐藏，观感更干净 */
+@media (max-width: 1023px) {
+  ::-webkit-scrollbar {
+    height: 0;
+    width: 0;
+  }
+}
+
+/* 7) 防止整页在窄屏出现横向滚动（表格外的溢出由第 1 条处理） */
+html,
+body {
+  overflow-x: hidden;
+}
+
+/* ---------- 窄屏布局兜底（第二轮：修"部分页面不协调"） ---------- */
+@media (max-width: 1023px) {
+  /* 1) 多列网格在窄屏自动收敛（能放下几列就几列，放不下就单列） */
+  [class*='grid-cols-'] {
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 170px), 1fr)) !important;
+  }
+
+  /* 2) 固定宽度 / 最小宽度不得撑破屏幕 */
+  [class*='w-['],
+  [class*='min-w-['] {
+    max-width: 100% !important;
+    min-width: 0 !important;
+  }
+
+  /* 3) 弹窗与大容器铺满可用宽度（原选择器匹配不到时用这条兜底） */
+  [class*='max-w-'] {
+    max-width: 96vw !important;
+  }
+
+  /* 4) 内边距收紧，小屏能多看内容 */
+  [class*='p-4'],
+  [class*='p-5'],
+  [class*='p-6'],
+  [class*='px-4'],
+  [class*='px-5'],
+  [class*='px-6'],
+  [class*='py-4'],
+  [class*='py-5'] {
+    padding: 0.875rem !important;
+  }
+
+  /* 5) 卡片圆角与间距略收，观感更紧凑 */
+  [class*='rounded-2xl'] {
+    border-radius: 1rem !important;
+  }
+  [class*='gap-4'],
+  [class*='gap-5'] {
+    gap: 0.75rem !important;
+  }
+
+  /* 6) 图片 / 视频不溢出 */
+  img,
+  video,
+  svg {
+    max-width: 100%;
+    height: auto;
+  }
+
+  /* 7) 长单词 / 长域名允许断行，避免撑宽 */
+  body,
+  div,
+  span,
+  p,
+  td,
+  th,
+  li {
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+
+  /* 8) 顶部横向标签导航：可滑动、不换行 */
+  [class*='overflow-x-auto'] {
+    -webkit-overflow-scrolling: touch;
+    flex-wrap: nowrap !important;
+  }
+
+  /* 9) 底部操作条留安全区 */
+  [class*='sticky'] {
+    padding-bottom: calc(0.5rem + env(safe-area-inset-bottom, 0px));
+  }
+}

@@ -1,0 +1,4 @@
+#!/bin/bash
+### 升级后：数据目录沿用旧版，不清理
+mkdir -p "${TRIM_PKGVAR}/data" "${TRIM_PKGVAR}/run" "${TRIM_PKGVAR}/logs" "${TRIM_PKGVAR}/data/cache" "${TRIM_PKGVAR}/data/updates"
+exit 0
