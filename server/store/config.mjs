@@ -153,13 +153,75 @@ export function safeRenameOverwrite(tmp, file) {
 /**
  * 原子写 JSON：先写临时文件，再按「rename → copy 覆盖 → 直接写」三策略 × 5 轮
  * 退避重试落盘（详见 persistTmpOverwrite）。同步接口，调用方无需改动。
+ *
+ * ⚠️ 同步 = 阻塞事件循环：本机 EPERM 窗口内最坏会冻住整个 HTTP 服务 36 秒，
+ * 导致前端 25 秒默认超时把「还在正常等待」误判成失败（2026-10-25 扫码添加报
+ * 「25 秒超时」即此）。长耗时/用户正在等待结果的链路请用 atomicWriteJsonAsync。
+ * 这里只保留慢写告警，方便事后定位。
  */
 export function atomicWriteJson(file, obj) {
   const text = JSON.stringify(obj, null, 2);
   const tmp = `${file}.tmp-${process.pid}-${Date.now()}`;
-  writeTmpWithRetry(tmp, text);
+  const started = Date.now();
   try {
+    writeTmpWithRetry(tmp, text);
     persistTmpOverwrite(tmp, file, text);
+  } finally {
+    cleanupTmpQuietly(tmp);
+    const ms = Date.now() - started;
+    if (ms > 2000) console.warn(`[store] 同步落盘耗时 ${ms}ms（期间服务无响应）：${file}`);
+  }
+}
+
+/* ---------------- 异步落盘（不阻塞事件循环） ---------------- */
+
+/** 异步 sleep：退避等待时把事件循环让给 HTTP 请求 */
+const sleepAsync = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** writeTmpWithRetry 的异步版：重试期间不冻结服务 */
+async function writeTmpWithRetryAsync(tmp, text) {
+  let lastErr = null;
+  for (let i = 0; i < 5; i++) {
+    if (i > 0) await sleepAsync(200 * i);
+    try {
+      fs.writeFileSync(tmp, text, 'utf8');
+      return;
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr || new Error(`写临时文件失败：${tmp}`);
+}
+
+/** persistTmpOverwrite 的异步版：策略与退避序列完全一致，只是等待改为异步 */
+export async function persistTmpOverwriteAsync(tmp, file, text) {
+  let lastErr = null;
+  for (const delay of PERSIST_DELAYS) {
+    if (delay > 0) await sleepAsync(delay);
+    for (const strategy of PERSIST_STRATEGIES) {
+      try {
+        strategy(tmp, file, text);
+        return;
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+  }
+  throw lastErr || new Error(`落盘失败：${file}`);
+}
+
+/**
+ * 异步原子写 JSON：语义与 atomicWriteJson 相同，但退避等待期间服务仍能正常响应。
+ * 返回本次落盘耗时（毫秒），供调用方判断是否需要告警。
+ */
+export async function atomicWriteJsonAsync(file, obj) {
+  const text = JSON.stringify(obj, null, 2);
+  const tmp = `${file}.tmp-${process.pid}-${Date.now()}`;
+  const started = Date.now();
+  try {
+    await writeTmpWithRetryAsync(tmp, text);
+    await persistTmpOverwriteAsync(tmp, file, text);
+    return Date.now() - started;
   } finally {
     cleanupTmpQuietly(tmp);
   }

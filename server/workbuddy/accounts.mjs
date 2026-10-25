@@ -8,7 +8,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { atomicWriteJson } from '../store/config.mjs';
+import { atomicWriteJson, atomicWriteJsonAsync } from '../store/config.mjs';
 import { variantOf, getVariant } from './variant.mjs';
 
 /** 账号库根目录：默认 ~/.wb-switch，可用 WB_SWITCH_HOME 重定向（测试隔离） */
@@ -57,6 +57,18 @@ export function loadAccounts() {
 export function saveAccounts(accounts) {
   fs.mkdirSync(STORE_DIR, { recursive: true });
   atomicWriteJson(ACCOUNTS_FILE, accounts);
+}
+
+/**
+ * 异步保存（不阻塞事件循环）。返回落盘耗时（毫秒）。
+ *
+ * 扫码采集 / 巡检这类「用户正在等结果、且本机写盘可能被拦几十秒」的路径用它：
+ * 同步版在 EPERM 窗口里会把整个 HTTP 服务冻住，前端默认 25 秒超时就会把
+ * 「后台其实还在正常干活」误报成失败（2026-10-25 反馈）。
+ */
+export async function saveAccountsAsync(accounts) {
+  fs.mkdirSync(STORE_DIR, { recursive: true });
+  return atomicWriteJsonAsync(ACCOUNTS_FILE, accounts);
 }
 
 /** 按 id 或 uid 查找账号（uid 兼容：切换时前端可能拿 uid 当标识） */

@@ -808,6 +808,8 @@ function ScanAddDialog({
   /** 成功回调进 ref：父组件传的是内联函数，直接进 deps 会让轮询效应反复重启 */
   const onAddedRef = useRef(onAdded);
   onAddedRef.current = onAdded;
+  /** 本次弹窗是否已发起过授权申请（防止 deps 变化重复换 state，详见下方 effect） */
+  const openedRef = useRef(false);
 
   const start = useCallback(async () => {
     setPhase('starting');
@@ -818,7 +820,7 @@ function ScanAddDialog({
     setQrFailed(false);
     setOfficial('');
     try {
-      const r = await post<OAuthStartResult>('/api/oauth/start', { variant });
+      const r = await post<OAuthStartResult>('/api/oauth/start', { variant }, { timeoutMs: TIMEOUT.oauth });
       setUri(r.verificationUri);
       setLoginId(r.loginId);
       setDeadline(Date.now() + r.expiresIn * 1000);
@@ -838,9 +840,24 @@ function ScanAddDialog({
     if (!w) toast('info', '浏览器拦截了新窗口，请点下方链接手动打开，或复制链接到浏览器');
   }, [uri, toast]);
 
-  // 打开弹窗即自动发起，省一次点击
+  /**
+   * 打开弹窗即自动发起，省一次点击。
+   *
+   * ⚠️ 只在「弹窗从关到开」时发起一次：`start` 依赖 variant，而 variant 会跟随
+   * 当前登录态变化（见下方 useEffect）。若把它放进普通 deps，档位一变就会**静默
+   * 换掉二维码/链接**——用户扫的或打开的是旧 state，官方那边登录成功但不绑定，
+   * 服务端只能一直看到 code 11217「login ing」，最后表现为「跳官网登录了却没添加
+   * 成功」（2026-10-25 反馈）。档位在服务端按 loginId 固定，不需要重发。
+   */
   useEffect(() => {
-    if (open) void start();
+    if (!open) {
+      openedRef.current = false;
+      return;
+    }
+    if (openedRef.current) return;
+    openedRef.current = true;
+    void start();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, start]);
 
   // 有效期倒计时（官方 state 有效期 10 分钟）
@@ -875,15 +892,23 @@ function ScanAddDialog({
   }, [uri, phase]);
 
   // 轮询授权结果：done=false 继续等，done+result 已入库，done+error 失败/超时
-  // 服务端有常驻采集循环，这里只是"读状态"，关掉弹窗也不影响账号入库
+  // 服务端有常驻采集循环，这里只是"读状态"，关掉弹窗也不影响账号入库。
+  //
+  // 单次请求失败**不是**登录失败：本机写盘可能被外部进程拦几十秒（服务端退避重试），
+  // 或浏览器并发连接排队，任何一种都会让这一枪超时。以前一次失败就置 failed，
+  // 用户看到的就是「扫码后提示 25 秒超时、没添加成功」——而账号其实可能在后台入库。
+  // 现在：超时放宽到 60 秒，且连续 3 次失败才判定失败（弹窗失败不清理 pending，
+  // 刷新页面会由 resumePendingOAuth 继续续采）。
   useEffect(() => {
     if (!loginId) return;
     let timer: number | undefined;
     let cancelled = false;
+    let fails = 0;
     const poll = async () => {
       try {
-        const r = await post<OAuthPollResult>('/api/oauth/status', { loginId });
+        const r = await post<OAuthPollResult>('/api/oauth/status', { loginId }, { timeoutMs: TIMEOUT.oauth });
         if (cancelled) return;
+        fails = 0;
         if (r.done) {
           clearPendingOAuth();
           if (r.result) {
@@ -901,7 +926,13 @@ function ScanAddDialog({
         timer = window.setTimeout(poll, 1500);
       } catch (e: any) {
         if (cancelled) return;
-        setError(e?.message || '轮询失败');
+        fails += 1;
+        if (fails < 3) {
+          setOfficial(`本地服务响应慢或正在落盘，正在重试（第 ${fails} 次）`);
+          timer = window.setTimeout(poll, 2500);
+          return;
+        }
+        setError(`${e?.message || '轮询失败'}；服务端采集仍在继续，刷新页面会自动续采`);
         setPhase('failed');
       }
     };
@@ -2014,27 +2045,38 @@ export default function AccountsPage() {
     const pending = readPendingOAuth();
     if (!pending) return;
     let stopped = false;
-    const timer = setInterval(async () => {
+    let timer: number | undefined;
+
+    /**
+     * 串行轮询而不是 setInterval：单次请求慢（服务端落盘卡顿）时，setInterval 会
+     * 让请求不断叠加，抢光浏览器对同一主机的并发连接，反而把「读状态」这一枪排队
+     * 到超时。这里等上一次有结果再排下一次。
+     */
+    const tick = async () => {
+      if (stopped) return;
       try {
-        const r = await post<OAuthPollResult>('/api/oauth/status', { loginId: pending.loginId });
+        const r = await post<OAuthPollResult>('/api/oauth/status', { loginId: pending.loginId }, { timeoutMs: TIMEOUT.oauth });
         if (stopped) return;
-        if (!r.done) return;
-        clearPendingOAuth();
-        clearInterval(timer);
-        if (r.result) {
-          toast('ok', `已扫码添加「${r.result.name}」`);
-          load();
-          void loadBalances(true);
-        } else if (r.error) {
-          toast('err', `扫码登录未完成：${r.error}`);
+        if (r.done) {
+          clearPendingOAuth();
+          if (r.result) {
+            toast('ok', `已扫码添加「${r.result.name}」`);
+            load();
+            void loadBalances(true);
+          } else if (r.error) {
+            toast('err', `扫码登录未完成：${r.error}`);
+          }
+          return;
         }
       } catch {
-        /* 瞬时错误忽略，下个周期再试 */
+        /* 瞬时错误忽略，下个周期再试（服务端采集不受影响） */
       }
-    }, 3000);
+      if (!stopped) timer = window.setTimeout(tick, 3000);
+    };
+    void tick();
     return () => {
       stopped = true;
-      clearInterval(timer);
+      if (timer !== undefined) window.clearTimeout(timer);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);

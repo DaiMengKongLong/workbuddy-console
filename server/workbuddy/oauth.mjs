@@ -17,13 +17,61 @@
  *   备注/展示字段，重复扫码会更新凭据而不是堆一条新记录。
  */
 import { randomUUID } from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import { proxyFetch } from '../proxy.mjs';
 import { getVariant, officialNetHint } from './variant.mjs';
-import { loadAccounts, saveAccounts, accountMeta } from './accounts.mjs';
+import { STORE_DIR, loadAccounts, saveAccountsAsync, accountMeta } from './accounts.mjs';
 import { verifyNewAccount } from './tokenRefresh.mjs';
 
 /** 单次扫码登录的有效期（秒），与官方 state 有效期对齐 */
 const OAUTH_TIMEOUT_SECONDS = 600;
+
+/**
+ * 扫码链路诊断日志（`~/.wb-switch/oauth_logs.jsonl`）。
+ *
+ * 之前这条链路完全没有落盘痕迹：用户在界面看到「25 秒超时」时，无法判断到底是
+ * 官方还没授权（code 11217）、本地写盘卡住、还是服务重启丢了 loginId。
+ * 现在 start / 状态变化 / 入库 / 验活 / 失败各写一行，含耗时与官方原始 code。
+ */
+const OAUTH_LOG_FILE = path.join(STORE_DIR, 'oauth_logs.jsonl');
+const OAUTH_LOG_MAX_BYTES = 512 * 1024;
+let oauthLogWrites = 0;
+
+/** 日志超过 512KB 时只保留最近 400 行（低频触发，失败不影响主流程） */
+function trimOauthLog() {
+  try {
+    if (fs.statSync(OAUTH_LOG_FILE).size <= OAUTH_LOG_MAX_BYTES) return;
+    const lines = fs.readFileSync(OAUTH_LOG_FILE, 'utf8').trim().split('\n').slice(-400);
+    fs.writeFileSync(OAUTH_LOG_FILE, `${lines.join('\n')}\n`, 'utf8');
+  } catch {
+    /* 诊断日志属尽力而为 */
+  }
+}
+
+/** 写一行诊断日志。用 append 而不是原子覆盖：日志不值得为写盘重试等几十秒。 */
+function oauthLog(event, detail = {}) {
+  const rec = { at: new Date().toISOString(), event, ...detail };
+  const brief = [
+    event,
+    detail.loginId ? String(detail.loginId).slice(0, 12) : '',
+    detail.variant || '',
+    detail.ms != null ? `${detail.ms}ms` : '',
+    detail.code != null ? `code=${detail.code}` : '',
+    detail.message || '',
+    detail.error || '',
+  ]
+    .filter(Boolean)
+    .join(' ');
+  console.log(`[oauth] ${brief}`);
+  try {
+    fs.mkdirSync(STORE_DIR, { recursive: true });
+    fs.appendFileSync(OAUTH_LOG_FILE, `${JSON.stringify(rec)}\n`, 'utf8');
+    if (++oauthLogWrites % 20 === 0) trimOauthLog();
+  } catch {
+    /* 诊断日志属尽力而为 */
+  }
+}
 
 /** loginId -> { variant, state, expiresAt, done, result, error } */
 const OAUTH_STATES = new Map();
@@ -114,17 +162,27 @@ export async function oauthStart(variantId = 'cn') {
   const variant = getVariant(variantId);
   const loginId = `wb_${randomUUID().replace(/-/g, '')}`;
 
-  const resp = await officialJson(oauthStateUrl(variant), { method: 'POST', body: {}, variant });
+  const started = Date.now();
+  let resp;
+  try {
+    resp = await officialJson(oauthStateUrl(variant), { method: 'POST', body: {}, variant });
+  } catch (err) {
+    oauthLog('start-fail', { loginId, variant: variant.id, ms: Date.now() - started, error: err?.message || String(err) });
+    throw err;
+  }
   const data = resp?.data && typeof resp.data === 'object' ? resp.data : {};
   const state = str(data.state);
   if (!state) {
     const snippet = JSON.stringify(resp).slice(0, 300);
+    oauthLog('start-bad-state', { loginId, variant: variant.id, ms: Date.now() - started, error: snippet });
     throw new Error(`auth/state 响应缺少 state: ${snippet}`);
   }
 
   // 官方字段名历史上在 authUrl / auth_url / url 之间变过，逐个兼容
   const verificationUri =
     str(data.authUrl) || str(data.auth_url) || str(data.url) || `${variant.apiEndpoint}/login?state=${encodeURIComponent(state)}`;
+
+  oauthLog('start', { loginId, variant: variant.id, ms: Date.now() - started, message: verificationUri });
 
   OAUTH_STATES.set(loginId, {
     variant,
@@ -157,6 +215,7 @@ function failOAuth(loginId, error) {
     info.done = true;
     info.error = error;
   }
+  oauthLog('fail', { loginId, variant: info?.variant?.id, code: info?.lastCode ?? null, error });
   return { done: true, error };
 }
 
@@ -176,12 +235,27 @@ async function pollOnce(loginId) {
 
   // 用发起档位拼域名与 platform，不跟随当前列表档位
   const { variant, state } = info;
+  const prevCode = info.lastCode;
+  const tokenStarted = Date.now();
   const resp = await officialJson(oauthTokenUrl(variant, state), { variant });
+  const tokenMs = Date.now() - tokenStarted;
   const code = typeof resp?.code === 'number' ? resp.code : -1;
   info.lastCode = code;
   info.lastMessage = str(resp?.msg) || str(resp?.message) || '';
   info.lastPollAt = Date.now();
   info.pollCount = (info.pollCount || 0) + 1;
+
+  // 只在「首次」和「状态变化」时落痕：每 2 秒一条会把日志刷爆
+  if (prevCode !== code) {
+    oauthLog('poll', {
+      loginId,
+      variant: variant.id,
+      ms: tokenMs,
+      code,
+      message: info.lastMessage,
+      pollCount: info.pollCount,
+    });
+  }
 
   if (code !== 0 && code !== 200) {
     // 鉴权类失败不可能是"还没扫"，直接给出可读错误，避免干等到超时
@@ -230,12 +304,22 @@ async function pollOnce(loginId) {
   };
 
   const saved = upsertCollectedAccount(record);
-  saveAccounts(saved.accounts);
+  /**
+   * 异步落盘：本机写盘可能被外部进程拦几十秒（EPERM 窗口），同步版会把整个
+   * HTTP 事件循环冻住——而前端此时正在每 1.5 秒轮询 /api/oauth/status，
+   * 25 秒默认超时一到就报「超时」，用户看到的是「没添加成功」（2026-10-25 反馈）。
+   */
+  const saveMs = await saveAccountsAsync(saved.accounts);
   const result = accountMeta(saved.record);
   info.done = true;
   info.result = result;
   info.error = null;
-  console.log(`[oauth] 已采集账号：${result?.name || result?.uid || '(未命名)'}（档位 ${variant.id}）`);
+  oauthLog('saved', {
+    loginId,
+    variant: variant.id,
+    ms: saveMs,
+    message: `${result?.name || result?.uid || '(未命名)'} / 共 ${saved.accounts.length} 个账号${saveMs > 3000 ? '（落盘偏慢）' : ''}`,
+  });
 
   /**
    * 入库即验活：徽章只认服务端验活结论，不验就要等 6 小时巡检，新账号会一直挂着
@@ -243,9 +327,16 @@ async function pollOnce(loginId) {
    * 收尾顺手验一次，前端随后 reload 列表就能看到真实状态。
    * 失败/超时都不影响入库结果——只在有结论时补进返回值。
    */
+  const verifyStarted = Date.now();
   const verify = await verifyNewAccount(result?.uid || result?.id);
   // info.result 与 result 是同一个对象，补上 verify 后后续轮询也能读到
   if (verify) result.verify = verify;
+  oauthLog('verify', {
+    loginId,
+    variant: variant.id,
+    ms: Date.now() - verifyStarted,
+    message: verify ? `valid=${verify.valid} unauthorized=${verify.unauthorized} ${verify.message || ''}`.trim() : '无结论（不影响已入库）',
+  });
   return { done: true, result };
 }
 
@@ -279,6 +370,12 @@ function startBackgroundCollect() {
         if (Date.now() > info.expiresAt) {
           info.done = true;
           info.error = '登录超时，请重新发起扫码';
+          oauthLog('expire', {
+            loginId,
+            variant: info.variant?.id,
+            code: info.lastCode ?? null,
+            message: `10 分钟内未完成授权（轮询 ${info.pollCount || 0} 次）`,
+          });
           continue;
         }
         try {
@@ -286,10 +383,18 @@ function startBackgroundCollect() {
         } catch (e) {
           info.lastMessage = e?.message || String(e);
           info.failures = (info.failures || 0) + 1;
+          if (info.failures === 1) {
+            oauthLog('poll-error', { loginId, variant: info.variant?.id, error: info.lastMessage });
+          }
           // 网络持续失败时不要一直傻等，给出可读原因
           if (info.failures >= MAX_CONSECUTIVE_FAILURES) {
             info.done = true;
             info.error = `轮询失败：${info.lastMessage}`;
+            oauthLog('fail', {
+              loginId,
+              variant: info.variant?.id,
+              error: `连续 ${info.failures} 次轮询失败：${info.lastMessage}`,
+            });
           }
         }
       }
