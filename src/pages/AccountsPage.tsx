@@ -794,6 +794,12 @@ function ScanAddDialog({
   const [copied, setCopied] = useState(false);
   /** 「在电脑上继续授权」链接是否已复制 */
   const [pcCopied, setPcCopied] = useState(false);
+  /**
+   * 授权页类型（platform）。官方登录页按这个参数切换登录组件：
+   * 默认的 `workbuddy` 在手机浏览器上走移动端流程、不绑定 state（报「登录失败，请返回客户端」），
+   * 换 web / pc 会渲染另一套组件，手机上就有机会完成绑定。
+   */
+  const [authPlatform, setAuthPlatform] = useState('');
   /** 官方接口的原始状态文案，用于解释"卡在哪一步" */
   const [official, setOfficial] = useState('');
   /** 成功回调进 ref：父组件传的是内联函数，直接进 deps 会让轮询效应反复重启 */
@@ -802,7 +808,9 @@ function ScanAddDialog({
   /** 本次弹窗是否已发起过授权申请（防止 deps 变化重复换 state，详见下方 effect） */
   const openedRef = useRef(false);
 
-  const start = useCallback(async () => {
+  /** platformOverride：切授权页类型时直接传新值（闭包里的 authPlatform 还是旧值） */
+  const start = useCallback(async (platformOverride?: string) => {
+    const platform = platformOverride !== undefined ? platformOverride : authPlatform;
     setPhase('starting');
     setUri('');
     setLoginId('');
@@ -811,7 +819,11 @@ function ScanAddDialog({
     setQrFailed(false);
     setOfficial('');
     try {
-      const r = await post<OAuthStartResult>('/api/oauth/start', { variant }, { timeoutMs: TIMEOUT.oauth });
+      const r = await post<OAuthStartResult>(
+        '/api/oauth/start',
+        { variant, platform },
+        { timeoutMs: TIMEOUT.oauth },
+      );
       setUri(r.verificationUri);
       setLoginId(r.loginId);
       setDeadline(Date.now() + r.expiresIn * 1000);
@@ -1046,6 +1058,29 @@ function ScanAddDialog({
                 <IconRefresh className="w-3.5 h-3.5" />
                 重新获取授权链接
               </Button>
+              {/* 授权页类型：手机上默认的 workbuddy 授权页走移动端流程、不绑定 state，
+                  换 web / pc 会渲染另一套登录组件，有机会在手机上完成绑定 */}
+              <div className="flex flex-wrap items-center gap-1.5">
+                <span className="text-[11px] text-indigo-700">授权页类型：</span>
+                {[
+                  { v: '', label: '默认' },
+                  { v: 'web', label: '网页版' },
+                  { v: 'pc', label: '电脑版' },
+                ].map((o) => (
+                  <Button
+                    key={o.v || 'default'}
+                    size="sm"
+                    variant={authPlatform === o.v ? 'primary' : 'ghost'}
+                    onClick={() => {
+                      setAuthPlatform(o.v);
+                      void start(o.v);
+                    }}
+                    title="官方登录页按 platform 参数切换登录组件；手机上默认类型打不开就换一个"
+                  >
+                    {o.label}
+                  </Button>
+                ))}
+              </div>
               {/* 手机上走不通官方登录页（移动端流程不绑定 state），给一条电脑直达地址 */}
               <div className="rounded-lg border border-zinc-200 bg-white px-2.5 py-2">
                 <div className="text-[11px] leading-relaxed text-zinc-600">
