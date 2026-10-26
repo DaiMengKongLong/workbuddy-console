@@ -522,7 +522,9 @@ app.post(
   '/api/oauth/start',
   wrap(async (req, res) => {
     const variant = String(req.body?.variant || 'cn');
-    res.json(await oauthStart(variant));
+    // platform：授权页类型（默认随档位）。手机上打不开默认授权页时可传 web / pc 换一种登录组件。
+    const platform = String(req.body?.platform || '').trim();
+    res.json(await oauthStart(variant, platform));
   })
 );
 
