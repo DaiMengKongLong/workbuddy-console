@@ -96,8 +96,8 @@ function domainMismatchError(variant, domain) {
 }
 
 /** 申请 state 的 URL（域名、前缀、platform 全部取自档位） */
-function oauthStateUrl(variant) {
-  return `${variant.apiEndpoint}${variant.apiPrefix}/auth/state?platform=${encodeURIComponent(variant.oauthPlatform)}`;
+function oauthStateUrl(variant, platform) {
+  return `${variant.apiEndpoint}${variant.apiPrefix}/auth/state?platform=${encodeURIComponent(platform || variant.oauthPlatform)}`;
 }
 
 /** 换取 token 的 URL。必须用**发起档位**，不能跟随当前列表档位。 */
@@ -157,15 +157,22 @@ function profileEmail(profile) {
 /**
  * 发起扫码登录：向官方申请 state，返回 loginId / verificationUri / expiresIn。
  * variantId 缺省国内版。
+ *
+ * platformOverride：授权页类型。官方登录页（`codebuddy.cn/login?platform=...`）会按这个参数
+ * 切换登录组件——默认 `workbuddy` 在手机浏览器上会走移动端流程、**不绑定 state**（报
+ * 「登录失败，请返回客户端」）。实测官方**接受任意 platform 值**（web / pc / desktop 等都能
+ * 换到 state 且 token 接口照常返回 11217），所以给界面一个切换入口，手机上打不开默认授权页时
+ * 换一种类型再试（会渲染不同的登录组件，例如网页账号登录 / 扫码登录）。
  */
-export async function oauthStart(variantId = 'cn') {
+export async function oauthStart(variantId = 'cn', platformOverride = '') {
   const variant = getVariant(variantId);
+  const platform = String(platformOverride || '').trim() || variant.oauthPlatform;
   const loginId = `wb_${randomUUID().replace(/-/g, '')}`;
 
   const started = Date.now();
   let resp;
   try {
-    resp = await officialJson(oauthStateUrl(variant), { method: 'POST', body: {}, variant });
+    resp = await officialJson(oauthStateUrl(variant, platform), { method: 'POST', body: {}, variant });
   } catch (err) {
     oauthLog('start-fail', { loginId, variant: variant.id, ms: Date.now() - started, error: err?.message || String(err) });
     throw err;
@@ -179,13 +186,19 @@ export async function oauthStart(variantId = 'cn') {
   }
 
   // 官方字段名历史上在 authUrl / auth_url / url 之间变过，逐个兼容
-  const verificationUri =
+  // 官方返回的 authUrl 会带上我们传的 platform；若没带（比如换了字段名）就自己补上，
+  // 保证登录页拿到的是我们选的那种授权页类型。
+  let verificationUri =
     str(data.authUrl) || str(data.auth_url) || str(data.url) || `${variant.apiEndpoint}/login?state=${encodeURIComponent(state)}`;
+  if (!verificationUri.includes(`platform=${encodeURIComponent(platform)}`)) {
+    verificationUri += `${verificationUri.includes('?') ? '&' : '?'}platform=${encodeURIComponent(platform)}`;
+  }
 
-  oauthLog('start', { loginId, variant: variant.id, ms: Date.now() - started, message: verificationUri });
+  oauthLog('start', { loginId, variant: variant.id, platform, ms: Date.now() - started, message: verificationUri });
 
   OAUTH_STATES.set(loginId, {
     variant,
+    platform,
     state,
     expiresAt: Date.now() + OAUTH_TIMEOUT_SECONDS * 1000,
     done: false,
@@ -206,7 +219,7 @@ export async function oauthStart(variantId = 'cn') {
   // 后台常驻采集：前端关弹窗/刷新页面都不影响账号入库
   startBackgroundCollect();
 
-  return { loginId, verificationUri, expiresIn: OAUTH_TIMEOUT_SECONDS };
+  return { loginId, verificationUri, platform, expiresIn: OAUTH_TIMEOUT_SECONDS };
 }
 
 function failOAuth(loginId, error) {
