@@ -792,6 +792,8 @@ function ScanAddDialog({
   const [error, setError] = useState('');
   const [qrFailed, setQrFailed] = useState(false);
   const [copied, setCopied] = useState(false);
+  /** 「在电脑上继续授权」链接是否已复制 */
+  const [pcCopied, setPcCopied] = useState(false);
   /** 官方接口的原始状态文案，用于解释"卡在哪一步" */
   const [official, setOfficial] = useState('');
   /** 成功回调进 ref：父组件传的是内联函数，直接进 deps 会让轮询效应反复重启 */
@@ -828,6 +830,24 @@ function ScanAddDialog({
     const w = window.open(uri, '_blank', 'noopener,noreferrer');
     if (!w) toast('info', '浏览器拦截了新窗口，请点下方链接手动打开，或复制链接到浏览器');
   }, [uri, toast]);
+
+  /**
+   * 「在电脑上继续授权」的直达地址。
+   *
+   * 为什么需要它：官方登录页在手机上会走移动端登录流程，而移动端流程是给官方 App 用的，
+   * **不会把登录结果绑定到本次 state**，于是直接报「登录失败，请返回客户端」——手机上怎么点都过不去。
+   * 桌面网页登录才参与绑定。所以给出一条带 `?oauth=1` 的地址，用户在电脑浏览器打开即可
+   * 自动弹出授权窗口（AccountsPage 初始化时读这个参数），登录成功后账号照样存进 NAS。
+   */
+  const pcLink = `${window.location.origin}${window.location.pathname}?oauth=1#accounts`;
+  const copyPcLink = useCallback(() => {
+    const done = () => setPcCopied(true);
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(pcLink).then(done, () => toast('err', '复制失败，请手动选中链接复制'));
+    } else {
+      toast('err', '当前浏览器不支持复制，请手动选中链接复制');
+    }
+  }, [pcLink, toast]);
 
   /**
    * 打开弹窗即自动发起，省一次点击。
@@ -995,6 +1015,11 @@ function ScanAddDialog({
                   「登录成功」而<strong>不会绑定本次登录</strong>，控制台就一直等不到账号。请复制链接到
                   <strong>无痕（隐私）窗口</strong>打开，或用未登录的浏览器完成授权。
                 </span>
+                <span className="block">
+                  ⚠️ 授权链接<strong>每次点「扫码添加账号」都会重新生成，有效期 10 分钟</strong>。
+                  如果打开的是旧链接/浏览器历史里的链接，官方会显示「登录失败，请重新发起登录」——
+                  这不是故障，回到本弹窗点上面的按钮重新打开即可。
+                </span>
               </span>
             </div>
             {/* 首选：浏览器里完成授权。官方页在浏览器里点「同意」才会绑定 state，
@@ -1007,6 +1032,34 @@ function ScanAddDialog({
                 <IconExternalLink className="w-4 h-4" />
                 在浏览器中打开授权页
               </Button>
+              {/* 手机上直接打开官方登录页最容易失败：官方页会走移动端登录流程，
+                  而移动端流程是给官方 App 用的，**不会把登录结果绑定到本次 state**，
+                  于是直接报「登录失败，请返回客户端」。所以要么切桌面版网站，要么用电脑。 */}
+              <div className="text-[11px] leading-relaxed text-indigo-700/90">
+                <strong>手机上失败请这样处理：</strong>
+                ① 复制链接到 Safari / Chrome 打开后，在浏览器菜单里选<strong>「请求桌面版网站」</strong>再登录；
+                ② 更稳的做法是在<strong>电脑浏览器</strong>里打开控制台（同局域网直连{' '}
+                <span className="font-mono">http://&lt;NAS内网IP&gt;:57891</span>）走一次授权。
+                不要在飞牛 App / 微信的内嵌页面里登录（cookie 与跳转常被禁，state 绑不上）。
+              </div>
+              <Button size="sm" variant="subtle" onClick={() => void start()}>
+                <IconRefresh className="w-3.5 h-3.5" />
+                重新获取授权链接
+              </Button>
+              {/* 手机上走不通官方登录页（移动端流程不绑定 state），给一条电脑直达地址 */}
+              <div className="rounded-lg border border-zinc-200 bg-white px-2.5 py-2">
+                <div className="text-[11px] leading-relaxed text-zinc-600">
+                  <strong>手机上报「登录失败」就用这个：</strong>复制下面地址到<strong>电脑浏览器</strong>打开，
+                  会自动弹出授权窗口，在电脑上登录即可（账号照样存进这台 NAS）。
+                </div>
+                <div className="mt-1.5 flex items-center gap-1.5">
+                  <code className="min-w-0 flex-1 truncate text-[11px] text-zinc-500">{pcLink}</code>
+                  <Button size="sm" variant="ghost" onClick={copyPcLink}>
+                    {pcCopied ? <IconCheck className="w-3.5 h-3.5" /> : <IconCopy className="w-3.5 h-3.5" />}
+                    {pcCopied ? '已复制' : '复制'}
+                  </Button>
+                </div>
+              </div>
             </div>
 
             <div className="flex items-center gap-3">
@@ -1836,7 +1889,11 @@ export default function AccountsPage() {
   const [editing, setEditing] = useState<AccountInfo | null>(null);
   const [pkgTarget, setPkgTarget] = useState<AccountInfo | null>(null);
   /** 扫码添加账号弹窗（OAuth 设备码流程） */
-  const [scanOpen, setScanOpen] = useState(false);
+  const [scanOpen, setScanOpen] = useState(
+    // `?oauth=1` 直达：手机上点「在电脑上继续授权」复制出来的链接带这个参数，
+    // 在电脑浏览器里打开就会自动弹出授权弹窗，省掉再点一次按钮。
+    () => new URLSearchParams(window.location.search).get('oauth') === '1',
+  );
   /** 档位筛选：与 workbuddy-switch 一致，两套登录态分开管理 */
   const [variant, setVariant] = useState<'cn' | 'ai'>('cn');
   // 记录当前档位，供同步会话/切换账号弹窗在请求里带上（跨档位搬运靠它判断源）
