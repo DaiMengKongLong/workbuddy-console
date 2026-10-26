@@ -620,7 +620,7 @@ export default function SettingsPage() {
                   ，服务端每小时巡检一次（06:00–23:00），发现当日未签到会自动补签，并顺带领取成长中心的
                   <b className="text-zinc-600">旅行礼物、派 Buddy、任务奖励、断登补签（消耗补登卡）、连登兑换、开盲盒、Buddy 盲盒</b>
                   （只对国内版账号生效；各接口幂等或由服务端兜底，重复执行无副作用；补登卡每轮最多用 1 张、盲盒每轮最多开 1 次）。
-                  巡检依赖控制台处于运行状态：桌面版关闭窗口后会驻留系统托盘，领取不会中断。
+                  巡检依赖应用处于运行状态：飞牛上应用常驻后台，领取不会中断（应用停止期间不会补跑）。
                   <br />
                   不需要自动领取可在此关闭；关闭后仍可随时点右上角「一键领取」或单账号「领取」手动执行。
                 </>
@@ -1080,21 +1080,26 @@ export default function SettingsPage() {
             </div>
           )}
           <div>
-            主要能力：账号管理（扫码登录 / 切换 / 备份恢复）· Token 统计 · 积分统计 ·
-            免费模型广场（免费模型 / 平台额度 / API Keys）·
-            反向代理（让其他 agent 按 OpenAI / Anthropic / Responses / Gemini 四种协议调用 WorkBuddy 的积分与模型）。
+            {/* fnOS 版文案：不要照抄桌面版（Token 统计 / 备份恢复 / ~/.workbuddy /
+                桌面版托盘这些都依赖本机客户端，fnOS 上根本没有，写出来只会显得"没适配"） */}
+            主要能力：账号管理（扫码登录、多账号凭据维护）· 每日签到与成长中心 ·
+            积分统计 · 免费模型广场（免费模型 / 平台额度 / API Keys）·
+            反向代理（让其他 agent 按 OpenAI / Anthropic / Responses / Gemini 四种协议调用）。
           </div>
           <div>
-            目标应用：<span className="text-zinc-500">WorkBuddy</span>（数据目录 {settings?.detected?.dir || '~/.workbuddy'}）。
+            运行环境：飞牛 fnOS 应用（应用中心安装，内置 Node 运行时）；
+            数据保存在应用数据目录，卸载重装不丢失。
           </div>
           <div>
             当前可用平台：OpenRouter、Agnes AI、硅基流动、魔搭；地区受限平台（Groq、Google AI Studio、NVIDIA、GitHub Models、OpenCode Zen）仅在免费模型展示，不可浏览与载入。
           </div>
           <div className="flex items-start gap-1.5">
             <IconShield className="w-3.5 h-3.5 mt-px shrink-0 text-emerald-500" />
-            <span>隐私：API Key、账号凭据与统计数据均只保存在本机，不经过任何第三方服务器；界面访问仅限 127.0.0.1。</span>
+            <span>隐私：API Key、账号凭据与统计数据均只保存在本机，不经过任何第三方服务器；唯一的外部请求是检查更新（只读 GitHub Release 元数据）。</span>
           </div>
-          <div className="text-zinc-300">备份与账号库与 workbuddy-switch 共用 ~/.wb-switch，可同时安装、随时切换。</div>
+          <div className="text-zinc-300">
+            基于上游 walter-io/workbuddy-console 源码做减法适配；桌面版专属能力（Token 统计、会话同步、登录态备份）依赖本机客户端，fnOS 版不包含。
+          </div>
         </Card>
       </PageSection>
     </div>
