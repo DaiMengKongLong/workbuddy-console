@@ -161,8 +161,11 @@ function ServiceBanner() {
             <>请从系统托盘图标右键「退出」后重新打开 workbuddy控制台；若仍无法恢复，请重启应用。</>
           ) : (
             <>
-              请在项目目录执行 <span className="font-mono text-xs bg-white/70 rounded px-1 py-0.5">npm start</span> 启动服务，或直接运行{' '}
-              <span className="font-mono text-xs bg-white/70 rounded px-1 py-0.5">npm run app</span> 打开桌面应用。
+              当前网络访问不到 NAS 上的服务。
+              <b>在外面用手机操作</b>需要先给飞牛开启远程访问（飞牛桌面 → 设置 → 远程访问 / fn Connect，
+              绑定飞牛账号后会得到一个公网地址），之后用那个地址打开本应用即可；
+              也可以回到与 NAS 相同的网络（家里 Wi-Fi）再使用。
+              {/* 桌面版的 npm start / npm run app 文案在 fnOS 上毫无意义，已去掉 */}
             </>
           )}
         </span>
