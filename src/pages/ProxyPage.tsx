@@ -510,8 +510,10 @@ export default function ProxyPage() {
 
       {/* 总开关 + 凭据 */}
       <Card className="p-5">
-        <div className="flex flex-wrap items-start gap-4">
-          <div className="min-w-[280px] flex-1">
+        {/* 手机端（<768px）改为上下堆叠：说明占满整行，开关/自检换到下一行。
+            否则说明块会被右侧控件挤成一条 ~70px 的窄竖排（每行两三个字）。 */}
+        <div className="flex flex-wrap items-start gap-4 max-md:flex-col max-md:items-stretch">
+          <div className="min-w-[280px] flex-1 max-md:min-w-0">
             <div className="flex flex-wrap items-center gap-2">
               <h2 className="text-sm font-semibold text-zinc-900">反向代理（多协议）</h2>
               <Badge color={data.enabled ? 'green' : 'gray'} dot>
